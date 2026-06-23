@@ -28,6 +28,7 @@ use crate::{
     config::{Config, negotiate_capabilities},
     proto,
     vfs::Vfs,
+    watch,
 };
 
 pub(crate) struct GlobalState {
@@ -68,11 +69,22 @@ impl GlobalState {
     }
 
     pub(crate) fn on_initialized(&mut self, _: InitializedParams) -> NotifyResult {
+        if self.config.supports_dynamic_watched_files_registration() {
+            self.register_watched_file_notifications();
+        }
+
         let _ = self.client.log_message(LogMessageParams {
             typ: MessageType::INFO,
             message: "solar initialized".into(),
         });
         ControlFlow::Continue(())
+    }
+
+    fn register_watched_file_notifications(&self) {
+        let mut client = self.client.clone();
+        // `ClientSocket::request` enqueues when the future is created; the response is non-fatal.
+        let _registration_response =
+            client.register_capability(watch::did_change_watched_files_registration());
     }
 
     /// Parses, lowers, and performs analysis on project files, including in-memory only files.

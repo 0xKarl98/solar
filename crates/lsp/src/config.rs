@@ -1,8 +1,8 @@
 use std::{env, path::PathBuf};
 
 use lsp_types::{
-    InitializeParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions,
+    ClientCapabilities as LspClientCapabilities, InitializeParams, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
 };
 use tracing::info;
 
@@ -17,11 +17,12 @@ use crate::workspace::manifest::ProjectManifest;
 pub(crate) struct Config {
     workspace_roots: Vec<PathBuf>,
     discovered_projects: Vec<ProjectManifest>,
+    client_capabilities: ClientCapabilityFlags,
 }
 
 impl Config {
-    pub(crate) fn new(workspace_roots: Vec<PathBuf>) -> Self {
-        Self { workspace_roots, discovered_projects: Default::default() }
+    fn new(workspace_roots: Vec<PathBuf>, client_capabilities: ClientCapabilityFlags) -> Self {
+        Self { workspace_roots, discovered_projects: Default::default(), client_capabilities }
     }
 
     pub(crate) fn rediscover_workspaces(&mut self) {
@@ -42,9 +43,33 @@ impl Config {
     pub(crate) fn add_workspaces(&mut self, paths: impl Iterator<Item = PathBuf>) {
         self.workspace_roots.extend(paths);
     }
+
+    pub(crate) fn supports_dynamic_watched_files_registration(&self) -> bool {
+        self.client_capabilities.dynamic_watched_files_registration
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct ClientCapabilityFlags {
+    dynamic_watched_files_registration: bool,
+}
+
+impl ClientCapabilityFlags {
+    fn from_lsp(capabilities: &LspClientCapabilities) -> Self {
+        let dynamic_watched_files_registration = capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|capabilities| capabilities.dynamic_registration)
+            .unwrap_or(false);
+
+        Self { dynamic_watched_files_registration }
+    }
 }
 
 pub(crate) fn negotiate_capabilities(params: InitializeParams) -> (ServerCapabilities, Config) {
+    let client_capabilities = ClientCapabilityFlags::from_lsp(&params.capabilities);
+
     // todo: make this absolute guaranteed
     #[allow(deprecated)]
     let root_path = match params.root_uri.and_then(|it| it.to_file_path().ok()) {
@@ -79,6 +104,41 @@ pub(crate) fn negotiate_capabilities(params: InitializeParams) -> (ServerCapabil
             )),
             ..Default::default()
         },
-        Config::new(workspace_roots),
+        Config::new(workspace_roots, client_capabilities),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_types::{
+        ClientCapabilities, DidChangeWatchedFilesClientCapabilities, WorkspaceClientCapabilities,
+    };
+
+    use super::*;
+
+    #[test]
+    fn negotiate_capabilities_records_dynamic_watched_files_registration() {
+        let (_, config) = negotiate_capabilities(InitializeParams {
+            capabilities: ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                        dynamic_registration: Some(true),
+                        relative_pattern_support: None,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        assert!(config.supports_dynamic_watched_files_registration());
+    }
+
+    #[test]
+    fn negotiate_capabilities_defaults_watched_files_registration_to_unsupported() {
+        let (_, config) = negotiate_capabilities(InitializeParams::default());
+
+        assert!(!config.supports_dynamic_watched_files_registration());
+    }
 }

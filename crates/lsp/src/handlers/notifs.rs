@@ -7,7 +7,12 @@ use lsp_types::{
 };
 use tracing::{error, info};
 
-use crate::{NotifyResult, global_state::GlobalState, proto, utils::apply_document_changes};
+use crate::{
+    NotifyResult,
+    global_state::GlobalState,
+    proto, utils,
+    watch::{self, WatchedFileKind},
+};
 
 pub(crate) fn did_open_text_document(
     state: &mut GlobalState,
@@ -42,7 +47,7 @@ pub(crate) fn did_change_text_document(
                 error!(?path, "orphan DidChangeTextDocument");
                 return ControlFlow::Continue(());
             };
-            let new_contents = apply_document_changes(contents, params.content_changes);
+            let new_contents = utils::apply_document_changes(contents, params.content_changes);
 
             (contents != &new_contents, new_contents)
         };
@@ -96,16 +101,16 @@ pub(crate) fn did_change_watched_files(
             continue;
         };
 
-        match path.file_name().and_then(|name| name.to_str()) {
-            Some("foundry.toml") => {
+        match watch::classify_path(&path) {
+            Some(WatchedFileKind::FoundryManifest) => {
                 Arc::make_mut(&mut state.config).rediscover_workspaces();
                 should_recompute = true;
             }
-            Some(_) if path.extension().is_some_and(|ext| ext == "sol") => {
+            Some(WatchedFileKind::SoliditySource) => {
                 disk_paths.push(path);
                 should_recompute = true;
             }
-            _ => {}
+            None => {}
         }
     }
 

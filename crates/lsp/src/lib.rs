@@ -23,6 +23,7 @@ mod proto;
 mod serde;
 mod utils;
 mod vfs;
+mod watch;
 mod workspace;
 
 pub(crate) type NotifyResult = ControlFlow<async_lsp::Result<()>>;
@@ -84,12 +85,17 @@ pub async fn run_server_stdio(_args: LspArgs) -> async_lsp::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::ControlFlow;
+    use std::{ops::ControlFlow, time::Duration};
 
     use async_lsp::{AnyNotification, LspService};
     use lsp_types::{
-        DidChangeWatchedFilesParams, FileChangeType, FileEvent, notification::Notification,
+        ClientCapabilities, DidChangeWatchedFilesClientCapabilities, DidChangeWatchedFilesParams,
+        FileChangeType, FileEvent, InitializeParams, RegistrationParams,
+        WorkspaceClientCapabilities, notification::Notification, request::Request,
     };
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     use super::*;
 
@@ -111,5 +117,197 @@ mod tests {
 
             assert!(matches!(router.notify(notification), ControlFlow::Continue(())));
         });
+    }
+
+    #[test]
+    fn initialized_registers_watched_files_when_client_supports_dynamic_registration() {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let (server_main, _) = async_lsp::MainLoop::new_server(new_router);
+                    let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
+                    let (server_read, server_write) = tokio::io::split(server_stream);
+                    let server_task = tokio::spawn(async move {
+                        server_main
+                            .run_buffered(server_read.compat(), server_write.compat_write())
+                            .await
+                    });
+
+                    let (client_read, mut client_write) = tokio::io::split(client_stream);
+                    let mut client_read = BufReader::new(client_read);
+                    let initialize_params = InitializeParams {
+                        capabilities: ClientCapabilities {
+                            workspace: Some(WorkspaceClientCapabilities {
+                                did_change_watched_files: Some(
+                                    DidChangeWatchedFilesClientCapabilities {
+                                        dynamic_registration: Some(true),
+                                        relative_pattern_support: None,
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+
+                    write_lsp_message(
+                        &mut client_write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": req::Initialize::METHOD,
+                            "params": initialize_params,
+                        }),
+                    )
+                    .await;
+                    assert_eq!(read_lsp_message(&mut client_read).await["id"], 1);
+
+                    write_lsp_message(
+                        &mut client_write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": notif::Initialized::METHOD,
+                            "params": {},
+                        }),
+                    )
+                    .await;
+
+                    let register_request =
+                        read_until_method(&mut client_read, "client/registerCapability").await;
+                    let registration_id = register_request["id"].clone();
+                    let params: RegistrationParams =
+                        serde_json::from_value(register_request["params"].clone()).unwrap();
+                    let registration = params.registrations.into_iter().next().unwrap();
+                    assert_eq!(registration.method, notif::DidChangeWatchedFiles::METHOD);
+
+                    write_lsp_message(
+                        &mut client_write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": registration_id,
+                            "result": null,
+                        }),
+                    )
+                    .await;
+                    write_lsp_message(
+                        &mut client_write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": notif::Exit::METHOD,
+                            "params": null,
+                        }),
+                    )
+                    .await;
+
+                    server_task.await.unwrap().unwrap();
+                })
+                .await
+                .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn initialized_does_not_register_watched_files_without_client_support() {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let (server_main, _) = async_lsp::MainLoop::new_server(new_router);
+                    let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
+                    let (server_read, server_write) = tokio::io::split(server_stream);
+                    let server_task = tokio::spawn(async move {
+                        server_main
+                            .run_buffered(server_read.compat(), server_write.compat_write())
+                            .await
+                    });
+
+                    let (client_read, mut client_write) = tokio::io::split(client_stream);
+                    let mut client_read = BufReader::new(client_read);
+
+                    write_lsp_message(
+                        &mut client_write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": req::Initialize::METHOD,
+                            "params": InitializeParams::default(),
+                        }),
+                    )
+                    .await;
+                    assert_eq!(read_lsp_message(&mut client_read).await["id"], 1);
+
+                    write_lsp_message(
+                        &mut client_write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": notif::Initialized::METHOD,
+                            "params": {},
+                        }),
+                    )
+                    .await;
+
+                    let message = read_lsp_message(&mut client_read).await;
+                    assert_eq!(message["method"], notif::LogMessage::METHOD);
+
+                    write_lsp_message(
+                        &mut client_write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": notif::Exit::METHOD,
+                            "params": null,
+                        }),
+                    )
+                    .await;
+
+                    server_task.await.unwrap().unwrap();
+                })
+                .await
+                .unwrap();
+            },
+        );
+    }
+
+    async fn write_lsp_message(writer: &mut (impl AsyncWriteExt + Unpin), message: Value) {
+        let body = serde_json::to_vec(&message).unwrap();
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&body).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    async fn read_until_method(reader: &mut (impl AsyncBufReadExt + Unpin), method: &str) -> Value {
+        for _ in 0..4 {
+            let message = read_lsp_message(reader).await;
+            if message["method"] == method {
+                return message;
+            }
+        }
+
+        panic!("server did not send `{method}`");
+    }
+
+    async fn read_lsp_message(reader: &mut (impl AsyncBufReadExt + Unpin)) -> Value {
+        let mut content_len = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" {
+                break;
+            }
+
+            if let Some(value) =
+                line.strip_suffix("\r\n").and_then(|line| line.strip_prefix("Content-Length: "))
+            {
+                content_len = Some(value.parse::<usize>().unwrap());
+            }
+        }
+
+        let mut body = vec![0; content_len.unwrap()];
+        reader.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 }
