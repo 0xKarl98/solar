@@ -707,15 +707,7 @@ mod tests {
             enum E { A }
             "#,
         );
-        let path = project.path("/Symbols.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Symbols.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty());
+        let (uri, result) = analyze_project_file(&project, "/Symbols.sol");
 
         let declarations = result.symbol_tables.file_declarations(&uri).collect::<Vec<_>>();
         assert_declaration(&declarations, "TOP", SymbolKind::CONSTANT);
@@ -789,15 +781,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Symbols.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Symbols.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Symbols.sol");
 
         let document_symbols = result.symbol_tables.document_symbols(&uri);
         assert_eq!(
@@ -852,15 +836,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Symbols.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Symbols.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Symbols.sol");
 
         let definition = result
             .symbol_tables
@@ -913,15 +889,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Completion.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Completion.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Completion.sol");
 
         let before_initializer = result.symbol_tables.completion_items(&uri, position(2, 31));
         let labels = before_initializer.iter().map(|item| item.label.as_str()).collect::<Vec<_>>();
@@ -950,15 +918,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Members.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Members.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Members.sol");
 
         let field_definition = result
             .symbol_tables
@@ -1002,15 +962,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Getter.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Getter.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Getter.sol");
 
         let references = result
             .symbol_tables
@@ -1036,15 +988,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Overload.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Overload.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Overload.sol");
 
         let definition = result
             .symbol_tables
@@ -1095,15 +1039,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Using.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Using.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Using.sol");
 
         let library_definition = result
             .symbol_tables
@@ -1143,15 +1079,7 @@ mod tests {
             }
             "#,
         );
-        let path = project.path("/Navigation.sol");
-        let uri = Url::from_file_path(&path).unwrap();
-        let result = analyze(AnalysisBatch {
-            opts: CompileOpts::default(),
-            files: vec![(path, project.read_file("/Navigation.sol"))],
-            seen_paths: FxHashSet::default(),
-        });
-
-        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        let (uri, result) = analyze_project_file(&project, "/Navigation.sol");
 
         let declaration = result
             .symbol_tables
@@ -1165,6 +1093,18 @@ mod tests {
 
         let definition = result.symbol_tables.goto_definition(&uri, position(1, 13));
         assert!(definition.is_none(), "interface-only function should not have a definition");
+    }
+
+    fn analyze_project_file(project: &TestProject, file: &str) -> (Url, AnalysisResult) {
+        let path = project.path(file);
+        let uri = Url::from_file_path(&path).unwrap();
+        let result = analyze(AnalysisBatch {
+            opts: CompileOpts::default(),
+            files: vec![(path, project.read_file(file))],
+            seen_paths: FxHashSet::default(),
+        });
+        assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);
+        (uri, result)
     }
 
     fn assert_parent(
