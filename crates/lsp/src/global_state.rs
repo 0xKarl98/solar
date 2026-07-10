@@ -19,7 +19,7 @@ use solar_interface::{
     Session,
     data_structures::{
         map::{FxHashMap, FxHashSet},
-        sync::RwLock,
+        sync::{Mutex, RwLock},
     },
     diagnostics::{DiagCtxt, InMemoryEmitter},
     source_map::{FileName, SourceMap},
@@ -33,14 +33,17 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::sync::oneshot;
+use tracing::{Span, debug_span, field};
 
 pub(crate) struct GlobalState {
     client: ClientSocket,
     pub(crate) vfs: Arc<RwLock<Vfs>>,
     pub(crate) config: Arc<Config>,
     analysis_version: Arc<AtomicUsize>,
+    analysis_scheduler: Arc<Mutex<AnalysisScheduler>>,
     flycheck_versions: Arc<RwLock<FxHashMap<DiagnosticOwner, usize>>>,
     flycheck_cancels: FxHashMap<DiagnosticOwner, oneshot::Sender<()>>,
     pub(crate) symbol_tables: Arc<RwLock<SymbolTables>>,
@@ -53,6 +56,7 @@ impl GlobalState {
             client,
             vfs: Arc::new(Default::default()),
             analysis_version: Arc::new(AtomicUsize::new(0)),
+            analysis_scheduler: Arc::new(Default::default()),
             flycheck_versions: Arc::new(Default::default()),
             flycheck_cancels: FxHashMap::default(),
             symbol_tables: Arc::new(Default::default()),
@@ -116,44 +120,27 @@ impl GlobalState {
 
     pub(crate) fn recompute_with_disk_files(&mut self, disk_paths: Vec<PathBuf>) {
         let version = self.analysis_version.fetch_add(1, Ordering::AcqRel) + 1;
-        self.spawn_with_snapshot(move |mut snapshot| {
-            if !snapshot.is_current(version) {
-                return;
-            }
+        let request = AnalysisRequest {
+            version,
+            snapshot: self.snapshot(),
+            disk_paths,
+            queued_at: Instant::now(),
+        };
+        let disk_file_count = request.disk_paths.len();
+        let first = self.analysis_scheduler.lock().enqueue(request);
+        let started_worker = first.is_some();
+        let span = debug_span!(
+            "lsp_recompute_request",
+            generation = version,
+            disk_file_count,
+            coalesced = !started_worker,
+            started_worker,
+        );
+        let _guard = span.enter();
 
-            let batches = snapshot.analysis_batches(disk_paths);
-            if !snapshot.is_current(version) {
-                return;
-            }
-
-            let mut diagnostics = DiagnosticMap::default();
-            let mut symbol_tables = SymbolTables::default();
-
-            for batch in batches {
-                if batch.files.is_empty() {
-                    continue;
-                }
-
-                if !snapshot.is_current(version) {
-                    return;
-                }
-
-                let result = analyze(batch);
-                symbol_tables.extend(result.symbol_tables);
-                for (uri, mut batch_diagnostics) in result.diagnostics {
-                    diagnostics.entry(uri).or_default().append(&mut batch_diagnostics);
-                }
-
-                if !snapshot.is_current(version) {
-                    return;
-                }
-            }
-
-            if snapshot.is_current(version) {
-                snapshot.set_symbol_tables(symbol_tables);
-                snapshot.publish_diagnostics(DiagnosticOwner::Compiler, diagnostics);
-            }
-        });
+        if let Some(first) = first {
+            spawn_analysis_worker(self.analysis_scheduler.clone(), first);
+        }
     }
 
     pub(crate) fn run_flychecks_on_save(&mut self, path: PathBuf) {
@@ -171,10 +158,18 @@ impl GlobalState {
                 }
 
                 match result {
-                    Ok(diagnostics) => snapshot.publish_diagnostics(task_owner, diagnostics),
+                    Ok(diagnostics) => snapshot.publish_diagnostics_with_generation(
+                        task_owner,
+                        diagnostics,
+                        version,
+                    ),
                     Err(error) => {
                         tracing::warn!(%id, %error, "flycheck failed");
-                        snapshot.publish_diagnostics(task_owner, DiagnosticMap::default());
+                        snapshot.publish_diagnostics_with_generation(
+                            task_owner,
+                            DiagnosticMap::default(),
+                            version,
+                        );
                     }
                 }
             });
@@ -254,19 +249,168 @@ impl GlobalState {
             diagnostics: self.diagnostics.clone(),
         }
     }
-
-    fn spawn_with_snapshot<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(GlobalStateSnapshot) -> T + Send + 'static,
-    ) -> JoinHandle<T> {
-        let snapshot = self.snapshot();
-        tokio::task::spawn_blocking(move || f(snapshot))
-    }
 }
 
 struct AnalysisResult {
     diagnostics: DiagnosticMap,
     symbol_tables: SymbolTables,
+}
+
+struct AnalysisRequest {
+    version: usize,
+    snapshot: GlobalStateSnapshot,
+    disk_paths: Vec<PathBuf>,
+    queued_at: Instant,
+}
+
+const ANALYSIS_DEBOUNCE: Duration = Duration::from_millis(25);
+
+enum NextAnalysis {
+    Idle,
+    Wait(Duration),
+    Run(AnalysisRequest),
+}
+
+#[derive(Default)]
+struct AnalysisScheduler {
+    running: bool,
+    pending: Option<AnalysisRequest>,
+}
+
+impl AnalysisScheduler {
+    fn enqueue(&mut self, mut request: AnalysisRequest) -> Option<AnalysisRequest> {
+        if !self.running {
+            self.running = true;
+            return Some(request);
+        }
+
+        if let Some(pending) = self.pending.take() {
+            request.disk_paths.extend(pending.disk_paths);
+            request.disk_paths.sort_unstable();
+            request.disk_paths.dedup();
+        }
+        self.pending = Some(request);
+        None
+    }
+
+    fn next_request(
+        &mut self,
+        now: Instant,
+        carried_disk_paths: &mut Vec<PathBuf>,
+    ) -> NextAnalysis {
+        let Some(pending) = &self.pending else {
+            self.running = false;
+            return NextAnalysis::Idle;
+        };
+
+        let elapsed = now.saturating_duration_since(pending.queued_at);
+        if elapsed < ANALYSIS_DEBOUNCE {
+            return NextAnalysis::Wait(ANALYSIS_DEBOUNCE - elapsed);
+        }
+
+        let mut request = self.pending.take().unwrap();
+        request.disk_paths.append(carried_disk_paths);
+        request.disk_paths.sort_unstable();
+        request.disk_paths.dedup();
+        NextAnalysis::Run(request)
+    }
+}
+
+fn spawn_analysis_worker(scheduler: Arc<Mutex<AnalysisScheduler>>, first: AnalysisRequest) {
+    tokio::task::spawn_blocking(move || {
+        let mut request = first;
+        let mut carried_disk_paths = Vec::new();
+
+        loop {
+            let disk_paths = request.disk_paths.clone();
+            if run_recompute_request(request) {
+                carried_disk_paths.clear();
+            } else {
+                carried_disk_paths.extend(disk_paths);
+                carried_disk_paths.sort_unstable();
+                carried_disk_paths.dedup();
+            }
+
+            loop {
+                let next = scheduler.lock().next_request(Instant::now(), &mut carried_disk_paths);
+                match next {
+                    NextAnalysis::Idle => return,
+                    NextAnalysis::Wait(delay) => std::thread::sleep(delay),
+                    NextAnalysis::Run(next) => {
+                        request = next;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn run_recompute_request(request: AnalysisRequest) -> bool {
+    let AnalysisRequest { version, mut snapshot, disk_paths, queued_at } = request;
+    let started_at = Instant::now();
+    let span = debug_span!(
+        "lsp_recompute",
+        generation = version,
+        queue_ms = duration_ms(queued_at.elapsed()),
+        batch_count = field::Empty,
+        file_count = field::Empty,
+        total_bytes = field::Empty,
+        discarded = false,
+        discard_stage = field::Empty,
+        discard_batch = field::Empty,
+        work_elapsed_ms = field::Empty,
+    );
+    let _guard = span.enter();
+
+    if !snapshot.is_current(version) {
+        record_recompute_discard(&span, started_at, "before_batch_collection", None);
+        return false;
+    }
+
+    let batches = snapshot.analysis_batches_with_generation(disk_paths, version);
+    span.record("batch_count", batches.len());
+    span.record("file_count", batches.iter().map(AnalysisBatch::file_count).sum::<usize>());
+    span.record("total_bytes", batches.iter().map(AnalysisBatch::total_bytes).sum::<usize>());
+    if !snapshot.is_current(version) {
+        record_recompute_discard(&span, started_at, "after_batch_collection", None);
+        return false;
+    }
+
+    let mut diagnostics = DiagnosticMap::default();
+    let mut symbol_tables = SymbolTables::default();
+
+    for (batch_index, batch) in batches.into_iter().enumerate() {
+        if batch.files.is_empty() {
+            continue;
+        }
+
+        if !snapshot.is_current(version) {
+            record_recompute_discard(&span, started_at, "before_batch_analysis", Some(batch_index));
+            return false;
+        }
+
+        let result = analyze_with_context(batch, version, batch_index);
+        symbol_tables.extend(result.symbol_tables);
+        for (uri, mut batch_diagnostics) in result.diagnostics {
+            diagnostics.entry(uri).or_default().append(&mut batch_diagnostics);
+        }
+
+        if !snapshot.is_current(version) {
+            record_recompute_discard(&span, started_at, "after_batch_analysis", Some(batch_index));
+            return false;
+        }
+    }
+
+    if !snapshot.is_current(version) {
+        record_recompute_discard(&span, started_at, "before_publish", None);
+        return false;
+    }
+
+    snapshot.set_symbol_tables(symbol_tables);
+    snapshot.publish_diagnostics_with_generation(DiagnosticOwner::Compiler, diagnostics, version);
+    span.record("work_elapsed_ms", duration_ms(started_at.elapsed()));
+    true
 }
 
 fn watched_file_registration_params() -> RegistrationParams {
@@ -316,7 +460,29 @@ impl GlobalStateSnapshot {
         self.flycheck_versions.read().get(owner).copied().unwrap_or_default() == version
     }
 
+    #[cfg(test)]
     fn analysis_batches(&self, disk_paths: Vec<PathBuf>) -> Vec<AnalysisBatch> {
+        self.analysis_batches_with_generation(disk_paths, 0)
+    }
+
+    fn analysis_batches_with_generation(
+        &self,
+        disk_paths: Vec<PathBuf>,
+        generation: usize,
+    ) -> Vec<AnalysisBatch> {
+        let started_at = Instant::now();
+        let span = debug_span!(
+            "lsp_analysis_batches",
+            generation,
+            requested_disk_files = disk_paths.len(),
+            workspace_count = field::Empty,
+            vfs_file_count = field::Empty,
+            file_count = field::Empty,
+            total_bytes = field::Empty,
+            elapsed_ms = field::Empty,
+        );
+        let _guard = span.enter();
+
         let vfs_files = self
             .vfs
             .read()
@@ -325,7 +491,9 @@ impl GlobalStateSnapshot {
                 Some((path.as_path()?.to_path_buf(), contents.to_string()))
             })
             .collect::<Vec<_>>();
+        span.record("vfs_file_count", vfs_files.len());
         let workspaces = self.analysis_workspaces();
+        span.record("workspace_count", workspaces.len());
         let workspace_path_index = WorkspacePathIndex::new(&workspaces);
         let mut batches = workspaces
             .iter()
@@ -372,6 +540,9 @@ impl GlobalStateSnapshot {
         for batch in &mut batches {
             batch.finish();
         }
+        span.record("file_count", batches.iter().map(AnalysisBatch::file_count).sum::<usize>());
+        span.record("total_bytes", batches.iter().map(AnalysisBatch::total_bytes).sum::<usize>());
+        span.record("elapsed_ms", duration_ms(started_at.elapsed()));
         batches
     }
 
@@ -389,12 +560,52 @@ impl GlobalStateSnapshot {
     }
 
     fn publish_diagnostics(&mut self, owner: DiagnosticOwner, diagnostics: DiagnosticMap) {
+        self.publish_diagnostics_inner(owner, diagnostics, None);
+    }
+
+    fn publish_diagnostics_with_generation(
+        &mut self,
+        owner: DiagnosticOwner,
+        diagnostics: DiagnosticMap,
+        generation: usize,
+    ) {
+        self.publish_diagnostics_inner(owner, diagnostics, Some(generation));
+    }
+
+    fn publish_diagnostics_inner(
+        &mut self,
+        owner: DiagnosticOwner,
+        diagnostics: DiagnosticMap,
+        generation: Option<usize>,
+    ) {
+        let started_at = Instant::now();
+        let span = debug_span!(
+            "lsp_diagnostics_publish",
+            generation = field::Empty,
+            owner = ?owner,
+            uri_count = diagnostics.len(),
+            diagnostic_count = diagnostics.values().map(Vec::len).sum::<usize>(),
+            published_uri_count = field::Empty,
+            published_diagnostic_count = field::Empty,
+            elapsed_ms = field::Empty,
+        );
+        if let Some(generation) = generation {
+            span.record("generation", generation);
+        }
+        let _guard = span.enter();
+
         let batches = {
             let mut store = self.diagnostics.write();
             store.replace_and_publish_batches(owner, diagnostics)
         };
+        span.record("published_uri_count", batches.len());
+        span.record(
+            "published_diagnostic_count",
+            batches.iter().map(|(_, diagnostics)| diagnostics.len()).sum::<usize>(),
+        );
 
         publish_diagnostic_batches(&mut self.client, batches);
+        span.record("elapsed_ms", duration_ms(started_at.elapsed()));
     }
 }
 
@@ -405,6 +616,14 @@ struct AnalysisBatch {
 }
 
 impl AnalysisBatch {
+    fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.files.iter().map(|(_, contents)| contents.len()).sum()
+    }
+
     fn push_file(&mut self, path: PathBuf, contents: String) {
         if self.seen_paths.insert(path.clone()) {
             self.files.push((path, contents));
@@ -416,7 +635,22 @@ impl AnalysisBatch {
     }
 }
 
+#[cfg(test)]
 fn analyze(batch: AnalysisBatch) -> AnalysisResult {
+    analyze_with_context(batch, 0, 0)
+}
+
+fn analyze_with_context(
+    batch: AnalysisBatch,
+    generation: usize,
+    batch_index: usize,
+) -> AnalysisResult {
+    let file_count = batch.file_count();
+    let total_bytes = batch.total_bytes();
+    let _guard =
+        debug_span!("lsp_analyze_batch", generation, batch_index, file_count, total_bytes,)
+            .entered();
+
     let (emitter, diag_buffer) = InMemoryEmitter::new();
     let mut opts = batch.opts;
     opts.unstable.typeck = true;
@@ -424,47 +658,94 @@ fn analyze(batch: AnalysisBatch) -> AnalysisResult {
 
     let mut compiler = Compiler::new(sess);
     compiler.enter_mut(move |compiler| {
-        {
-            let mut parsing_context = compiler.parse();
-            let files = batch
-                .files
-                .into_iter()
-                .map(|(path, contents)| {
-                    parsing_context
-                        .sess
-                        .source_map()
-                        .new_source_file(FileName::real(path), contents)
-                        .map_err(|error| {
-                            parsing_context
-                                .dcx()
-                                .err(format!("failed to load source: {error}"))
-                                .emit()
-                        })
-                })
-                .collect::<solar_interface::Result<Vec<_>>>();
+        let parsed = debug_span!("lsp_parse", generation, batch_index, file_count, total_bytes,)
+            .in_scope(|| {
+                let mut parsing_context = compiler.parse();
+                let files = batch
+                    .files
+                    .into_iter()
+                    .map(|(path, contents)| {
+                        parsing_context
+                            .sess
+                            .source_map()
+                            .new_source_file(FileName::real(path), contents)
+                            .map_err(|error| {
+                                parsing_context
+                                    .dcx()
+                                    .err(format!("failed to load source: {error}"))
+                                    .emit()
+                            })
+                    })
+                    .collect::<solar_interface::Result<Vec<_>>>();
 
-            if let Ok(files) = files {
-                parsing_context.add_files(files);
-                parsing_context.parse();
+                if let Ok(files) = files {
+                    parsing_context.add_files(files);
+                    parsing_context.parse();
+                    true
+                } else {
+                    false
+                }
+            });
 
-                compiler.sources_mut().topo_sort();
-                let _ = compiler.lower_asts();
-                let _ = compiler.analysis();
-            }
+        if parsed {
+            compiler.sources_mut().topo_sort();
+            debug_span!("lsp_lower", generation, batch_index, file_count, total_bytes,).in_scope(
+                || {
+                    let _ = compiler.lower_asts();
+                },
+            );
+            debug_span!("lsp_analysis", generation, batch_index, file_count, total_bytes,)
+                .in_scope(|| {
+                    let _ = compiler.analysis();
+                });
         }
 
-        let symbol_tables = SymbolTables::build(compiler.gcx());
-        let diagnostics = diag_buffer
-            .read()
-            .iter()
-            .filter_map(|diag| proto::diagnostic(compiler.sess().source_map(), diag))
-            .fold(DiagnosticMap::default(), |mut diagnostics, (uri, diag)| {
-                diagnostics.entry(uri).or_default().push(diag);
-                diagnostics
-            });
+        let symbol_tables = debug_span!(
+            "lsp_symbol_tables_build",
+            generation,
+            batch_index,
+            file_count,
+            total_bytes,
+        )
+        .in_scope(|| SymbolTables::build(compiler.gcx()));
+        let diagnostics = debug_span!(
+            "lsp_diagnostics_collect",
+            generation,
+            batch_index,
+            file_count,
+            total_bytes,
+        )
+        .in_scope(|| {
+            diag_buffer
+                .read()
+                .iter()
+                .filter_map(|diag| proto::diagnostic(compiler.sess().source_map(), diag))
+                .fold(DiagnosticMap::default(), |mut diagnostics, (uri, diag)| {
+                    diagnostics.entry(uri).or_default().push(diag);
+                    diagnostics
+                })
+        });
 
         AnalysisResult { diagnostics, symbol_tables }
     })
+}
+
+fn record_recompute_discard(
+    span: &Span,
+    started_at: Instant,
+    stage: &'static str,
+    batch_index: Option<usize>,
+) {
+    span.record("discarded", true);
+    span.record("discard_stage", stage);
+    if let Some(batch_index) = batch_index {
+        span.record("discard_batch", batch_index);
+    }
+    span.record("work_elapsed_ms", duration_ms(started_at.elapsed()));
+}
+
+fn duration_ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 #[cfg(test)]
@@ -503,6 +784,56 @@ mod tests {
 
     fn flycheck_owner(workspace: impl Into<PathBuf>) -> DiagnosticOwner {
         DiagnosticOwner::Flycheck { id: "slow".into(), workspace: workspace.into() }
+    }
+
+    fn analysis_request(version: usize, disk_paths: &[&str]) -> AnalysisRequest {
+        let state = GlobalState::new(ClientSocket::new_closed());
+        AnalysisRequest {
+            version,
+            snapshot: state.snapshot(),
+            disk_paths: disk_paths.iter().map(PathBuf::from).collect(),
+            queued_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn analysis_scheduler_keeps_latest_request_and_merges_disk_paths() {
+        let mut scheduler = AnalysisScheduler::default();
+
+        let first = scheduler.enqueue(analysis_request(1, &["/A.sol"])).unwrap();
+        assert_eq!(first.version, 1);
+        assert!(scheduler.enqueue(analysis_request(2, &["/B.sol"])).is_none());
+        assert!(scheduler.enqueue(analysis_request(3, &["/C.sol"])).is_none());
+
+        let pending = scheduler.pending.unwrap();
+        assert_eq!(pending.version, 3);
+        assert_eq!(pending.disk_paths, [PathBuf::from("/B.sol"), PathBuf::from("/C.sol")]);
+    }
+
+    #[test]
+    fn analysis_scheduler_waits_for_quiet_period_before_running_latest_request() {
+        let mut scheduler = AnalysisScheduler::default();
+        let first = scheduler.enqueue(analysis_request(1, &["/A.sol"])).unwrap();
+        let queued_at = Instant::now();
+        let mut pending = analysis_request(2, &["/B.sol"]);
+        pending.queued_at = queued_at;
+        assert!(scheduler.enqueue(pending).is_none());
+
+        let mut carried_disk_paths = first.disk_paths;
+        let NextAnalysis::Wait(delay) =
+            scheduler.next_request(queued_at + Duration::from_millis(24), &mut carried_disk_paths)
+        else {
+            panic!("latest request should wait for the quiet period")
+        };
+        assert_eq!(delay, Duration::from_millis(1));
+
+        let NextAnalysis::Run(request) =
+            scheduler.next_request(queued_at + Duration::from_millis(25), &mut carried_disk_paths)
+        else {
+            panic!("latest request should run after the quiet period")
+        };
+        assert_eq!(request.version, 2);
+        assert_eq!(request.disk_paths, [PathBuf::from("/A.sol"), PathBuf::from("/B.sol")]);
     }
 
     #[test]
