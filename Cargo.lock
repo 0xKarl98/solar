@@ -3346,6 +3346,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "solar-lsp-bench"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "solar-macros"
 version = "0.2.0"
 dependencies = [
