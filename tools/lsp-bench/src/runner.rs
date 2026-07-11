@@ -22,7 +22,6 @@ use std::{
 const SLOW_TYPING_TEXT: &str = "_slow_typing_exercises_completed";
 const FAST_TYPING_TEXT: &str = "_fast_typing_produces_a_burst_while_earlier_analyses_are_running";
 const REQUEST_TYPING_TEXT: &str = "_requests_during_edit";
-const NAVIGATION_MODULES: [usize; 9] = [0, 20, 40, 60, 80, 100, 120, 140, 160];
 const CROSS_FILE_MODULES: [usize; 4] = [20, 60, 100, 140];
 
 pub(crate) struct CompareOptions {
@@ -135,7 +134,6 @@ fn run_once(spec: &RunSpec, timeout: Duration) -> RunSample {
         Ok(fixture) => fixture,
         Err(error) => return failed_sample(spec, error, Observations::default()),
     };
-    let process_started = Instant::now();
     let process = match LspProcess::spawn(&spec.binary, fixture.root(), timeout) {
         Ok(process) => process,
         Err(error) => return failed_sample(spec, error, Observations::default()),
@@ -148,14 +146,10 @@ fn run_once(spec: &RunSpec, timeout: Duration) -> RunSample {
         return failed_sample(spec, error, observations);
     }
 
-    let result = if spec.scenario == Scenario::Startup {
-        session.run_startup(process_started)
-    } else {
-        session.prepare().and_then(|()| {
-            session.process.clear_observations();
-            session.run(spec.scenario)
-        })
-    };
+    let result = session.prepare().and_then(|()| {
+        session.process.clear_observations();
+        session.run(spec.scenario)
+    });
     let observations = session.process.observations().clone();
     let graceful = result.is_ok();
     let process = session.process.finish(graceful);
@@ -245,13 +239,7 @@ impl BenchmarkSession {
                 "clientInfo": {"name": "solar-lsp-bench", "version": env!("CARGO_PKG_VERSION")},
                 "rootUri": root_uri,
                 "capabilities": {
-                    "workspace": {
-                        "workspaceFolders": true,
-                        "didChangeWatchedFiles": {"dynamicRegistration": true}
-                    },
-                    "textDocument": {
-                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": true}
-                    }
+                    "workspace": {"workspaceFolders": true}
                 },
                 "initializationOptions": {"flychecks": []},
                 "workspaceFolders": [{"uri": root_uri, "name": "solar-lsp-bench"}]
@@ -267,25 +255,12 @@ impl BenchmarkSession {
         Ok(())
     }
 
-    fn run_startup(&mut self, started_at: Instant) -> Result<ScenarioOutcome> {
-        let path = self.fixture.treasury_path();
-        self.open_document(&path)?;
-        let latency = self.process.wait_for_diagnostics(STARTUP_MARKER)?;
-        Ok(ScenarioOutcome {
-            wall_ms: duration_ms(started_at.elapsed()),
-            analysis_latencies_ms: vec![latency],
-        })
-    }
-
     fn run(&mut self, scenario: Scenario) -> Result<ScenarioOutcome> {
         match scenario {
-            Scenario::Startup => unreachable!(),
             Scenario::SlowTyping => self.typing(SLOW_TYPING_TEXT, Duration::from_millis(110)),
             Scenario::FastTyping => self.typing(FAST_TYPING_TEXT, Duration::from_millis(2)),
-            Scenario::FileNavigation => self.file_navigation(),
             Scenario::CrossFileEdits => self.cross_file_edits(),
             Scenario::RequestsDuringEdit => self.requests_during_edit(),
-            Scenario::WatchedFiles => self.watched_files(),
         }
     }
 
@@ -304,34 +279,6 @@ impl BenchmarkSession {
         Ok(ScenarioOutcome {
             wall_ms: duration_ms(started_at.elapsed()),
             analysis_latencies_ms: vec![latency],
-        })
-    }
-
-    fn file_navigation(&mut self) -> Result<ScenarioOutcome> {
-        let started_at = Instant::now();
-        let mut latencies = Vec::new();
-        let mut paths = NAVIGATION_MODULES.map(|module| self.fixture.module_path(module)).to_vec();
-        paths.extend([
-            self.fixture.root().join("src/Owned.sol"),
-            self.fixture.root().join("src/lib/PercentMath.sol"),
-            self.fixture.treasury_path(),
-        ]);
-
-        for path in paths {
-            if self.documents.contains_key(&path) {
-                let uri = file_uri(&path)?;
-                self.process.request(
-                    "textDocument/documentSymbol",
-                    json!({"textDocument": {"uri": uri}}),
-                )?;
-            } else {
-                self.open_document(&path)?;
-                latencies.push(self.process.wait_for_diagnostics(STARTUP_MARKER)?);
-            }
-        }
-        Ok(ScenarioOutcome {
-            wall_ms: duration_ms(started_at.elapsed()),
-            analysis_latencies_ms: latencies,
         })
     }
 
@@ -415,37 +362,6 @@ impl BenchmarkSession {
             wall_ms: duration_ms(started_at.elapsed()),
             analysis_latencies_ms: vec![latency],
         })
-    }
-
-    fn watched_files(&mut self) -> Result<ScenarioOutcome> {
-        let started_at = Instant::now();
-        let path = self.fixture.root().join("src/Watched.sol");
-        let uri = file_uri(&path)?;
-        let mut latencies = Vec::new();
-
-        fs::write(&path, "pragma solidity ^0.8.0; contract Watched {}\n")?;
-        self.watched_file_event(&uri, 1)?;
-        latencies.push(self.process.wait_for_diagnostics(STARTUP_MARKER)?);
-
-        fs::write(&path, "pragma solidity ^0.8.0; contract Watched { uint256 value; }\n")?;
-        self.watched_file_event(&uri, 2)?;
-        latencies.push(self.process.wait_for_diagnostics(STARTUP_MARKER)?);
-
-        fs::remove_file(&path)?;
-        self.watched_file_event(&uri, 3)?;
-        latencies.push(self.process.wait_for_diagnostics(STARTUP_MARKER)?);
-
-        Ok(ScenarioOutcome {
-            wall_ms: duration_ms(started_at.elapsed()),
-            analysis_latencies_ms: latencies,
-        })
-    }
-
-    fn watched_file_event(&mut self, uri: &Url, typ: u8) -> Result<()> {
-        self.process.notify(
-            "workspace/didChangeWatchedFiles",
-            json!({"changes": [{"uri": uri, "type": typ}]}),
-        )
     }
 
     fn open_document(&mut self, path: &Path) -> Result<()> {

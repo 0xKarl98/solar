@@ -182,9 +182,92 @@ pub(crate) fn write_reports(
     Ok(())
 }
 
+pub(crate) fn terminal(report: &SummaryReport) -> String {
+    let mut output = String::from(
+        "Solar LSP benchmark results\n\
+         Lower is better; change compares candidate with baseline.\n\n\
+         Scenario                Metric                     Baseline      Candidate      Change\n\
+         ----------------------  ----------------------  -----------  -------------  ----------\n",
+    );
+    let mut wrote_scenario = false;
+
+    for &scenario in &report.config.scenarios {
+        let baseline = report
+            .summaries
+            .iter()
+            .find(|summary| summary.scenario == scenario && summary.label == "baseline");
+        let candidate = report
+            .summaries
+            .iter()
+            .find(|summary| summary.scenario == scenario && summary.label == "candidate");
+        let (Some(baseline), Some(candidate)) = (baseline, candidate) else { continue };
+
+        if wrote_scenario {
+            output.push('\n');
+        }
+        wrote_scenario = true;
+
+        let metrics = [
+            (
+                "Wall p50 (ms)",
+                baseline.scenario_wall_ms.count,
+                baseline.scenario_wall_ms.p50,
+                candidate.scenario_wall_ms.count,
+                candidate.scenario_wall_ms.p50,
+            ),
+            (
+                "Wall p95 (ms)",
+                baseline.scenario_wall_ms.count,
+                baseline.scenario_wall_ms.p95,
+                candidate.scenario_wall_ms.count,
+                candidate.scenario_wall_ms.p95,
+            ),
+            (
+                "Peak RSS max (MiB)",
+                baseline.peak_rss_mib.count,
+                baseline.peak_rss_mib.max,
+                candidate.peak_rss_mib.count,
+                candidate.peak_rss_mib.max,
+            ),
+        ];
+        for (index, (metric, baseline_count, baseline_value, candidate_count, candidate_value)) in
+            metrics.into_iter().enumerate()
+        {
+            let scenario = if index == 0 { scenario.name() } else { "" };
+            let baseline = display_value(baseline_count, baseline_value);
+            let candidate = display_value(candidate_count, candidate_value);
+            let change =
+                display_change(baseline_count, baseline_value, candidate_count, candidate_value);
+            let _ = writeln!(
+                output,
+                "{scenario:<22}  {metric:<22}  {baseline:>11}  {candidate:>13}  {change:>10}",
+            );
+        }
+    }
+
+    output
+}
+
+fn display_value(count: usize, value: f64) -> String {
+    if count == 0 { "n/a".into() } else { format!("{value:.2}") }
+}
+
+fn display_change(
+    baseline_count: usize,
+    baseline: f64,
+    candidate_count: usize,
+    candidate: f64,
+) -> String {
+    if baseline_count == 0 || candidate_count == 0 || baseline == 0.0 {
+        "n/a".into()
+    } else {
+        format!("{:+.2}%", (candidate / baseline - 1.0) * 100.0)
+    }
+}
+
 fn markdown(report: &SummaryReport) -> String {
     let mut output = String::from(
-        "# Solar LSP benchmark\n\n| Binary | Scenario | Runs | Wall p50 | Wall p95 | Analysis p95 | CPU p50 | Peak RSS |\n|---|---|---:|---:|---:|---:|---:|---:|\n",
+        "# Solar LSP benchmark\n\n| Binary | Scenario | Runs | Wall p50 | Wall p95 | Analysis p95 | CPU p50 | Peak RSS max |\n|---|---|---:|---:|---:|---:|---:|---:|\n",
     );
     for summary in &report.summaries {
         let _ = writeln!(
@@ -240,7 +323,75 @@ fn percentile(sorted: &[f64], ratio: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::process::Observations;
+    use snapbox::{assert_data_eq, str};
     use std::path::PathBuf;
+
+    #[test]
+    fn terminal_report_makes_metrics_and_comparison_explicit() {
+        let report = SummaryReport {
+            schema_version: SCHEMA_VERSION,
+            config: HarnessConfig {
+                repeat: 10,
+                timeout_ms: 10_000,
+                scenarios: vec![Scenario::SlowTyping],
+                fixture_file_count: 184,
+            },
+            environment: Environment::current(),
+            binaries: Vec::new(),
+            summaries: vec![
+                scenario_summary("baseline", 100.0, 120.0, 50.0),
+                scenario_summary("candidate", 90.0, 126.0, 40.0),
+            ],
+        };
+
+        assert_data_eq!(
+            terminal(&report),
+            str![[r#"
+Solar LSP benchmark results
+Lower is better; change compares candidate with baseline.
+
+Scenario                Metric                     Baseline      Candidate      Change
+----------------------  ----------------------  -----------  -------------  ----------
+slow-typing             Wall p50 (ms)                100.00          90.00     -10.00%
+                        Wall p95 (ms)                120.00         126.00      +5.00%
+                        Peak RSS max (MiB)            50.00          40.00     -20.00%
+
+"#]],
+        );
+    }
+
+    fn scenario_summary(
+        label: &'static str,
+        wall_p50: f64,
+        wall_p95: f64,
+        peak_rss_max: f64,
+    ) -> ScenarioSummary {
+        let empty = Stats::new(&[]);
+        ScenarioSummary {
+            label,
+            scenario: Scenario::SlowTyping,
+            successful_runs: 10,
+            failed_runs: 0,
+            scenario_wall_ms: Stats {
+                count: 10,
+                mean: wall_p50,
+                p50: wall_p50,
+                p95: wall_p95,
+                max: wall_p95,
+            },
+            analysis_latency_ms: empty,
+            request_latency_ms: empty,
+            process_cpu_ms: empty,
+            peak_rss_mib: Stats {
+                count: 10,
+                mean: peak_rss_max,
+                p50: peak_rss_max,
+                p95: peak_rss_max,
+                max: peak_rss_max,
+            },
+            diagnostic_publications: empty,
+        }
+    }
 
     #[test]
     fn summary_uses_nearest_rank_percentiles() {
@@ -258,7 +409,7 @@ mod tests {
             RunSample {
                 label: "baseline",
                 binary: PathBuf::from("solar"),
-                scenario: Scenario::Startup,
+                scenario: Scenario::SlowTyping,
                 repetition: 0,
                 status: RunStatus::Ok,
                 scenario_wall_ms: Some(10.0),
@@ -270,7 +421,7 @@ mod tests {
             RunSample {
                 label: "baseline",
                 binary: PathBuf::from("solar"),
-                scenario: Scenario::Startup,
+                scenario: Scenario::SlowTyping,
                 repetition: 1,
                 status: RunStatus::Failed,
                 scenario_wall_ms: None,
@@ -284,7 +435,7 @@ mod tests {
             HarnessConfig {
                 repeat: 2,
                 timeout_ms: 1_000,
-                scenarios: vec![Scenario::Startup],
+                scenarios: vec![Scenario::SlowTyping],
                 fixture_file_count: 184,
             },
             Vec::new(),

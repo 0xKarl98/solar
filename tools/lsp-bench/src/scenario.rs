@@ -5,35 +5,22 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Scenario {
-    Startup,
     SlowTyping,
     FastTyping,
-    FileNavigation,
     CrossFileEdits,
     RequestsDuringEdit,
-    WatchedFiles,
 }
 
 impl Scenario {
-    pub(crate) const ALL: [Self; 7] = [
-        Self::Startup,
-        Self::SlowTyping,
-        Self::FastTyping,
-        Self::FileNavigation,
-        Self::CrossFileEdits,
-        Self::RequestsDuringEdit,
-        Self::WatchedFiles,
-    ];
+    pub(crate) const ALL: [Self; 4] =
+        [Self::SlowTyping, Self::FastTyping, Self::CrossFileEdits, Self::RequestsDuringEdit];
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
-            Self::Startup => "startup",
             Self::SlowTyping => "slow-typing",
             Self::FastTyping => "fast-typing",
-            Self::FileNavigation => "file-navigation",
             Self::CrossFileEdits => "cross-file-edits",
             Self::RequestsDuringEdit => "requests-during-edit",
-            Self::WatchedFiles => "watched-files",
         }
     }
 }
@@ -41,26 +28,20 @@ impl Scenario {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum Selection {
     All,
-    Startup,
     SlowTyping,
     FastTyping,
-    FileNavigation,
     CrossFileEdits,
     RequestsDuringEdit,
-    WatchedFiles,
 }
 
 impl Selection {
     pub(crate) fn scenarios(self) -> Vec<Scenario> {
         match self {
             Self::All => Scenario::ALL.to_vec(),
-            Self::Startup => vec![Scenario::Startup],
             Self::SlowTyping => vec![Scenario::SlowTyping],
             Self::FastTyping => vec![Scenario::FastTyping],
-            Self::FileNavigation => vec![Scenario::FileNavigation],
             Self::CrossFileEdits => vec![Scenario::CrossFileEdits],
             Self::RequestsDuringEdit => vec![Scenario::RequestsDuringEdit],
-            Self::WatchedFiles => vec![Scenario::WatchedFiles],
         }
     }
 }
@@ -104,14 +85,22 @@ mod tests {
 
     #[test]
     fn all_selects_every_core_scenario() {
-        assert_eq!(Selection::All.scenarios(), Scenario::ALL);
+        assert_eq!(
+            Selection::All.scenarios(),
+            [
+                Scenario::SlowTyping,
+                Scenario::FastTyping,
+                Scenario::CrossFileEdits,
+                Scenario::RequestsDuringEdit,
+            ]
+        );
     }
 
     #[test]
     fn comparison_plan_alternates_binary_order() {
         let baseline = PathBuf::from("baseline");
         let candidate = PathBuf::from("candidate");
-        let plan = comparison_plan(&baseline, &candidate, &[Scenario::Startup], 3);
+        let plan = comparison_plan(&baseline, &candidate, &[Scenario::SlowTyping], 3);
         let labels = plan.iter().map(|run| run.label).collect::<Vec<_>>();
 
         assert_eq!(

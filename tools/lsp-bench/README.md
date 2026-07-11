@@ -24,14 +24,11 @@ External flychecks are disabled.
 
 ## Scenarios
 
-- `startup`: process start, LSP initialization, document open, and first matching diagnostics.
 - `slow-typing`: identifier edits spaced 110 ms apart.
 - `fast-typing`: identifier edits spaced 2 ms apart.
-- `file-navigation`: open a fixed sequence of Solidity files and return to the initial file.
 - `cross-file-edits`: edit four fixed files with 4 ms between changes, then save them.
 - `requests-during-edit`: issue completion, definition, references, and inlay-hint requests while
   editing.
-- `watched-files`: create, change, and delete a Solidity file on disk.
 
 `--scenario all` runs every scenario independently. Use `--help` to list all options.
 

@@ -63,17 +63,8 @@ fn main() -> Result<()> {
                 timeout: Duration::from_secs(timeout_secs),
                 output: output.clone(),
             })?;
-            for summary in &outcome.summary.summaries {
-                println!(
-                    "{:<9} {:<22} wall p50 {:>8.2} ms  p95 {:>8.2} ms  peak RSS {:>7.2} MiB",
-                    summary.label,
-                    summary.scenario.name(),
-                    summary.scenario_wall_ms.p50,
-                    summary.scenario_wall_ms.p95,
-                    summary.peak_rss_mib.max,
-                );
-            }
-            println!("reports: {}", output.display());
+            print!("{}", report::terminal(&outcome.summary));
+            println!("Reports: {}", output.display());
             if outcome.failed_runs != 0 {
                 bail!("{} benchmark run(s) failed", outcome.failed_runs)
             }
