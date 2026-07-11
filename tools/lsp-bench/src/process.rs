@@ -5,14 +5,13 @@ use serde_json::{Value, json};
 use std::{
     io::{BufReader, Read},
     path::Path,
-    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+const PUBLISH_DIAGNOSTICS: &str = "textDocument/publishDiagnostics";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -37,19 +36,20 @@ pub(crate) struct RequestMeasurement {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct Observations {
-    pub(crate) diagnostic_publications: usize,
+    pub(crate) solar_diagnostic_publications: usize,
     pub(crate) requests: Vec<RequestMeasurement>,
     pub(crate) events: Vec<TraceEvent>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ProcessMetrics {
-    pub(crate) wall_ms: f64,
-    pub(crate) user_cpu_ms: Option<f64>,
-    pub(crate) system_cpu_ms: Option<f64>,
-    pub(crate) peak_rss_mib: Option<f64>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) stderr: String,
+}
+
+pub(crate) struct FinishedProcess {
+    pub(crate) metrics: ProcessMetrics,
+    pub(crate) observations: Observations,
 }
 
 pub(crate) struct LspProcess {
@@ -62,7 +62,7 @@ pub(crate) struct LspProcess {
     next_id: i64,
     timeout: Duration,
     started_at: Instant,
-    observed_diagnostic_uri: Option<String>,
+    sentinel_uri: Option<String>,
     observations: Observations,
 }
 
@@ -119,7 +119,7 @@ impl LspProcess {
             next_id: 1,
             timeout,
             started_at,
-            observed_diagnostic_uri: None,
+            sentinel_uri: None,
             observations: Observations::default(),
         })
     }
@@ -163,27 +163,31 @@ impl LspProcess {
         }
     }
 
-    pub(crate) fn wait_for_diagnostics(&mut self, marker: &str) -> Result<f64> {
+    pub(crate) fn wait_for_solar_marker(&mut self, uri: &str, marker: &str) -> Result<f64> {
+        self.wait_for_diagnostics(|message| solar_marker_matches(message, uri, marker))
+    }
+
+    pub(crate) fn wait_for_no_solar_diagnostics(&mut self, uri: &str) -> Result<f64> {
+        self.wait_for_diagnostics(|message| no_solar_diagnostics_match(message, uri))
+    }
+
+    pub(crate) fn wait_for_diagnostic(
+        &mut self,
+        uri: &str,
+        source: &str,
+        code: &str,
+    ) -> Result<f64> {
+        self.wait_for_diagnostics(|message| diagnostic_matches(message, uri, source, code))
+    }
+
+    fn wait_for_diagnostics(&mut self, matches: impl Fn(&Value) -> bool) -> Result<f64> {
         let started_at = Instant::now();
         let deadline = Instant::now() + self.timeout;
         loop {
             let message = self.receive(deadline)?;
-            if message.get("method").and_then(Value::as_str)
-                == Some("textDocument/publishDiagnostics")
-            {
+            if message.get("method").and_then(Value::as_str) == Some(PUBLISH_DIAGNOSTICS) {
                 self.record_diagnostics(&message);
-                let contains_marker = message
-                    .pointer("/params/diagnostics")
-                    .and_then(Value::as_array)
-                    .is_some_and(|diagnostics| {
-                        diagnostics.iter().any(|diagnostic| {
-                            diagnostic
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .is_some_and(|message| message.contains(marker))
-                        })
-                    });
-                if contains_marker {
+                if matches(&message) {
                     return Ok(duration_ms(started_at.elapsed()));
                 }
             } else {
@@ -192,12 +196,17 @@ impl LspProcess {
         }
     }
 
-    pub(crate) fn clear_observations(&mut self) {
-        self.observations = Observations::default();
+    pub(crate) fn clear_measurements(&mut self) {
+        self.observations.solar_diagnostic_publications = 0;
+        self.observations.requests.clear();
     }
 
-    pub(crate) fn observe_diagnostics_for(&mut self, uri: impl Into<String>) {
-        self.observed_diagnostic_uri = Some(uri.into());
+    pub(crate) fn observe_solar_diagnostics_for(&mut self, uri: impl Into<String>) {
+        self.sentinel_uri = Some(uri.into());
+    }
+
+    pub(crate) fn solar_diagnostic_publications(&self) -> usize {
+        self.observations.solar_diagnostic_publications
     }
 
     pub(crate) fn observations(&self) -> &Observations {
@@ -224,8 +233,7 @@ impl LspProcess {
     }
 
     fn handle_unsolicited(&mut self, message: Value) -> Result<()> {
-        if message.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
-        {
+        if message.get("method").and_then(Value::as_str) == Some(PUBLISH_DIAGNOSTICS) {
             self.record_diagnostics(&message);
         }
 
@@ -238,9 +246,12 @@ impl LspProcess {
     }
 
     fn record_diagnostics(&mut self, message: &Value) {
-        let uri = message.pointer("/params/uri").and_then(Value::as_str);
-        if self.observed_diagnostic_uri.as_deref().is_none_or(|observed| uri == Some(observed)) {
-            self.observations.diagnostic_publications += 1;
+        if self.sentinel_uri.as_deref().is_some_and(|uri| message_uri(message) == Some(uri))
+            && diagnostics(message).is_some_and(|diagnostics| {
+                diagnostics.iter().any(|diagnostic| diagnostic_source(diagnostic) == Some("solar"))
+            })
+        {
+            self.observations.solar_diagnostic_publications += 1;
         }
     }
 
@@ -253,7 +264,7 @@ impl LspProcess {
         });
     }
 
-    pub(crate) fn finish(mut self, graceful: bool) -> Result<ProcessMetrics> {
+    pub(crate) fn finish(mut self, graceful: bool) -> Result<FinishedProcess> {
         let mut shutdown_error = None;
         if graceful {
             if let Err(error) = self.setup_request("shutdown", Value::Null) {
@@ -267,8 +278,8 @@ impl LspProcess {
         }
         drop(self.stdin.take());
 
-        let wall_ms = duration_ms(self.started_at.elapsed());
-        let (status, usage) = wait_with_usage(self.child.take().unwrap())?;
+        let status = self.child.as_mut().unwrap().wait()?;
+        self.child.take();
         if let Some(thread) = self.stdout_thread.take() {
             let _ = thread.join();
         }
@@ -280,13 +291,9 @@ impl LspProcess {
             return Err(error.context(format!("failed to stop LSP; stderr: {stderr}")));
         }
 
-        Ok(ProcessMetrics {
-            wall_ms,
-            user_cpu_ms: usage.user_cpu_ms,
-            system_cpu_ms: usage.system_cpu_ms,
-            peak_rss_mib: usage.peak_rss_mib,
-            exit_code: status.code(),
-            stderr,
+        Ok(FinishedProcess {
+            metrics: ProcessMetrics { exit_code: status.code(), stderr },
+            observations: std::mem::take(&mut self.observations),
         })
     }
 }
@@ -300,54 +307,46 @@ impl Drop for LspProcess {
     }
 }
 
-#[derive(Default)]
-struct ResourceUsage {
-    user_cpu_ms: Option<f64>,
-    system_cpu_ms: Option<f64>,
-    peak_rss_mib: Option<f64>,
+fn solar_marker_matches(message: &Value, uri: &str, marker: &str) -> bool {
+    message_uri(message) == Some(uri)
+        && diagnostics(message).is_some_and(|diagnostics| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic_source(diagnostic) == Some("solar")
+                    && diagnostic
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| message.contains(marker))
+            })
+        })
 }
 
-#[cfg(unix)]
-fn wait_with_usage(child: Child) -> Result<(ExitStatus, ResourceUsage)> {
-    let mut status = 0;
-    // SAFETY: `rusage` is a plain C struct that is valid when zero-initialized.
-    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
-    loop {
-        // SAFETY: `child.id()` is a live child PID and both output pointers are valid.
-        let result = unsafe { libc::wait4(child.id() as libc::pid_t, &mut status, 0, &mut usage) };
-        if result >= 0 {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINTR) {
-            return Err(error.into());
-        }
-    }
-    drop(child);
-
-    #[cfg(target_os = "macos")]
-    let peak_rss_mib = usage.ru_maxrss as f64 / (1024.0 * 1024.0);
-    #[cfg(not(target_os = "macos"))]
-    let peak_rss_mib = usage.ru_maxrss as f64 / 1024.0;
-
-    Ok((
-        ExitStatus::from_raw(status),
-        ResourceUsage {
-            user_cpu_ms: Some(timeval_ms(usage.ru_utime)),
-            system_cpu_ms: Some(timeval_ms(usage.ru_stime)),
-            peak_rss_mib: Some(peak_rss_mib),
-        },
-    ))
+fn no_solar_diagnostics_match(message: &Value, uri: &str) -> bool {
+    message_uri(message) == Some(uri)
+        && diagnostics(message).is_some_and(|diagnostics| {
+            diagnostics.iter().all(|diagnostic| diagnostic_source(diagnostic) != Some("solar"))
+        })
 }
 
-#[cfg(not(unix))]
-fn wait_with_usage(mut child: Child) -> Result<(ExitStatus, ResourceUsage)> {
-    child.wait().map(|status| (status, ResourceUsage::default())).map_err(Into::into)
+fn diagnostic_matches(message: &Value, uri: &str, source: &str, code: &str) -> bool {
+    message_uri(message) == Some(uri)
+        && diagnostics(message).is_some_and(|diagnostics| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic_source(diagnostic) == Some(source)
+                    && diagnostic.get("code").and_then(Value::as_str) == Some(code)
+            })
+        })
 }
 
-#[cfg(unix)]
-fn timeval_ms(value: libc::timeval) -> f64 {
-    value.tv_sec as f64 * 1_000.0 + value.tv_usec as f64 / 1_000.0
+fn message_uri(message: &Value) -> Option<&str> {
+    message.pointer("/params/uri").and_then(Value::as_str)
+}
+
+fn diagnostics(message: &Value) -> Option<&Vec<Value>> {
+    message.pointer("/params/diagnostics").and_then(Value::as_array)
+}
+
+fn diagnostic_source(diagnostic: &Value) -> Option<&str> {
+    diagnostic.get("source").and_then(Value::as_str)
 }
 
 fn duration_ms(duration: Duration) -> f64 {
@@ -359,21 +358,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn diagnostics_marker_matching_is_exact_to_the_message_contents() {
-        let message = json!({
-            "params": {"diagnostics": [{"message": "identifier `bench_final` not found"}]}
-        });
-        let diagnostics = message.pointer("/params/diagnostics").unwrap().as_array().unwrap();
+    fn solar_marker_requires_exact_uri_source_and_message_contents() {
+        let message = diagnostics_message(
+            "file:///workspace/src/Test.sol",
+            json!({"source": "solar", "message": "identifier `bench_final` not found"}),
+        );
 
-        assert!(
-            diagnostics.iter().any(|diagnostic| {
-                diagnostic["message"].as_str().unwrap().contains("bench_final")
-            })
+        assert!(solar_marker_matches(&message, "file:///workspace/src/Test.sol", "bench_final"));
+        assert!(!solar_marker_matches(&message, "file:///workspace/src/Other.sol", "bench_final"));
+        assert!(!solar_marker_matches(&message, "file:///workspace/src/Test.sol", "bench_other"));
+    }
+
+    #[test]
+    fn diagnostic_barriers_distinguish_compiler_and_forge_results() {
+        let uri = "file:///workspace/src/Test.sol";
+        let clean = diagnostics_message(uri, json!({"source": "forge-lint", "code": "other"}));
+        let forge = diagnostics_message(
+            uri,
+            json!({"source": "forge-lint", "code": "mixed-case-variable"}),
         );
-        assert!(
-            !diagnostics.iter().any(|diagnostic| {
-                diagnostic["message"].as_str().unwrap().contains("bench_other")
-            })
-        );
+
+        assert!(no_solar_diagnostics_match(&clean, uri));
+        assert!(diagnostic_matches(&forge, uri, "forge-lint", "mixed-case-variable"));
+        assert!(!diagnostic_matches(&forge, uri, "solar", "mixed-case-variable"));
+    }
+
+    #[test]
+    fn publications_only_count_solar_diagnostics_on_the_sentinel_uri() {
+        let sentinel = "file:///workspace/src/Sentinel.sol";
+        let solar = diagnostics_message(sentinel, json!({"source": "solar"}));
+        let forge = diagnostics_message(sentinel, json!({"source": "forge-lint"}));
+        let other =
+            diagnostics_message("file:///workspace/src/Other.sol", json!({"source": "solar"}));
+
+        assert!(message_has_counted_publication(&solar, sentinel));
+        assert!(!message_has_counted_publication(&forge, sentinel));
+        assert!(!message_has_counted_publication(&other, sentinel));
+    }
+
+    fn diagnostics_message(uri: &str, diagnostic: Value) -> Value {
+        json!({
+            "method": PUBLISH_DIAGNOSTICS,
+            "params": {"uri": uri, "diagnostics": [diagnostic]}
+        })
+    }
+
+    fn message_has_counted_publication(message: &Value, sentinel: &str) -> bool {
+        message_uri(message) == Some(sentinel)
+            && diagnostics(message)
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic_source(diagnostic) == Some("solar"))
     }
 }

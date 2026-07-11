@@ -12,7 +12,6 @@ mod process;
 mod protocol;
 mod report;
 mod runner;
-mod scenario;
 
 #[derive(Parser)]
 #[command(name = "solar-lsp-bench", version, about)]
@@ -33,11 +32,15 @@ enum Command {
         #[arg(long)]
         candidate: PathBuf,
 
-        /// Scenario to run, or `all` for every core scenario.
-        #[arg(long, value_enum, default_value = "all")]
-        scenario: scenario::Selection,
+        /// Clean checkout of the pinned Solady revision.
+        #[arg(long)]
+        project: PathBuf,
 
-        /// Independent process runs per binary and scenario.
+        /// Absolute path to a Forge binary that supports `forge lint`.
+        #[arg(long)]
+        forge: PathBuf,
+
+        /// Independent user-session runs per binary.
         #[arg(long, default_value_t = 10)]
         repeat: usize,
 
@@ -54,11 +57,12 @@ enum Command {
 fn main() -> Result<()> {
     let Cli { command } = Cli::parse();
     match command {
-        Command::Compare { baseline, candidate, scenario, repeat, timeout_secs, output } => {
+        Command::Compare { baseline, candidate, project, forge, repeat, timeout_secs, output } => {
             let outcome = runner::compare(runner::CompareOptions {
                 baseline,
                 candidate,
-                selection: scenario,
+                project,
+                forge,
                 repeat,
                 timeout: Duration::from_secs(timeout_secs),
                 output: output.clone(),

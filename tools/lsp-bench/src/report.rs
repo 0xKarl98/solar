@@ -1,17 +1,17 @@
 use crate::{
+    fixture::FixtureMetadata,
     process::{Observations, ProcessMetrics},
-    scenario::Scenario,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct BinaryMetadata {
@@ -21,11 +21,15 @@ pub(crate) struct BinaryMetadata {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub(crate) struct ForgeMetadata {
+    pub(crate) path: PathBuf,
+    pub(crate) version: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct HarnessConfig {
     pub(crate) repeat: usize,
     pub(crate) timeout_ms: u64,
-    pub(crate) scenarios: Vec<Scenario>,
-    pub(crate) fixture_file_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -46,6 +50,25 @@ impl Environment {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub(crate) struct LatencyMeasurement {
+    pub(crate) name: &'static str,
+    pub(crate) elapsed_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AnalysisActivity {
+    pub(crate) phase: &'static str,
+    pub(crate) solar_analysis_triggers: usize,
+    pub(crate) solar_diagnostic_publications: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SessionOutcome {
+    pub(crate) latencies: Vec<LatencyMeasurement>,
+    pub(crate) analysis_activity: Vec<AnalysisActivity>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum RunStatus {
     Ok,
@@ -56,11 +79,9 @@ pub(crate) enum RunStatus {
 pub(crate) struct RunSample {
     pub(crate) label: &'static str,
     pub(crate) binary: PathBuf,
-    pub(crate) scenario: Scenario,
     pub(crate) repetition: usize,
     pub(crate) status: RunStatus,
-    pub(crate) scenario_wall_ms: Option<f64>,
-    pub(crate) analysis_latencies_ms: Vec<f64>,
+    pub(crate) outcome: Option<SessionOutcome>,
     pub(crate) process: Option<ProcessMetrics>,
     pub(crate) observations: Observations,
     pub(crate) error: Option<String>,
@@ -73,17 +94,27 @@ impl RunSample {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct ScenarioSummary {
+pub(crate) struct NamedStats {
+    pub(crate) name: String,
+    pub(crate) stats: Stats,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AnalysisSummary {
+    pub(crate) phase: String,
+    pub(crate) solar_analysis_triggers: Stats,
+    pub(crate) solar_diagnostic_publications: Stats,
+    pub(crate) unpublished_analysis_proxy: Stats,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct BinarySummary {
     pub(crate) label: &'static str,
-    pub(crate) scenario: Scenario,
     pub(crate) successful_runs: usize,
     pub(crate) failed_runs: usize,
-    pub(crate) scenario_wall_ms: Stats,
-    pub(crate) analysis_latency_ms: Stats,
-    pub(crate) request_latency_ms: Stats,
-    pub(crate) process_cpu_ms: Stats,
-    pub(crate) peak_rss_mib: Stats,
-    pub(crate) diagnostic_publications: Stats,
+    pub(crate) latencies: Vec<NamedStats>,
+    pub(crate) requests: Vec<NamedStats>,
+    pub(crate) analysis_activity: Vec<AnalysisSummary>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -91,8 +122,10 @@ pub(crate) struct SummaryReport {
     pub(crate) schema_version: u32,
     pub(crate) config: HarnessConfig,
     pub(crate) environment: Environment,
+    pub(crate) fixture: FixtureMetadata,
+    pub(crate) forge: ForgeMetadata,
     pub(crate) binaries: Vec<BinaryMetadata>,
-    pub(crate) summaries: Vec<ScenarioSummary>,
+    pub(crate) summaries: Vec<BinarySummary>,
 }
 
 #[derive(Serialize)]
@@ -104,67 +137,91 @@ struct SamplesReport<'a> {
 pub(crate) fn summarize(
     config: HarnessConfig,
     binaries: Vec<BinaryMetadata>,
+    fixture: FixtureMetadata,
+    forge: ForgeMetadata,
     samples: &[RunSample],
-) -> SummaryReport {
-    let mut groups = BTreeMap::<(&'static str, Scenario), Vec<&RunSample>>::new();
-    for sample in samples {
-        groups.entry((sample.label, sample.scenario)).or_default().push(sample);
+) -> Result<SummaryReport> {
+    let mut summaries = Vec::with_capacity(binaries.len());
+    for binary in &binaries {
+        let runs = samples.iter().filter(|sample| sample.label == binary.label).collect::<Vec<_>>();
+        let successful =
+            runs.iter().copied().filter(|sample| sample.succeeded()).collect::<Vec<_>>();
+        let mut latencies = BTreeMap::<&str, Vec<f64>>::new();
+        let mut requests = BTreeMap::<&str, Vec<f64>>::new();
+        let mut activity = BTreeMap::<&str, ActivityValues>::new();
+
+        for sample in &successful {
+            let outcome =
+                sample.outcome.as_ref().context("successful run has no session outcome")?;
+            for measurement in &outcome.latencies {
+                latencies.entry(measurement.name).or_default().push(measurement.elapsed_ms);
+            }
+            for request in &sample.observations.requests {
+                requests.entry(&request.method).or_default().push(request.elapsed_ms);
+            }
+            for measurement in &outcome.analysis_activity {
+                let values = activity.entry(measurement.phase).or_default();
+                values.triggers.push(measurement.solar_analysis_triggers as f64);
+                values.publications.push(measurement.solar_diagnostic_publications as f64);
+                values.proxies.push(unpublished_analysis_proxy(measurement)? as f64);
+            }
+        }
+
+        summaries.push(BinarySummary {
+            label: binary.label,
+            successful_runs: successful.len(),
+            failed_runs: runs.len() - successful.len(),
+            latencies: named_stats(latencies),
+            requests: named_stats(requests),
+            analysis_activity: activity
+                .into_iter()
+                .map(|(phase, values)| AnalysisSummary {
+                    phase: phase.into(),
+                    solar_analysis_triggers: Stats::new(&values.triggers),
+                    solar_diagnostic_publications: Stats::new(&values.publications),
+                    unpublished_analysis_proxy: Stats::new(&values.proxies),
+                })
+                .collect(),
+        });
     }
 
-    let summaries = groups
-        .into_iter()
-        .map(|((label, scenario), samples)| {
-            let successful =
-                samples.iter().copied().filter(|sample| sample.succeeded()).collect::<Vec<_>>();
-            let scenario_wall =
-                successful.iter().filter_map(|sample| sample.scenario_wall_ms).collect::<Vec<_>>();
-            let analysis_latency = successful
-                .iter()
-                .flat_map(|sample| sample.analysis_latencies_ms.iter().copied())
-                .collect::<Vec<_>>();
-            let request_latency = successful
-                .iter()
-                .flat_map(|sample| {
-                    sample.observations.requests.iter().map(|request| request.elapsed_ms)
-                })
-                .collect::<Vec<_>>();
-            let process_cpu = successful
-                .iter()
-                .filter_map(|sample| {
-                    let process = sample.process.as_ref()?;
-                    Some(process.user_cpu_ms? + process.system_cpu_ms?)
-                })
-                .collect::<Vec<_>>();
-            let peak_rss = successful
-                .iter()
-                .filter_map(|sample| sample.process.as_ref()?.peak_rss_mib)
-                .collect::<Vec<_>>();
-            let diagnostic_publications = successful
-                .iter()
-                .map(|sample| sample.observations.diagnostic_publications as f64)
-                .collect::<Vec<_>>();
-            ScenarioSummary {
-                label,
-                scenario,
-                successful_runs: successful.len(),
-                failed_runs: samples.len() - successful.len(),
-                scenario_wall_ms: Stats::new(&scenario_wall),
-                analysis_latency_ms: Stats::new(&analysis_latency),
-                request_latency_ms: Stats::new(&request_latency),
-                process_cpu_ms: Stats::new(&process_cpu),
-                peak_rss_mib: Stats::new(&peak_rss),
-                diagnostic_publications: Stats::new(&diagnostic_publications),
-            }
-        })
-        .collect();
-
-    SummaryReport {
+    Ok(SummaryReport {
         schema_version: SCHEMA_VERSION,
         config,
         environment: Environment::current(),
+        fixture,
+        forge,
         binaries,
         summaries,
-    }
+    })
+}
+
+#[derive(Default)]
+struct ActivityValues {
+    triggers: Vec<f64>,
+    publications: Vec<f64>,
+    proxies: Vec<f64>,
+}
+
+fn unpublished_analysis_proxy(activity: &AnalysisActivity) -> Result<usize> {
+    activity
+        .solar_analysis_triggers
+        .checked_sub(activity.solar_diagnostic_publications)
+        .with_context(|| {
+            format!(
+                "phase `{}` published {} Solar diagnostics for {} analysis triggers",
+                activity.phase,
+                activity.solar_diagnostic_publications,
+                activity.solar_analysis_triggers,
+            )
+        })
+}
+
+fn named_stats(values: BTreeMap<&str, Vec<f64>>) -> Vec<NamedStats> {
+    values
+        .into_iter()
+        .map(|(name, values)| NamedStats { name: name.into(), stats: Stats::new(&values) })
+        .collect()
 }
 
 pub(crate) fn write_reports(
@@ -185,106 +242,276 @@ pub(crate) fn write_reports(
 pub(crate) fn terminal(report: &SummaryReport) -> String {
     let mut output = String::from(
         "Solar LSP benchmark results\n\
-         Lower is better; change compares candidate with baseline.\n\n\
-         Scenario                Metric                     Baseline      Candidate      Change\n\
-         ----------------------  ----------------------  -----------  -------------  ----------\n",
+         Latency is in milliseconds; change compares candidate p50 with baseline p50.\n\n",
     );
-    let mut wrote_scenario = false;
+    let (baseline, candidate) = binary_summaries(report);
 
-    for &scenario in &report.config.scenarios {
-        let baseline = report
-            .summaries
-            .iter()
-            .find(|summary| summary.scenario == scenario && summary.label == "baseline");
-        let candidate = report
-            .summaries
-            .iter()
-            .find(|summary| summary.scenario == scenario && summary.label == "candidate");
-        let (Some(baseline), Some(candidate)) = (baseline, candidate) else { continue };
+    output.push_str("Edit latency (lower is better)\n");
+    write_latency_table(&mut output, baseline, candidate, |name| {
+        name.starts_with("edit_settle_ms")
+    });
 
-        if wrote_scenario {
-            output.push('\n');
-        }
-        wrote_scenario = true;
+    output.push_str("\nRequest latency (lower is better)\n");
+    write_named_table(
+        &mut output,
+        baseline.map(|it| &it.requests),
+        candidate.map(|it| &it.requests),
+    );
 
-        let metrics = [
-            (
-                "Wall p50 (ms)",
-                baseline.scenario_wall_ms.count,
-                baseline.scenario_wall_ms.p50,
-                candidate.scenario_wall_ms.count,
-                candidate.scenario_wall_ms.p50,
-            ),
-            (
-                "Wall p95 (ms)",
-                baseline.scenario_wall_ms.count,
-                baseline.scenario_wall_ms.p95,
-                candidate.scenario_wall_ms.count,
-                candidate.scenario_wall_ms.p95,
-            ),
-            (
-                "Peak RSS max (MiB)",
-                baseline.peak_rss_mib.count,
-                baseline.peak_rss_mib.max,
-                candidate.peak_rss_mib.count,
-                candidate.peak_rss_mib.max,
-            ),
-        ];
-        for (index, (metric, baseline_count, baseline_value, candidate_count, candidate_value)) in
-            metrics.into_iter().enumerate()
-        {
-            let scenario = if index == 0 { scenario.name() } else { "" };
-            let baseline = display_value(baseline_count, baseline_value);
-            let candidate = display_value(candidate_count, candidate_value);
-            let change =
-                display_change(baseline_count, baseline_value, candidate_count, candidate_value);
-            let _ = writeln!(
-                output,
-                "{scenario:<22}  {metric:<22}  {baseline:>11}  {candidate:>13}  {change:>10}",
-            );
-        }
+    output.push_str("\nForge save lifecycle (lower is better; includes external Forge)\n");
+    write_latency_table(&mut output, baseline, candidate, |name| name == "forge_flycheck_ready_ms");
+
+    output.push_str(
+        "\nSolar analysis activity (behavioral metrics; lower is not inherently better)\n",
+    );
+    write_activity_table(&mut output, baseline, candidate);
+
+    output
+        .push_str("\nRuns\nBinary         Successful  Failed\n-------------  ----------  ------\n");
+    for summary in &report.summaries {
+        let _ = writeln!(
+            output,
+            "{:<13}  {:>10}  {:>6}",
+            summary.label, summary.successful_runs, summary.failed_runs
+        );
     }
-
     output
 }
 
-fn display_value(count: usize, value: f64) -> String {
-    if count == 0 { "n/a".into() } else { format!("{value:.2}") }
+fn binary_summaries(report: &SummaryReport) -> (Option<&BinarySummary>, Option<&BinarySummary>) {
+    (
+        report.summaries.iter().find(|summary| summary.label == "baseline"),
+        report.summaries.iter().find(|summary| summary.label == "candidate"),
+    )
 }
 
-fn display_change(
-    baseline_count: usize,
-    baseline: f64,
-    candidate_count: usize,
-    candidate: f64,
-) -> String {
-    if baseline_count == 0 || candidate_count == 0 || baseline == 0.0 {
-        "n/a".into()
-    } else {
-        format!("{:+.2}%", (candidate / baseline - 1.0) * 100.0)
+fn write_latency_table(
+    output: &mut String,
+    baseline: Option<&BinarySummary>,
+    candidate: Option<&BinarySummary>,
+    include: impl Fn(&str) -> bool,
+) {
+    let baseline = baseline.map(|summary| &summary.latencies);
+    let candidate = candidate.map(|summary| &summary.latencies);
+    write_filtered_named_table(output, baseline, candidate, include);
+}
+
+fn write_named_table(
+    output: &mut String,
+    baseline: Option<&Vec<NamedStats>>,
+    candidate: Option<&Vec<NamedStats>>,
+) {
+    write_filtered_named_table(output, baseline, candidate, |_| true);
+}
+
+fn write_filtered_named_table(
+    output: &mut String,
+    baseline: Option<&Vec<NamedStats>>,
+    candidate: Option<&Vec<NamedStats>>,
+    include: impl Fn(&str) -> bool,
+) {
+    output.push_str(
+        "Metric                                  Baseline p50/max  Candidate p50/max  Change\n\
+         --------------------------------------  ----------------  -----------------  -------\n",
+    );
+    let names = named_keys(baseline, candidate).into_iter().filter(|name| include(name));
+    for name in names {
+        let baseline_stats = find_named(baseline, name);
+        let candidate_stats = find_named(candidate, name);
+        let baseline_value = display_stats(baseline_stats);
+        let candidate_value = display_stats(candidate_stats);
+        let change = display_change(baseline_stats, candidate_stats);
+        let _ = writeln!(
+            output,
+            "{name:<38}  {baseline_value:>16}  {candidate_value:>17}  {change:>7}"
+        );
+    }
+}
+
+fn write_activity_table(
+    output: &mut String,
+    baseline: Option<&BinarySummary>,
+    candidate: Option<&BinarySummary>,
+) {
+    output.push_str(
+        "Phase                       Metric                         Baseline p50/max  Candidate p50/max\n\
+         --------------------------  -----------------------------  ----------------  -----------------\n",
+    );
+    let phases = activity_phases(baseline, candidate);
+    for phase in phases {
+        let baseline = find_activity(baseline, phase);
+        let candidate = find_activity(candidate, phase);
+        let metrics = [
+            (
+                "solar_analysis_triggers",
+                baseline.map(|it| &it.solar_analysis_triggers),
+                candidate.map(|it| &it.solar_analysis_triggers),
+            ),
+            (
+                "solar_diagnostic_publications",
+                baseline.map(|it| &it.solar_diagnostic_publications),
+                candidate.map(|it| &it.solar_diagnostic_publications),
+            ),
+            (
+                "unpublished_analysis_proxy",
+                baseline.map(|it| &it.unpublished_analysis_proxy),
+                candidate.map(|it| &it.unpublished_analysis_proxy),
+            ),
+        ];
+        for (index, (metric, baseline, candidate)) in metrics.into_iter().enumerate() {
+            let phase = if index == 0 { phase } else { "" };
+            let baseline = display_stats(baseline);
+            let candidate = display_stats(candidate);
+            let _ = writeln!(output, "{phase:<26}  {metric:<29}  {baseline:>16}  {candidate:>17}");
+        }
+    }
+}
+
+fn named_keys<'a>(
+    baseline: Option<&'a Vec<NamedStats>>,
+    candidate: Option<&'a Vec<NamedStats>>,
+) -> BTreeSet<&'a str> {
+    baseline.into_iter().chain(candidate).flatten().map(|metric| metric.name.as_str()).collect()
+}
+
+fn activity_phases<'a>(
+    baseline: Option<&'a BinarySummary>,
+    candidate: Option<&'a BinarySummary>,
+) -> BTreeSet<&'a str> {
+    baseline
+        .into_iter()
+        .chain(candidate)
+        .flat_map(|summary| &summary.analysis_activity)
+        .map(|summary| summary.phase.as_str())
+        .collect()
+}
+
+fn find_named<'a>(metrics: Option<&'a Vec<NamedStats>>, name: &str) -> Option<&'a Stats> {
+    metrics?.iter().find(|metric| metric.name == name).map(|metric| &metric.stats)
+}
+
+fn find_activity<'a>(
+    summary: Option<&'a BinarySummary>,
+    phase: &str,
+) -> Option<&'a AnalysisSummary> {
+    summary?.analysis_activity.iter().find(|activity| activity.phase == phase)
+}
+
+fn display_stats(stats: Option<&Stats>) -> String {
+    match stats.filter(|stats| stats.count != 0) {
+        Some(stats) => format!("{:.2}/{:.2}", stats.p50, stats.max),
+        None => "n/a".into(),
+    }
+}
+
+fn display_change(baseline: Option<&Stats>, candidate: Option<&Stats>) -> String {
+    match (
+        baseline.filter(|stats| stats.count != 0 && stats.p50 != 0.0),
+        candidate.filter(|stats| stats.count != 0),
+    ) {
+        (Some(baseline), Some(candidate)) => {
+            format!("{:+.2}%", (candidate.p50 / baseline.p50 - 1.0) * 100.0)
+        }
+        _ => "n/a".into(),
     }
 }
 
 fn markdown(report: &SummaryReport) -> String {
-    let mut output = String::from(
-        "# Solar LSP benchmark\n\n| Binary | Scenario | Runs | Wall p50 | Wall p95 | Analysis p95 | CPU p50 | Peak RSS max |\n|---|---|---:|---:|---:|---:|---:|---:|\n",
+    let mut output = format!(
+        "# Solar LSP benchmark\n\nSolady `{}`: {} Solidity files, {} lines, {} bytes. Forge: `{}`.\n\n",
+        report.fixture.revision,
+        report.fixture.source_file_count,
+        report.fixture.source_line_count,
+        report.fixture.source_byte_count,
+        report.forge.version,
     );
+    let (baseline, candidate) = binary_summaries(report);
+    markdown_named_section(
+        &mut output,
+        "Edit latency",
+        baseline.map(|it| &it.latencies),
+        candidate.map(|it| &it.latencies),
+        |name| name.starts_with("edit_settle_ms"),
+    );
+    markdown_named_section(
+        &mut output,
+        "Request latency",
+        baseline.map(|it| &it.requests),
+        candidate.map(|it| &it.requests),
+        |_| true,
+    );
+    markdown_named_section(
+        &mut output,
+        "Forge save lifecycle",
+        baseline.map(|it| &it.latencies),
+        candidate.map(|it| &it.latencies),
+        |name| name == "forge_flycheck_ready_ms",
+    );
+
+    output.push_str("## Solar analysis activity\n\n| Phase | Metric | Baseline p50/max | Candidate p50/max |\n|---|---|---:|---:|\n");
+    for phase in activity_phases(baseline, candidate) {
+        let baseline = find_activity(baseline, phase);
+        let candidate = find_activity(candidate, phase);
+        for (metric, baseline, candidate) in [
+            (
+                "solar_analysis_triggers",
+                baseline.map(|it| &it.solar_analysis_triggers),
+                candidate.map(|it| &it.solar_analysis_triggers),
+            ),
+            (
+                "solar_diagnostic_publications",
+                baseline.map(|it| &it.solar_diagnostic_publications),
+                candidate.map(|it| &it.solar_diagnostic_publications),
+            ),
+            (
+                "unpublished_analysis_proxy",
+                baseline.map(|it| &it.unpublished_analysis_proxy),
+                candidate.map(|it| &it.unpublished_analysis_proxy),
+            ),
+        ] {
+            let _ = writeln!(
+                output,
+                "| {phase} | {metric} | {} | {} |",
+                display_stats(baseline),
+                display_stats(candidate)
+            );
+        }
+    }
+
+    output.push_str("\n## Runs\n\n| Binary | Successful | Failed |\n|---|---:|---:|\n");
     for summary in &report.summaries {
         let _ = writeln!(
             output,
-            "| {} | {} | {}/{} | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} MiB |",
-            summary.label,
-            summary.scenario.name(),
-            summary.successful_runs,
-            summary.successful_runs + summary.failed_runs,
-            summary.scenario_wall_ms.p50,
-            summary.scenario_wall_ms.p95,
-            summary.analysis_latency_ms.p95,
-            summary.process_cpu_ms.p50,
-            summary.peak_rss_mib.max,
+            "| {} | {} | {} |",
+            summary.label, summary.successful_runs, summary.failed_runs
         );
     }
     output
+}
+
+fn markdown_named_section(
+    output: &mut String,
+    title: &str,
+    baseline: Option<&Vec<NamedStats>>,
+    candidate: Option<&Vec<NamedStats>>,
+    include: impl Fn(&str) -> bool,
+) {
+    let _ = writeln!(
+        output,
+        "## {title}\n\n| Metric | Baseline p50/max | Candidate p50/max | Change |\n|---|---:|---:|---:|"
+    );
+    for name in named_keys(baseline, candidate).into_iter().filter(|name| include(name)) {
+        let baseline = find_named(baseline, name);
+        let candidate = find_named(candidate, name);
+        let _ = writeln!(
+            output,
+            "| {name} | {} | {} | {} |",
+            display_stats(baseline),
+            display_stats(candidate),
+            display_change(baseline, candidate)
+        );
+    }
+    output.push('\n');
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -322,76 +549,7 @@ fn percentile(sorted: &[f64], ratio: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::Observations;
     use snapbox::{assert_data_eq, str};
-    use std::path::PathBuf;
-
-    #[test]
-    fn terminal_report_makes_metrics_and_comparison_explicit() {
-        let report = SummaryReport {
-            schema_version: SCHEMA_VERSION,
-            config: HarnessConfig {
-                repeat: 10,
-                timeout_ms: 10_000,
-                scenarios: vec![Scenario::SlowTyping],
-                fixture_file_count: 184,
-            },
-            environment: Environment::current(),
-            binaries: Vec::new(),
-            summaries: vec![
-                scenario_summary("baseline", 100.0, 120.0, 50.0),
-                scenario_summary("candidate", 90.0, 126.0, 40.0),
-            ],
-        };
-
-        assert_data_eq!(
-            terminal(&report),
-            str![[r#"
-Solar LSP benchmark results
-Lower is better; change compares candidate with baseline.
-
-Scenario                Metric                     Baseline      Candidate      Change
-----------------------  ----------------------  -----------  -------------  ----------
-slow-typing             Wall p50 (ms)                100.00          90.00     -10.00%
-                        Wall p95 (ms)                120.00         126.00      +5.00%
-                        Peak RSS max (MiB)            50.00          40.00     -20.00%
-
-"#]],
-        );
-    }
-
-    fn scenario_summary(
-        label: &'static str,
-        wall_p50: f64,
-        wall_p95: f64,
-        peak_rss_max: f64,
-    ) -> ScenarioSummary {
-        let empty = Stats::new(&[]);
-        ScenarioSummary {
-            label,
-            scenario: Scenario::SlowTyping,
-            successful_runs: 10,
-            failed_runs: 0,
-            scenario_wall_ms: Stats {
-                count: 10,
-                mean: wall_p50,
-                p50: wall_p50,
-                p95: wall_p95,
-                max: wall_p95,
-            },
-            analysis_latency_ms: empty,
-            request_latency_ms: empty,
-            process_cpu_ms: empty,
-            peak_rss_mib: Stats {
-                count: 10,
-                mean: peak_rss_max,
-                p50: peak_rss_max,
-                p95: peak_rss_max,
-                max: peak_rss_max,
-            },
-            diagnostic_publications: empty,
-        }
-    }
 
     #[test]
     fn summary_uses_nearest_rank_percentiles() {
@@ -404,46 +562,166 @@ slow-typing             Wall p50 (ms)                100.00          90.00     -
     }
 
     #[test]
-    fn summaries_keep_failed_runs_out_of_latency_statistics() {
+    fn summary_groups_metrics_and_excludes_failed_runs() {
         let samples = [
-            RunSample {
-                label: "baseline",
-                binary: PathBuf::from("solar"),
-                scenario: Scenario::SlowTyping,
-                repetition: 0,
-                status: RunStatus::Ok,
-                scenario_wall_ms: Some(10.0),
-                analysis_latencies_ms: vec![5.0],
-                process: None,
-                observations: Observations::default(),
-                error: None,
-            },
-            RunSample {
-                label: "baseline",
-                binary: PathBuf::from("solar"),
-                scenario: Scenario::SlowTyping,
-                repetition: 1,
-                status: RunStatus::Failed,
-                scenario_wall_ms: None,
-                analysis_latencies_ms: Vec::new(),
-                process: None,
-                observations: Observations::default(),
-                error: Some("timeout".into()),
-            },
+            sample(
+                RunStatus::Ok,
+                vec![LatencyMeasurement { name: "edit_settle_ms{slow}", elapsed_ms: 10.0 }],
+                vec![activity("slow", 8, 1)],
+            ),
+            sample(RunStatus::Failed, Vec::new(), Vec::new()),
         ];
-        let report = summarize(
-            HarnessConfig {
-                repeat: 2,
-                timeout_ms: 1_000,
-                scenarios: vec![Scenario::SlowTyping],
-                fixture_file_count: 184,
-            },
-            Vec::new(),
-            &samples,
-        );
 
-        assert_eq!(report.summaries[0].successful_runs, 1);
-        assert_eq!(report.summaries[0].failed_runs, 1);
-        assert_eq!(report.summaries[0].scenario_wall_ms.p50, 10.0);
+        let report = test_summary(&samples).unwrap();
+        let summary = &report.summaries[0];
+        assert_eq!(summary.successful_runs, 1);
+        assert_eq!(summary.failed_runs, 1);
+        assert_eq!(summary.latencies[0].name, "edit_settle_ms{slow}");
+        assert_eq!(summary.latencies[0].stats.p50, 10.0);
+        assert_eq!(summary.analysis_activity[0].unpublished_analysis_proxy.p50, 7.0);
+    }
+
+    #[test]
+    fn proxy_is_checked_per_run_before_aggregation() {
+        let samples = [
+            sample(RunStatus::Ok, Vec::new(), vec![activity("slow", 10, 9)]),
+            sample(RunStatus::Ok, Vec::new(), vec![activity("slow", 2, 0)]),
+        ];
+
+        let report = test_summary(&samples).unwrap();
+        let proxy = report.summaries[0].analysis_activity[0].unpublished_analysis_proxy;
+        assert_eq!(proxy.p50, 1.0);
+        assert_eq!(proxy.max, 2.0);
+
+        let invalid = [sample(RunStatus::Ok, Vec::new(), vec![activity("slow", 1, 2)])];
+        assert!(test_summary(&invalid).is_err());
+    }
+
+    #[test]
+    fn missing_values_are_rendered_as_na() {
+        assert_eq!(display_stats(None), "n/a");
+        assert_eq!(display_stats(Some(&Stats::new(&[]))), "n/a");
+        assert_eq!(display_change(None, None), "n/a");
+    }
+
+    #[test]
+    fn terminal_separates_latency_lifecycle_and_activity_metrics() {
+        let report = SummaryReport {
+            schema_version: SCHEMA_VERSION,
+            config: HarnessConfig { repeat: 1, timeout_ms: 1_000 },
+            environment: Environment::current(),
+            fixture: FixtureMetadata {
+                revision: "test".into(),
+                source_file_count: 114,
+                source_line_count: 53_156,
+                source_byte_count: 2_317_649,
+            },
+            forge: ForgeMetadata { path: "forge".into(), version: "forge test".into() },
+            binaries: Vec::new(),
+            summaries: vec![summary("baseline", 10.0), summary("candidate", 8.0)],
+        };
+
+        assert_data_eq!(
+            terminal(&report),
+            str![[r#"
+Solar LSP benchmark results
+Latency is in milliseconds; change compares candidate p50 with baseline p50.
+
+Edit latency (lower is better)
+Metric                                  Baseline p50/max  Candidate p50/max  Change
+--------------------------------------  ----------------  -----------------  -------
+edit_settle_ms{slow}                         10.00/10.00          8.00/8.00  -20.00%
+
+Request latency (lower is better)
+Metric                                  Baseline p50/max  Candidate p50/max  Change
+--------------------------------------  ----------------  -----------------  -------
+textDocument/completion                      10.00/10.00          8.00/8.00  -20.00%
+
+Forge save lifecycle (lower is better; includes external Forge)
+Metric                                  Baseline p50/max  Candidate p50/max  Change
+--------------------------------------  ----------------  -----------------  -------
+forge_flycheck_ready_ms                      10.00/10.00          8.00/8.00  -20.00%
+
+Solar analysis activity (behavioral metrics; lower is not inherently better)
+Phase                       Metric                         Baseline p50/max  Candidate p50/max
+--------------------------  -----------------------------  ----------------  -----------------
+slow                        solar_analysis_triggers               8.00/8.00          8.00/8.00
+                            solar_diagnostic_publications         1.00/1.00          1.00/1.00
+                            unpublished_analysis_proxy            7.00/7.00          7.00/7.00
+
+Runs
+Binary         Successful  Failed
+-------------  ----------  ------
+baseline                1       0
+candidate               1       0
+
+"#]],
+        );
+    }
+
+    fn test_summary(samples: &[RunSample]) -> Result<SummaryReport> {
+        summarize(
+            HarnessConfig { repeat: samples.len(), timeout_ms: 1_000 },
+            vec![BinaryMetadata {
+                label: "baseline",
+                path: "solar".into(),
+                version: "test".into(),
+            }],
+            FixtureMetadata {
+                revision: "test".into(),
+                source_file_count: 114,
+                source_line_count: 53_156,
+                source_byte_count: 2_317_649,
+            },
+            ForgeMetadata { path: "forge".into(), version: "test".into() },
+            samples,
+        )
+    }
+
+    fn sample(
+        status: RunStatus,
+        latencies: Vec<LatencyMeasurement>,
+        analysis_activity: Vec<AnalysisActivity>,
+    ) -> RunSample {
+        let outcome = matches!(status, RunStatus::Ok)
+            .then_some(SessionOutcome { latencies, analysis_activity });
+        RunSample {
+            label: "baseline",
+            binary: "solar".into(),
+            repetition: 0,
+            status,
+            outcome,
+            process: None,
+            observations: Observations::default(),
+            error: None,
+        }
+    }
+
+    fn activity(
+        phase: &'static str,
+        solar_analysis_triggers: usize,
+        solar_diagnostic_publications: usize,
+    ) -> AnalysisActivity {
+        AnalysisActivity { phase, solar_analysis_triggers, solar_diagnostic_publications }
+    }
+
+    fn summary(label: &'static str, latency: f64) -> BinarySummary {
+        let stats = Stats::new(&[latency]);
+        BinarySummary {
+            label,
+            successful_runs: 1,
+            failed_runs: 0,
+            latencies: vec![
+                NamedStats { name: "edit_settle_ms{slow}".into(), stats },
+                NamedStats { name: "forge_flycheck_ready_ms".into(), stats },
+            ],
+            requests: vec![NamedStats { name: "textDocument/completion".into(), stats }],
+            analysis_activity: vec![AnalysisSummary {
+                phase: "slow".into(),
+                solar_analysis_triggers: Stats::new(&[8.0]),
+                solar_diagnostic_publications: Stats::new(&[1.0]),
+                unpublished_analysis_proxy: Stats::new(&[7.0]),
+            }],
+        }
     }
 }

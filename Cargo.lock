@@ -3351,7 +3351,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
- "libc",
  "lsp-types",
  "serde",
  "serde_json",
