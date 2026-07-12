@@ -1,22 +1,22 @@
 use lsp_types::{
-    Position, Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
-    SemanticTokensDelta, SemanticTokensEdit, SemanticTokensFullDeltaResult, SemanticTokensLegend,
-    Url,
+    Position, Range, SemanticToken, SemanticTokenType, SemanticTokens, SemanticTokensDelta,
+    SemanticTokensEdit, SemanticTokensFullDeltaResult, SemanticTokensLegend, Url,
 };
 use solar_interface::{
-    RelativeBytePos, Span, data_structures::map::FxHashMap, kw, source_map::SourceMap, sym,
+    Span, Symbol, data_structures::map::FxHashMap, kw, source_map::SourceFile, sym,
 };
 use solar_parse::{
     Cursor,
     lexer::token::{RawLiteralKind, RawTokenKind},
+    token::Delimiter,
 };
 use solar_sema::{
     Gcx,
     ast::{ImportItems, ItemKind},
-    hir::{self, ContractKind, ItemId, Res, TypeKind, UsingEntry, UsingEntryKind, VarKind},
-    ty::{ResolvedMember, TyKind},
+    hir::{self, ContractKind, ItemId, Res, UsingEntry, UsingEntryKind, VarKind},
+    ty::{ResolvedCallee, ResolvedMember, TyKind},
 };
-use std::cmp::Reverse;
+use std::{cmp::Reverse, collections::hash_map::Entry};
 
 pub(crate) mod token_type {
     pub(crate) const NAMESPACE: u32 = 0;
@@ -65,20 +65,11 @@ pub(crate) fn legend() -> SemanticTokensLegend {
             SemanticTokenType::NUMBER,
             SemanticTokenType::OPERATOR,
         ],
-        token_modifiers: vec![
-            SemanticTokenModifier::DECLARATION,
-            SemanticTokenModifier::DEFINITION,
-            SemanticTokenModifier::READONLY,
-            SemanticTokenModifier::STATIC,
-            SemanticTokenModifier::DEPRECATED,
-            SemanticTokenModifier::ABSTRACT,
-            SemanticTokenModifier::DOCUMENTATION,
-            SemanticTokenModifier::DEFAULT_LIBRARY,
-        ],
+        token_modifiers: Vec::new(),
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CachedTokens {
     result_id: String,
     data: Vec<SemanticToken>,
@@ -126,11 +117,17 @@ impl SemanticTokenCache {
             .filter(|cached| cached.result_id == previous_result_id)
             .map(|cached| token_delta(&cached.data, &data));
         let result_id = self.next_result_id();
-        self.files.insert(uri, CachedTokens { result_id: result_id.clone(), data: data.clone() });
 
         match edits {
-            Some(edits) => SemanticTokensDelta { result_id: Some(result_id), edits }.into(),
-            None => SemanticTokens { result_id: Some(result_id), data }.into(),
+            Some(edits) => {
+                self.files.insert(uri, CachedTokens { result_id: result_id.clone(), data });
+                SemanticTokensDelta { result_id: Some(result_id), edits }.into()
+            }
+            None => {
+                self.files
+                    .insert(uri, CachedTokens { result_id: result_id.clone(), data: data.clone() });
+                SemanticTokens { result_id: Some(result_id), data }.into()
+            }
         }
     }
 
@@ -174,7 +171,7 @@ fn token_delta(old: &[SemanticToken], new: &[SemanticToken]) -> Vec<SemanticToke
     }]
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 struct AbsoluteToken {
     range: Range,
     token_type: u32,
@@ -182,24 +179,38 @@ struct AbsoluteToken {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SemanticTokenIndex {
+    /// Tokens are sorted by range and do not overlap within each file.
     files: FxHashMap<Url, Vec<AbsoluteToken>>,
 }
 
 impl SemanticTokenIndex {
     pub(crate) fn extend(&mut self, other: Self) {
         for (uri, tokens) in other.files {
-            let entry = self.files.entry(uri).or_default();
-            entry.extend(tokens);
-            normalize_absolute_tokens(entry);
+            match self.files.entry(uri) {
+                Entry::Occupied(mut entry) => {
+                    let current = entry.get_mut();
+                    current.extend(tokens);
+                    normalize_absolute_tokens(current);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(tokens);
+                }
+            }
         }
     }
 
     pub(crate) fn tokens(&self, uri: &Url, range: Option<Range>) -> Vec<SemanticToken> {
         let tokens = self.files.get(uri).map(Vec::as_slice).unwrap_or_default();
-        let tokens = tokens
-            .iter()
-            .copied()
-            .filter(|token| range.is_none_or(|range| ranges_overlap(token.range, range)));
+        let tokens = match range {
+            None => tokens,
+            Some(range) if range.start < range.end => {
+                let start = tokens.partition_point(|token| token.range.end <= range.start);
+                let end =
+                    start + tokens[start..].partition_point(|token| token.range.start < range.end);
+                &tokens[start..end]
+            }
+            Some(_) => &[],
+        };
         encode(tokens)
     }
 }
@@ -232,9 +243,8 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
         self.push_semantic(span, token_type::ENUM_MEMBER);
     }
 
-    pub(crate) fn push_modifier(&mut self, modifier: &hir::Modifier<'gcx>) {
-        let span = modifier.span.with_hi(modifier.args.span.lo());
-        self.push_last_ident(span, item_token_type(self.gcx, modifier.id));
+    pub(crate) fn push_modifier(&mut self, item_id: ItemId, span: Span) {
+        self.push_last_ident(span, item_token_type(self.gcx, item_id));
     }
 
     pub(crate) fn push_using_entry(&mut self, entry: &UsingEntry<'gcx>) {
@@ -250,8 +260,13 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
         }
     }
 
-    pub(crate) fn push_ident_expr(&mut self, expr: &hir::Expr<'gcx>, resolutions: &[Res]) {
-        let token_type = if let Some(callee) = self.gcx.resolved_callee(expr.id) {
+    pub(crate) fn push_ident_expr(
+        &mut self,
+        expr: &hir::Expr<'gcx>,
+        resolutions: &[Res],
+        callee: Option<ResolvedCallee>,
+    ) {
+        let token_type = if let Some(callee) = callee {
             self.res_token_type(callee.res, expr, false)
         } else {
             unanimous(resolutions.iter().filter_map(|&res| self.res_token_type(res, expr, false)))
@@ -266,48 +281,63 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
         expr: &hir::Expr<'gcx>,
         member: solar_interface::Ident,
         is_yul: bool,
+        resolved: Option<ResolvedMember>,
+        callee: Option<ResolvedCallee>,
     ) {
-        let token_type = self
-            .gcx
-            .resolved_member(expr.id)
+        let token_type = resolved
             .and_then(|resolved| self.resolved_member_token_type(resolved, expr))
-            .or_else(|| {
-                self.gcx
-                    .resolved_callee(expr.id)
-                    .and_then(|callee| self.res_token_type(callee.res, expr, true))
-            })
+            .or_else(|| callee.and_then(|callee| self.res_token_type(callee.res, expr, true)))
             .or(is_yul.then_some(token_type::PROPERTY));
         if let Some(token_type) = token_type {
             self.push_semantic(member.span, token_type);
         }
     }
 
-    pub(crate) fn push_type(&mut self, ty: &hir::Type<'gcx>) {
-        if let TypeKind::Custom(item_id) = ty.kind {
-            self.push_last_ident(ty.span, item_token_type(self.gcx, item_id));
-        }
+    pub(crate) fn push_custom_type(&mut self, item_id: ItemId, span: Span) {
+        self.push_last_ident(span, item_token_type(self.gcx, item_id));
     }
 
     pub(crate) fn finish(mut self) -> SemanticTokenIndex {
-        self.tokens.sort_by_key(|token| {
+        self.tokens.sort_unstable_by_key(|token| {
             (token.span.lo(), Reverse(token.priority), token.span.hi(), token.token_type)
         });
 
-        let mut non_overlapping = Vec::<BuilderToken>::with_capacity(self.tokens.len());
-        for token in self.tokens {
-            if non_overlapping.last().is_some_and(|previous| token.span.lo() < previous.span.hi()) {
-                continue;
+        let mut previous_hi = None;
+        self.tokens.retain(|token| {
+            if previous_hi.is_some_and(|hi| token.span.lo() < hi) {
+                return false;
             }
-            non_overlapping.push(token);
-        }
+            previous_hi = Some(token.span.hi());
+            true
+        });
 
         let source_map = self.gcx.sess.source_map();
+        let files = source_map.files();
         let mut index = SemanticTokenIndex::default();
-        for token in non_overlapping {
-            push_span_segments(&mut index, source_map, token);
-        }
-        for tokens in index.files.values_mut() {
-            normalize_absolute_tokens(tokens);
+        let mut tokens = self.tokens.into_iter().peekable();
+        // Both inputs are ordered by absolute byte position, so consume each file in one pass.
+        for file in files.iter() {
+            let file_end = file.end_position();
+            while tokens.peek().is_some_and(|token| token.span.lo() < file.start_pos) {
+                tokens.next();
+            }
+            if tokens.peek().is_none_or(|token| token.span.lo() > file_end) {
+                continue;
+            }
+
+            let mut output = file
+                .name
+                .as_real()
+                .and_then(|path| Url::from_file_path(path).ok())
+                .map(|uri| index.files.entry(uri).or_default());
+            while tokens.peek().is_some_and(|token| token.span.lo() <= file_end) {
+                let token = tokens.next().unwrap();
+                if token.span.hi() <= file_end
+                    && let Some(output) = &mut output
+                {
+                    push_span_segments(output, file, token);
+                }
+            }
         }
         index
     }
@@ -320,38 +350,39 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
             for (start, token) in Cursor::new(&file.src).with_position() {
                 let text = &file.src[start..start + token.len as usize];
                 let in_yul = yul_depth > 0;
+                let symbol =
+                    (token.kind == RawTokenKind::Ident).then(|| self.gcx.sess.intern(text));
                 if let Some((token_type, priority)) =
-                    self.lexical_token_type(token.kind, text, in_yul)
+                    Self::lexical_token_type(token.kind, text, in_yul, symbol)
                 {
                     let lo = file.start_pos + start as u32;
                     self.push(Span::new(lo, lo + token.len), token_type, priority);
                 }
-                self.update_yul_context(token.kind, text, &mut yul_depth, &mut assembly_pending);
+                Self::update_yul_context(token.kind, symbol, &mut yul_depth, &mut assembly_pending);
             }
         }
     }
 
     fn update_yul_context(
-        &self,
         kind: RawTokenKind,
-        text: &str,
+        symbol: Option<Symbol>,
         yul_depth: &mut usize,
         assembly_pending: &mut bool,
     ) {
-        if kind == RawTokenKind::Ident && self.gcx.sess.intern(text) == kw::Assembly {
+        if symbol == Some(kw::Assembly) {
             *assembly_pending = true;
             return;
         }
 
         match kind {
-            RawTokenKind::OpenDelim(_) if *assembly_pending && text == "{" => {
+            RawTokenKind::OpenDelim(Delimiter::Brace) if *assembly_pending => {
                 *assembly_pending = false;
                 *yul_depth = 1;
             }
             RawTokenKind::OpenDelim(_) if *yul_depth > 0 => *yul_depth += 1,
             RawTokenKind::CloseDelim(_) if *yul_depth > 0 => *yul_depth -= 1,
             RawTokenKind::Semi => *assembly_pending = false,
-            RawTokenKind::CloseDelim(_) if text == "}" => *assembly_pending = false,
+            RawTokenKind::CloseDelim(Delimiter::Brace) => *assembly_pending = false,
             _ => {}
         }
     }
@@ -366,10 +397,6 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
 
             for (item_id, item) in ast.items.iter_enumerated() {
                 let ItemKind::Import(import) = &item.kind else { continue };
-                let imported_source =
-                    hir_source.imports.iter().find_map(|&(import_id, source_id)| {
-                        (import_id == item_id).then_some(source_id)
-                    });
 
                 match &import.items {
                     ImportItems::Plain(Some(alias)) | ImportItems::Glob(alias) => {
@@ -377,7 +404,13 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
                     }
                     ImportItems::Plain(None) => {}
                     ImportItems::Aliases(imports) => {
-                        let Some(imported_source) = imported_source else { continue };
+                        let Some(imported_source) =
+                            hir_source.imports.iter().find_map(|&(import_id, source_id)| {
+                                (import_id == item_id).then_some(source_id)
+                            })
+                        else {
+                            continue;
+                        };
                         for (name, alias) in imports.iter() {
                             let Some(token_type) =
                                 self.imported_item_token_type(imported_source, name.name)
@@ -410,10 +443,10 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
     }
 
     fn lexical_token_type(
-        &self,
         kind: RawTokenKind,
         text: &str,
         in_yul: bool,
+        symbol: Option<Symbol>,
     ) -> Option<(u32, u8)> {
         let token = match kind {
             RawTokenKind::LineComment { .. } | RawTokenKind::BlockComment { .. } => {
@@ -426,8 +459,8 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
                 kind: RawLiteralKind::Int { .. } | RawLiteralKind::Rational { .. },
             } => (token_type::NUMBER, PRIORITY_LEXICAL),
             RawTokenKind::Ident => {
-                let symbol = self.gcx.sess.intern(text);
-                if symbol.is_elementary_type() || is_sized_elementary_type(text) {
+                let symbol = symbol?;
+                if symbol.is_elementary_type() || is_sized_fixed_type(text) {
                     (token_type::TYPE, PRIORITY_LEXICAL)
                 } else if symbol.is_used_keyword()
                     || symbol.is_unused_keyword()
@@ -505,7 +538,7 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
     }
 }
 
-pub(crate) fn item_token_type(gcx: Gcx<'_>, item_id: ItemId) -> u32 {
+fn item_token_type(gcx: Gcx<'_>, item_id: ItemId) -> u32 {
     match item_id {
         ItemId::Contract(id) => match gcx.hir.contract(id).kind {
             ContractKind::Contract | ContractKind::AbstractContract => token_type::CLASS,
@@ -538,32 +571,45 @@ pub(crate) fn item_token_type(gcx: Gcx<'_>, item_id: ItemId) -> u32 {
     }
 }
 
-fn push_span_segments(index: &mut SemanticTokenIndex, source_map: &SourceMap, token: BuilderToken) {
-    let Ok(source) = source_map.span_to_source(token.span) else { return };
-    let Some(path) = source.file.name.as_real() else { return };
-    let Ok(uri) = Url::from_file_path(path) else { return };
-    let start = RelativeBytePos::from_usize(source.data.start);
-    let end = RelativeBytePos::from_usize(source.data.end);
-    let Some(start_line) = source.file.lookup_line(start) else { return };
-    let Some(end_line) = source.file.lookup_line(end) else { return };
+fn push_span_segments(tokens: &mut Vec<AbsoluteToken>, file: &SourceFile, token: BuilderToken) {
+    let start = file.relative_position(token.span.lo());
+    let end = file.relative_position(token.span.hi());
+    let Some(start_line) = file.lookup_line(start) else { return };
+    let Some(end_line) = file.lookup_line(end) else { return };
+    let ascii = file.multibyte_chars.is_empty();
+    let bytes = file.src.as_bytes();
+    let start = start.to_usize();
+    let end = end.to_usize();
 
     for line in start_line..=end_line {
-        let Some(line_start) = source.file.line_position(line) else { continue };
-        let Some(line_text) = source.file.get_line(line) else { continue };
-        let line_text = line_text.strip_suffix('\r').unwrap_or(line_text);
-        let line_end = line_start + line_text.len();
-        let segment_start = source.data.start.max(line_start);
-        let segment_end = source.data.end.min(line_end);
+        let Some(line_start) = file.line_position(line) else { continue };
+        let mut line_end = file.line_position(line + 1).unwrap_or(file.src.len());
+        if line_end > line_start && bytes[line_end - 1] == b'\n' {
+            line_end -= 1;
+        }
+        if line_end > line_start && bytes[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let segment_start = start.max(line_start);
+        let segment_end = end.min(line_end);
         if segment_start >= segment_end {
             continue;
         }
 
-        let character = source.file.src[line_start..segment_start].encode_utf16().count() as u32;
-        let length = source.file.src[segment_start..segment_end].encode_utf16().count() as u32;
+        let character = if ascii {
+            (segment_start - line_start) as u32
+        } else {
+            file.src[line_start..segment_start].encode_utf16().count() as u32
+        };
+        let length = if ascii {
+            (segment_end - segment_start) as u32
+        } else {
+            file.src[segment_start..segment_end].encode_utf16().count() as u32
+        };
         if length == 0 {
             continue;
         }
-        index.files.entry(uri.clone()).or_default().push(AbsoluteToken {
+        tokens.push(AbsoluteToken {
             range: Range {
                 start: Position { line: line as u32, character },
                 end: Position { line: line as u32, character: character + length },
@@ -574,8 +620,8 @@ fn push_span_segments(index: &mut SemanticTokenIndex, source_map: &SourceMap, to
 }
 
 fn normalize_absolute_tokens(tokens: &mut Vec<AbsoluteToken>) {
-    tokens.sort_by_key(|token| (token.range.start, token.range.end, token.token_type));
-    tokens.dedup();
+    debug_assert!(tokens.iter().all(|token| token.range.start < token.range.end));
+    tokens.sort_unstable_by_key(|token| (token.range.start, token.range.end, token.token_type));
 
     let mut write = 0;
     for read in 0..tokens.len() {
@@ -588,30 +634,26 @@ fn normalize_absolute_tokens(tokens: &mut Vec<AbsoluteToken>) {
     tokens.truncate(write);
 }
 
-fn encode(tokens: impl Iterator<Item = AbsoluteToken>) -> Vec<SemanticToken> {
+fn encode(tokens: &[AbsoluteToken]) -> Vec<SemanticToken> {
     let mut previous = Position::new(0, 0);
-    tokens
-        .map(|token| {
-            let delta_line = token.range.start.line - previous.line;
-            let delta_start = if delta_line == 0 {
-                token.range.start.character - previous.character
-            } else {
-                token.range.start.character
-            };
-            previous = token.range.start;
-            SemanticToken {
-                delta_line,
-                delta_start,
-                length: token.range.end.character - token.range.start.character,
-                token_type: token.token_type,
-                token_modifiers_bitset: 0,
-            }
-        })
-        .collect()
-}
-
-fn ranges_overlap(token: Range, requested: Range) -> bool {
-    requested.start < requested.end && token.end > requested.start && token.start < requested.end
+    let mut encoded = Vec::with_capacity(tokens.len());
+    for token in tokens.iter().copied() {
+        let delta_line = token.range.start.line - previous.line;
+        let delta_start = if delta_line == 0 {
+            token.range.start.character - previous.character
+        } else {
+            token.range.start.character
+        };
+        previous = token.range.start;
+        encoded.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.range.end.character - token.range.start.character,
+            token_type: token.token_type,
+            token_modifiers_bitset: 0,
+        });
+    }
+    encoded
 }
 
 fn unanimous(mut values: impl Iterator<Item = u32>) -> Option<u32> {
@@ -646,21 +688,14 @@ fn is_operator(kind: RawTokenKind) -> bool {
     )
 }
 
-fn is_sized_elementary_type(text: &str) -> bool {
-    if let Some(size) = text.strip_prefix("uint").or_else(|| text.strip_prefix("int")) {
-        return valid_integer_size(size);
-    }
-    if let Some(size) = text.strip_prefix("bytes") {
-        return size.parse::<u8>().is_ok_and(|size| (1..=32).contains(&size));
-    }
-
-    if matches!(text, "fixed" | "ufixed") {
-        return true;
-    }
-    let Some(size) = text.strip_prefix("fixed").or_else(|| text.strip_prefix("ufixed")) else {
+fn is_sized_fixed_type(text: &str) -> bool {
+    let Some((m, n)) = text
+        .strip_prefix("fixed")
+        .or_else(|| text.strip_prefix("ufixed"))
+        .and_then(|size| size.split_once('x'))
+    else {
         return false;
     };
-    let Some((m, n)) = size.split_once('x') else { return false };
     valid_integer_size(m) && n.parse::<u8>().is_ok_and(|n| n <= 80)
 }
 
@@ -708,6 +743,43 @@ mod tests {
     }
 
     #[test]
+    fn range_tokens_use_half_open_overlap_boundaries() {
+        let uri = Url::parse("file:///tokens.sol").unwrap();
+        let mut index = SemanticTokenIndex::default();
+        index.files.insert(
+            uri.clone(),
+            vec![
+                absolute_token(1, 3, token_type::TYPE),
+                absolute_token(5, 7, token_type::PROPERTY),
+            ],
+        );
+
+        let range =
+            |start, end| Some(Range { start: Position::new(0, start), end: Position::new(0, end) });
+        assert!(index.tokens(&uri, range(0, 1)).is_empty());
+        assert!(index.tokens(&uri, range(3, 5)).is_empty());
+        assert_eq!(
+            index.tokens(&uri, range(2, 6)),
+            vec![
+                SemanticToken {
+                    delta_line: 0,
+                    delta_start: 1,
+                    length: 2,
+                    token_type: token_type::TYPE,
+                    token_modifiers_bitset: 0,
+                },
+                SemanticToken {
+                    delta_line: 0,
+                    delta_start: 4,
+                    length: 2,
+                    token_type: token_type::PROPERTY,
+                    token_modifiers_bitset: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn cache_returns_deltas_only_for_the_latest_matching_result() {
         let uri = Url::parse("file:///tokens.sol").unwrap();
         let mut cache = SemanticTokenCache::default();
@@ -745,12 +817,12 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_valid_sized_elementary_types() {
-        for text in ["uint8", "uint256", "int16", "bytes1", "bytes32", "fixed8x0", "ufixed256x80"] {
-            assert!(is_sized_elementary_type(text), "expected valid type: {text}");
+    fn recognizes_only_valid_sized_fixed_types() {
+        for text in ["fixed8x0", "ufixed256x80"] {
+            assert!(is_sized_fixed_type(text), "expected valid type: {text}");
         }
-        for text in ["uint7", "int999", "bytes0", "bytes33", "fixed7x1", "fixed8x81"] {
-            assert!(!is_sized_elementary_type(text), "unexpected type: {text}");
+        for text in ["fixed", "ufixed", "fixed7x1", "fixed8x81"] {
+            assert!(!is_sized_fixed_type(text), "unexpected type: {text}");
         }
     }
 
@@ -761,6 +833,13 @@ mod tests {
             length: value,
             token_type: value,
             token_modifiers_bitset: value,
+        }
+    }
+
+    fn absolute_token(start: u32, end: u32, token_type: u32) -> AbsoluteToken {
+        AbsoluteToken {
+            range: Range { start: Position::new(0, start), end: Position::new(0, end) },
+            token_type,
         }
     }
 }

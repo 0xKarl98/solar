@@ -133,16 +133,8 @@ impl RequestFixture {
         let contents = self.marked.project().read_file(path);
         let mut values =
             vec![BTreeSet::<String>::new(); crate::semantic_tokens::legend().token_types.len()];
-        let mut line = 0;
-        let mut character = 0;
 
-        for token in tokens {
-            line += token.delta_line;
-            character = if token.delta_line == 0 {
-                character + token.delta_start
-            } else {
-                token.delta_start
-            };
+        for (line, character, token) in absolute_semantic_tokens(&tokens) {
             values[token.token_type as usize].insert(utf16_text_at(
                 &contents,
                 line,
@@ -192,16 +184,8 @@ impl RequestFixture {
         let contents = self.marked.project().read_file(path);
         let legend = crate::semantic_tokens::legend();
         let mut output = String::new();
-        let mut line = 0;
-        let mut character = 0;
 
-        for token in tokens {
-            line += token.delta_line;
-            character = if token.delta_line == 0 {
-                character + token.delta_start
-            } else {
-                token.delta_start
-            };
+        for (line, character, token) in absolute_semantic_tokens(tokens) {
             let token_type = legend.token_types[token.token_type as usize].as_str();
             let text = utf16_text_at(&contents, line, character, token.length);
             writeln!(
@@ -290,6 +274,19 @@ fn expect_ready<F: Future>(future: F) -> F::Output {
         Poll::Ready(output) => output,
         Poll::Pending => panic!("request handler future should complete immediately"),
     }
+}
+
+fn absolute_semantic_tokens(
+    tokens: &[SemanticToken],
+) -> impl Iterator<Item = (u32, u32, &SemanticToken)> {
+    let mut line = 0;
+    let mut character = 0;
+    tokens.iter().map(move |token| {
+        line += token.delta_line;
+        character =
+            if token.delta_line == 0 { character + token.delta_start } else { token.delta_start };
+        (line, character, token)
+    })
 }
 
 fn read_file(path: &Path) -> Option<String> {

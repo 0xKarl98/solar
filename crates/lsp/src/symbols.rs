@@ -14,7 +14,7 @@ use solar_sema::{
         self, ContractKind, EnumId, FunctionKind, ItemId, Res, StmtKind, TypeKind, UsingEntryKind,
         VarKind, Visit,
     },
-    ty::{MemberCompletion, ResolvedMember, Ty},
+    ty::{MemberCompletion, ResolvedCallee, ResolvedMember, Ty},
 };
 use std::ops::ControlFlow;
 
@@ -1228,14 +1228,18 @@ impl<'gcx> ReferenceCollector<'_, 'gcx> {
         res.into_iter().filter_map(|res| self.tables.symbol_id_for_res(res)).collect()
     }
 
-    fn symbol_ids_for_member_expr(&self, expr: &hir::Expr<'gcx>) -> Vec<SymbolId> {
-        if let Some(member) = self.gcx.resolved_member(expr.id)
+    fn symbol_ids_for_member(
+        &self,
+        member: Option<ResolvedMember>,
+        callee: Option<ResolvedCallee>,
+    ) -> Vec<SymbolId> {
+        if let Some(member) = member
             && let Some(symbol_id) = self.tables.symbol_id_for_resolved_member(self.gcx, member)
         {
             return vec![symbol_id];
         }
 
-        if let Some(callee) = self.gcx.resolved_callee(expr.id) {
+        if let Some(callee) = callee {
             let targets = self.symbol_ids_for_res([callee.res]);
             if !targets.is_empty() {
                 return targets;
@@ -1245,13 +1249,20 @@ impl<'gcx> ReferenceCollector<'_, 'gcx> {
         Vec::new()
     }
 
-    fn push_type_reference(&mut self, ty: &hir::Type<'gcx>) {
-        if let TypeKind::Custom(item_id) = ty.kind
-            && let Some(symbol_id) =
-                self.tables.symbols_by_key.get(&SymbolKey::Item(item_id)).copied()
-        {
-            self.push_reference(ty.span, vec![symbol_id]);
-        }
+    fn visit_member_expr(
+        &mut self,
+        expr: &'gcx hir::Expr<'gcx>,
+        receiver: &'gcx hir::Expr<'gcx>,
+        ident: solar_interface::Ident,
+        is_yul: bool,
+    ) -> ControlFlow<Never> {
+        self.visit_expr(receiver)?;
+        let member = self.gcx.resolved_member(expr.id);
+        let callee = self.gcx.resolved_callee(expr.id);
+        self.semantic_tokens.push_member_expr(expr, ident, is_yul, member, callee);
+        let targets = self.symbol_ids_for_member(member, callee);
+        self.push_reference(ident.span, targets);
+        ControlFlow::Continue(())
     }
 
     fn visit_using_directive(&mut self, using: &'gcx hir::UsingDirective<'gcx>) {
@@ -1288,11 +1299,12 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
         &mut self,
         modifier: &'gcx hir::Modifier<'gcx>,
     ) -> ControlFlow<Self::BreakValue> {
-        self.semantic_tokens.push_modifier(modifier);
+        let span = modifier.span.with_hi(modifier.args.span.lo());
+        self.semantic_tokens.push_modifier(modifier.id, span);
         if let Some(symbol_id) =
             self.tables.symbols_by_key.get(&SymbolKey::Item(modifier.id)).copied()
         {
-            self.push_reference(modifier.span.with_hi(modifier.args.span.lo()), vec![symbol_id]);
+            self.push_reference(span, vec![symbol_id]);
         }
         self.visit_call_args(&modifier.args)
     }
@@ -1329,8 +1341,9 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
     fn visit_expr(&mut self, expr: &'gcx hir::Expr<'gcx>) -> ControlFlow<Self::BreakValue> {
         match expr.kind {
             hir::ExprKind::Ident(res) => {
-                self.semantic_tokens.push_ident_expr(expr, res);
-                let targets = if let Some(callee) = self.gcx.resolved_callee(expr.id) {
+                let callee = self.gcx.resolved_callee(expr.id);
+                self.semantic_tokens.push_ident_expr(expr, res, callee);
+                let targets = if let Some(callee) = callee {
                     self.symbol_ids_for_res([callee.res])
                 } else {
                     self.symbol_ids_for_res(res.iter().copied())
@@ -1338,16 +1351,10 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
                 self.push_reference(expr.span, targets);
             }
             hir::ExprKind::Member(receiver, ident) => {
-                self.visit_expr(receiver)?;
-                self.semantic_tokens.push_member_expr(expr, ident, false);
-                let targets = self.symbol_ids_for_member_expr(expr);
-                self.push_reference(ident.span, targets);
+                self.visit_member_expr(expr, receiver, ident, false)?;
             }
             hir::ExprKind::YulMember(receiver, ident) => {
-                self.visit_expr(receiver)?;
-                self.semantic_tokens.push_member_expr(expr, ident, true);
-                let targets = self.symbol_ids_for_member_expr(expr);
-                self.push_reference(ident.span, targets);
+                self.visit_member_expr(expr, receiver, ident, true)?;
             }
             _ => {
                 hir::Visit::walk_expr(self, expr)?;
@@ -1357,10 +1364,16 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
     }
 
     fn visit_ty(&mut self, ty: &'gcx hir::Type<'gcx>) -> ControlFlow<Self::BreakValue> {
-        self.semantic_tokens.push_type(ty);
-        self.push_type_reference(ty);
         match ty.kind {
-            TypeKind::Elementary(_) | TypeKind::Custom(_) | TypeKind::Err(_) => {}
+            TypeKind::Custom(item_id) => {
+                self.semantic_tokens.push_custom_type(item_id, ty.span);
+                if let Some(symbol_id) =
+                    self.tables.symbols_by_key.get(&SymbolKey::Item(item_id)).copied()
+                {
+                    self.push_reference(ty.span, vec![symbol_id]);
+                }
+            }
+            TypeKind::Elementary(_) | TypeKind::Err(_) => {}
             TypeKind::Array(array) => {
                 self.visit_ty(&array.element)?;
                 if let Some(size) = array.size {
