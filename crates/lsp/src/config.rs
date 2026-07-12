@@ -1,11 +1,13 @@
 use crate::{
     diagnostics::DiagnosticOwner,
     flycheck::{FlycheckConfig, FlycheckInitializationOptions},
+    semantic_tokens,
     workspace::{Workspace, WorkspacePathIndex, manifest::ProjectManifest},
 };
 use lsp_types::{
     CompletionOptions, DeclarationCapability, InitializeParams, OneOf, SaveOptions,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    SemanticTokensFullOptions, SemanticTokensOptions, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions,
 };
 use solar_interface::data_structures::map::FxHashSet;
@@ -180,6 +182,20 @@ pub(crate) fn negotiate_capabilities(params: InitializeParams) -> (ServerCapabil
             document_symbol_provider: Some(OneOf::Left(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
             references_provider: Some(OneOf::Left(true)),
+            semantic_tokens_provider: Some(
+                SemanticTokensOptions {
+                    work_done_progress_options: Default::default(),
+                    legend: semantic_tokens::legend(),
+                    range: Some(true),
+                    full: Some(
+                        serde_json::from_value::<SemanticTokensFullOptions>(
+                            serde_json::json!({ "delta": true }),
+                        )
+                        .expect("semantic token delta options are valid"),
+                    ),
+                }
+                .into(),
+            ),
             text_document_sync: Some(TextDocumentSyncCapability::Options(
                 TextDocumentSyncOptions {
                     open_close: Some(true),
@@ -255,6 +271,51 @@ mod tests {
             panic!("expected save options");
         };
         assert_eq!(save_options.include_text, Some(false));
+    }
+
+    #[test]
+    fn negotiate_capabilities_advertises_semantic_tokens() {
+        let (capabilities, _) = negotiate_capabilities(InitializeParams::default());
+
+        assert_eq!(
+            serde_json::to_value(capabilities.semantic_tokens_provider.unwrap()).unwrap(),
+            serde_json::json!({
+                "legend": {
+                    "tokenTypes": [
+                        "namespace",
+                        "type",
+                        "class",
+                        "enum",
+                        "interface",
+                        "struct",
+                        "parameter",
+                        "variable",
+                        "property",
+                        "enumMember",
+                        "event",
+                        "function",
+                        "method",
+                        "keyword",
+                        "comment",
+                        "string",
+                        "number",
+                        "operator",
+                    ],
+                    "tokenModifiers": [
+                        "declaration",
+                        "definition",
+                        "readonly",
+                        "static",
+                        "deprecated",
+                        "abstract",
+                        "documentation",
+                        "defaultLibrary",
+                    ],
+                },
+                "range": true,
+                "full": { "delta": true },
+            })
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use crate::{
     config::{Config, negotiate_capabilities},
     diagnostics::{DiagnosticMap, DiagnosticOwner, DiagnosticStore},
     flycheck, proto,
+    semantic_tokens::SemanticTokenCache,
     symbols::SymbolTables,
     vfs::Vfs,
     workspace::WorkspacePathIndex,
@@ -34,28 +35,36 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{
+    sync::{oneshot, watch},
+    task::JoinHandle,
+};
 
 pub(crate) struct GlobalState {
     client: ClientSocket,
     pub(crate) vfs: Arc<RwLock<Vfs>>,
     pub(crate) config: Arc<Config>,
     analysis_version: Arc<AtomicUsize>,
+    analysis_completed: watch::Sender<usize>,
     flycheck_versions: Arc<RwLock<FxHashMap<DiagnosticOwner, usize>>>,
     flycheck_cancels: FxHashMap<DiagnosticOwner, oneshot::Sender<()>>,
     pub(crate) symbol_tables: Arc<RwLock<SymbolTables>>,
+    pub(crate) semantic_token_cache: Arc<RwLock<SemanticTokenCache>>,
     diagnostics: Arc<RwLock<DiagnosticStore>>,
 }
 
 impl GlobalState {
     pub(crate) fn new(client: ClientSocket) -> Self {
+        let (analysis_completed, _) = watch::channel(0);
         Self {
             client,
             vfs: Arc::new(Default::default()),
             analysis_version: Arc::new(AtomicUsize::new(0)),
+            analysis_completed,
             flycheck_versions: Arc::new(Default::default()),
             flycheck_cancels: FxHashMap::default(),
             symbol_tables: Arc::new(Default::default()),
+            semantic_token_cache: Arc::new(Default::default()),
             diagnostics: Arc::new(Default::default()),
             config: Arc::new(Default::default()),
         }
@@ -149,11 +158,30 @@ impl GlobalState {
                 }
             }
 
-            if snapshot.is_current(version) {
-                snapshot.set_symbol_tables(symbol_tables);
-                snapshot.publish_diagnostics(DiagnosticOwner::Compiler, diagnostics);
-            }
+            snapshot.commit_analysis(version, symbol_tables, diagnostics);
         });
+    }
+
+    pub(crate) fn wait_for_latest_analysis(
+        &self,
+    ) -> impl Future<Output = ()> + Send + 'static + use<> {
+        let target = self.analysis_version.load(Ordering::Acquire);
+        let mut completed = self.analysis_completed.subscribe();
+        async move {
+            loop {
+                let completed_version = *completed.borrow_and_update();
+                if completed_version >= target {
+                    return;
+                }
+                if completed.changed().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn clear_semantic_tokens(&self, uri: &Url) {
+        self.semantic_token_cache.write().remove(uri);
     }
 
     pub(crate) fn run_flychecks_on_save(&mut self, path: PathBuf) {
@@ -249,6 +277,7 @@ impl GlobalState {
             vfs: self.vfs.clone(),
             config: self.config.clone(),
             analysis_version: self.analysis_version.clone(),
+            analysis_completed: self.analysis_completed.clone(),
             flycheck_versions: self.flycheck_versions.clone(),
             symbol_tables: self.symbol_tables.clone(),
             diagnostics: self.diagnostics.clone(),
@@ -297,11 +326,13 @@ fn publish_diagnostic_batches(
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct GlobalStateSnapshot {
     client: ClientSocket,
     vfs: Arc<RwLock<Vfs>>,
     config: Arc<Config>,
     analysis_version: Arc<AtomicUsize>,
+    analysis_completed: watch::Sender<usize>,
     flycheck_versions: Arc<RwLock<FxHashMap<DiagnosticOwner, usize>>>,
     symbol_tables: Arc<RwLock<SymbolTables>>,
     diagnostics: Arc<RwLock<DiagnosticStore>>,
@@ -375,8 +406,21 @@ impl GlobalStateSnapshot {
         batches
     }
 
-    fn set_symbol_tables(&mut self, symbol_tables: SymbolTables) {
-        *self.symbol_tables.write() = symbol_tables;
+    fn commit_analysis(
+        &mut self,
+        version: usize,
+        symbol_tables: SymbolTables,
+        diagnostics: DiagnosticMap,
+    ) {
+        let shared_symbol_tables = self.symbol_tables.clone();
+        let mut current_symbol_tables = shared_symbol_tables.write();
+        if !self.is_current(version) {
+            return;
+        }
+
+        *current_symbol_tables = symbol_tables;
+        self.publish_diagnostics(DiagnosticOwner::Compiler, diagnostics);
+        self.analysis_completed.send_replace(version);
     }
 
     fn analysis_workspaces(&self) -> Cow<'_, [crate::workspace::Workspace]> {
@@ -475,14 +519,24 @@ mod tests {
     use crate::{config::negotiate_capabilities, test_support::TestProject};
     use async_lsp::ClientSocket;
     use lsp_types::{
-        DocumentSymbol, SymbolKind, WatchKind, WorkspaceSymbol, notification::Notification,
+        DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DocumentSymbol, FileChangeType,
+        FileEvent, PartialResultParams, Position, Range, SemanticTokensDeltaParams,
+        SemanticTokensEdit, SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensResult,
+        SymbolKind, TextDocumentIdentifier, WatchKind, WorkDoneProgressParams, WorkspaceSymbol,
+        notification::Notification,
     };
-    use std::{path::Path, time::Duration};
+    use std::{
+        path::Path,
+        sync::Barrier,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
 
     mod completion;
     mod goto_definition;
     mod inlay_hint;
     mod references;
+    mod semantic_tokens;
     mod support;
 
     fn snapshot(project: &TestProject) -> GlobalStateSnapshot {
@@ -495,6 +549,7 @@ mod tests {
             vfs: Arc::new(RwLock::new(vfs)),
             config: Arc::new(config),
             analysis_version: Arc::new(AtomicUsize::new(1)),
+            analysis_completed: watch::channel(1).0,
             flycheck_versions: Arc::new(Default::default()),
             symbol_tables: Arc::new(Default::default()),
             diagnostics: Arc::new(Default::default()),
@@ -520,6 +575,236 @@ mod tests {
                 ],
             }))
         );
+    }
+
+    #[test]
+    fn waits_for_the_captured_analysis_epoch() {
+        let state = GlobalState::new(ClientSocket::new_closed());
+        state.analysis_version.store(1, Ordering::Release);
+        let mut wait = std::pin::pin!(state.wait_for_latest_analysis());
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+        state.analysis_completed.send_replace(0);
+        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+        state.analysis_completed.send_replace(1);
+        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Ready(())));
+    }
+
+    #[test]
+    fn stale_analysis_cannot_replace_a_newer_commit() {
+        let mut snapshot = snapshot_with_config(Config::default(), Vfs::default());
+        let mut stale_snapshot = snapshot.clone();
+        let current = symbol_tables_for_contract("Current");
+        let stale = symbol_tables_for_contract("Stale");
+        let barrier = Arc::new(Barrier::new(2));
+        let stale_barrier = barrier.clone();
+        let shared_symbol_tables = snapshot.symbol_tables.clone();
+        let table_guard = shared_symbol_tables.write();
+        let stale_commit = std::thread::spawn(move || {
+            assert!(stale_snapshot.is_current(1));
+            stale_barrier.wait();
+            stale_snapshot.commit_analysis(1, stale, DiagnosticMap::default());
+        });
+
+        barrier.wait();
+        snapshot.analysis_version.store(2, Ordering::Release);
+        drop(table_guard);
+        stale_commit.join().unwrap();
+        snapshot.commit_analysis(2, current, DiagnosticMap::default());
+
+        let declarations = snapshot.symbol_tables.read();
+        assert_eq!(declarations.declarations()[0].name, "Current");
+        assert_eq!(*snapshot.analysis_completed.borrow(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_and_delete_notifications_clear_semantic_token_history() {
+        let project = TestProject::from_fixture(
+            r#"
+            //- /Tokens.sol open
+            contract Tokens {}
+            "#,
+        );
+        let uri = Url::from_file_path(project.path("/Tokens.sol")).unwrap();
+        let mut state = GlobalState::new(ClientSocket::new_closed());
+        state.config = Arc::new(project.config());
+        *state.vfs.write() = project.vfs();
+
+        let generation = state.semantic_token_cache.read().generation();
+        state.semantic_token_cache.write().full_at_generation(uri.clone(), Vec::new(), generation);
+        let _ = crate::handlers::did_close_text_document(
+            &mut state,
+            DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            },
+        );
+        assert!(!state.semantic_token_cache.read().contains(&uri));
+
+        let generation = state.semantic_token_cache.read().generation();
+        state.semantic_token_cache.write().full_at_generation(uri.clone(), Vec::new(), generation);
+        project.remove_file("/Tokens.sol");
+        let _ = crate::handlers::did_change_watched_files(
+            &mut state,
+            DidChangeWatchedFilesParams {
+                changes: vec![FileEvent::new(uri.clone(), FileChangeType::DELETED)],
+            },
+        );
+        assert!(!state.semantic_token_cache.read().contains(&uri));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_token_handlers_issue_full_and_delta_results() {
+        let mut state = GlobalState::new(ClientSocket::new_closed());
+        let project = TestProject::new();
+        let path = project.path("/Tokens.sol");
+        let uri = Url::from_file_path(&path).unwrap();
+        *state.symbol_tables.write() =
+            symbol_tables_for_source(path.clone(), "contract Tokens {}".into());
+        let full = crate::handlers::semantic_tokens_full(
+            &mut state,
+            SemanticTokensParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let SemanticTokensResult::Tokens(full) = full else {
+            panic!("expected full semantic tokens");
+        };
+        let first_result_id = full.result_id.clone().unwrap();
+
+        let _ = crate::handlers::semantic_tokens_range(
+            &mut state,
+            SemanticTokensRangeParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range { start: Position::new(0, 0), end: Position::new(u32::MAX, u32::MAX) },
+            },
+        )
+        .await
+        .unwrap();
+        *state.symbol_tables.write() =
+            symbol_tables_for_source(path, "contract Tokens { uint256 value; }".into());
+
+        let delta = crate::handlers::semantic_tokens_full_delta(
+            &mut state,
+            SemanticTokensDeltaParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                previous_result_id: first_result_id.clone(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let lsp_types::SemanticTokensFullDeltaResult::TokensDelta(delta) = delta else {
+            panic!("expected a delta for a matching result id");
+        };
+        assert_ne!(delta.result_id.as_deref(), Some(first_result_id.as_str()));
+        assert_eq!(
+            delta.edits,
+            vec![SemanticTokensEdit {
+                start: 10,
+                delete_count: 0,
+                data: Some(vec![
+                    lsp_types::SemanticToken {
+                        delta_line: 0,
+                        delta_start: 9,
+                        length: 7,
+                        token_type: crate::semantic_tokens::token_type::TYPE,
+                        token_modifiers_bitset: 0,
+                    },
+                    lsp_types::SemanticToken {
+                        delta_line: 0,
+                        delta_start: 8,
+                        length: 5,
+                        token_type: crate::semantic_tokens::token_type::PROPERTY,
+                        token_modifiers_bitset: 0,
+                    },
+                ]),
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&delta.edits[0]).unwrap(),
+            serde_json::json!({
+                "start": 10,
+                "deleteCount": 0,
+                "data": [0, 9, 7, 1, 0, 0, 8, 5, 8, 0],
+            })
+        );
+
+        let full = crate::handlers::semantic_tokens_full_delta(
+            &mut state,
+            SemanticTokensDeltaParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri },
+                previous_result_id: first_result_id,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(full, lsp_types::SemanticTokensFullDeltaResult::Tokens(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_token_request_cannot_repopulate_cleared_cache() {
+        let project = TestProject::from_fixture(
+            r#"
+            //- /Tokens.sol open
+            contract Tokens {}
+            "#,
+        );
+        let uri = Url::from_file_path(project.path("/Tokens.sol")).unwrap();
+        let mut state = GlobalState::new(ClientSocket::new_closed());
+        state.config = Arc::new(project.config());
+        *state.vfs.write() = project.vfs();
+        state.analysis_version.store(1, Ordering::Release);
+
+        let mut request = std::pin::pin!(crate::handlers::semantic_tokens_full(
+            &mut state,
+            SemanticTokensParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            },
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(request.as_mut().poll(&mut context), Poll::Pending));
+
+        let _ = crate::handlers::did_close_text_document(
+            &mut state,
+            DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            },
+        );
+        state.analysis_completed.send_replace(2);
+        assert!(matches!(request.as_mut().poll(&mut context), Poll::Ready(Ok(Some(_)))));
+        assert!(!state.semantic_token_cache.read().contains(&uri));
+    }
+
+    fn symbol_tables_for_contract(name: &str) -> SymbolTables {
+        let project = TestProject::new();
+        let path = project.path("/Contract.sol");
+        symbol_tables_for_source(path, format!("contract {name} {{}}"))
+    }
+
+    fn symbol_tables_for_source(path: PathBuf, source: String) -> SymbolTables {
+        analyze(AnalysisBatch {
+            opts: CompileOpts::default(),
+            files: vec![(path, source)],
+            seen_paths: FxHashSet::default(),
+        })
+        .symbol_tables
     }
 
     #[test]

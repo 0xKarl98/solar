@@ -23,6 +23,7 @@ mod global_state;
 mod handlers;
 mod inlay_hints;
 mod proto;
+mod semantic_tokens;
 mod serde;
 mod symbols;
 mod utils;
@@ -53,7 +54,10 @@ fn new_router(client: ClientSocket) -> Router<GlobalState> {
         .request::<req::GotoDeclaration, _>(handlers::goto_declaration)
         .request::<req::References, _>(handlers::references)
         .request::<req::InlayHintRequest, _>(handlers::inlay_hints)
-        .request::<req::Completion, _>(handlers::completion);
+        .request::<req::Completion, _>(handlers::completion)
+        .request::<req::SemanticTokensFullRequest, _>(handlers::semantic_tokens_full)
+        .request::<req::SemanticTokensRangeRequest, _>(handlers::semantic_tokens_range)
+        .request::<req::SemanticTokensFullDeltaRequest, _>(handlers::semantic_tokens_full_delta);
 
     // Workspace management
     router
@@ -103,16 +107,17 @@ pub async fn run_server_stdio(_args: LspArgs) -> async_lsp::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_lsp::{AnyNotification, LanguageServer, LspService, router::Router};
+    use async_lsp::{AnyNotification, AnyRequest, LanguageServer, LspService, router::Router};
     use lsp_types::{
         DidChangeWatchedFilesClientCapabilities, DidChangeWatchedFilesParams,
         DidSaveTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializedParams,
         TextDocumentIdentifier, WorkspaceClientCapabilities, notification as notif,
-        notification::Notification, request,
+        notification::Notification, request, request::Request,
     };
     use std::ops::ControlFlow;
     use tokio::sync::oneshot;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+    use tower::Service;
 
     #[tokio::test(flavor = "current_thread")]
     async fn router_handles_watched_file_changes() {
@@ -148,6 +153,46 @@ mod tests {
         .unwrap();
 
         assert!(matches!(router.notify(notification), ControlFlow::Continue(())));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_handles_semantic_token_requests() {
+        let uri = "file:///workspace/src/Test.sol";
+        let requests = [
+            (
+                request::SemanticTokensFullRequest::METHOD,
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            ),
+            (
+                request::SemanticTokensRangeRequest::METHOD,
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 1 },
+                    },
+                }),
+            ),
+            (
+                request::SemanticTokensFullDeltaRequest::METHOD,
+                serde_json::json!({
+                    "textDocument": { "uri": uri },
+                    "previousResultId": "missing",
+                }),
+            ),
+        ];
+
+        for (id, (method, params)) in requests.into_iter().enumerate() {
+            let mut router = new_router(ClientSocket::new_closed());
+            let request = serde_json::from_value::<AnyRequest>(serde_json::json!({
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .unwrap();
+
+            router.call(request).await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

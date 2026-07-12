@@ -4,7 +4,9 @@ use crop::Rope;
 use lsp_types::{
     CompletionParams, CompletionResponse, DocumentSymbolParams, DocumentSymbolResponse,
     GotoDefinitionParams, GotoDefinitionResponse, InlayHint, InlayHintParams, Position,
-    ReferenceParams, Url, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    ReferenceParams, SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, Url, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use std::future::ready;
 
@@ -84,6 +86,57 @@ pub(crate) fn completion(
         context,
     );
     ready(Ok(Some(CompletionResponse::Array(items))))
+}
+
+pub(crate) fn semantic_tokens_full(
+    state: &mut GlobalState,
+    params: SemanticTokensParams,
+) -> impl Future<Output = Result<Option<SemanticTokensResult>, ResponseError>> + use<> {
+    let wait = state.wait_for_latest_analysis();
+    let symbol_tables = state.symbol_tables.clone();
+    let cache = state.semantic_token_cache.clone();
+    let uri = params.text_document.uri;
+    let cache_generation = cache.read().generation();
+    async move {
+        wait.await;
+        let data = symbol_tables.read().semantic_tokens(&uri, None);
+        let tokens = cache.write().full_at_generation(uri, data, cache_generation);
+        Ok(Some(tokens.into()))
+    }
+}
+
+pub(crate) fn semantic_tokens_range(
+    state: &mut GlobalState,
+    params: SemanticTokensRangeParams,
+) -> impl Future<Output = Result<Option<SemanticTokensRangeResult>, ResponseError>> + use<> {
+    let wait = state.wait_for_latest_analysis();
+    let symbol_tables = state.symbol_tables.clone();
+    let uri = params.text_document.uri;
+    let range = params.range;
+    async move {
+        wait.await;
+        let data = symbol_tables.read().semantic_tokens(&uri, Some(range));
+        Ok(Some(SemanticTokens { result_id: None, data }.into()))
+    }
+}
+
+pub(crate) fn semantic_tokens_full_delta(
+    state: &mut GlobalState,
+    params: SemanticTokensDeltaParams,
+) -> impl Future<Output = Result<Option<SemanticTokensFullDeltaResult>, ResponseError>> + use<> {
+    let wait = state.wait_for_latest_analysis();
+    let symbol_tables = state.symbol_tables.clone();
+    let cache = state.semantic_token_cache.clone();
+    let uri = params.text_document.uri;
+    let previous_result_id = params.previous_result_id;
+    let cache_generation = cache.read().generation();
+    async move {
+        wait.await;
+        let data = symbol_tables.read().semantic_tokens(&uri, None);
+        let tokens =
+            cache.write().delta_at_generation(uri, &previous_result_id, data, cache_generation);
+        Ok(Some(tokens))
+    }
 }
 
 struct CompletionInput {

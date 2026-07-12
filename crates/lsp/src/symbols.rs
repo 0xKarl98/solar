@@ -1,6 +1,7 @@
 use lsp_types::{
     CompletionItem, CompletionItemKind, DocumentSymbol, GotoDefinitionResponse, InlayHint,
-    Location, OneOf, Position, Range, SymbolInformation, SymbolKind, Url, WorkspaceSymbol,
+    Location, OneOf, Position, Range, SemanticToken, SymbolInformation, SymbolKind, Url,
+    WorkspaceSymbol,
 };
 use solar_interface::{
     Span,
@@ -17,7 +18,11 @@ use solar_sema::{
 };
 use std::ops::ControlFlow;
 
-use crate::{inlay_hints::InlayHintIndex, proto};
+use crate::{
+    inlay_hints::InlayHintIndex,
+    proto,
+    semantic_tokens::{SemanticTokenBuilder, SemanticTokenIndex},
+};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SymbolTables {
@@ -36,6 +41,7 @@ pub(crate) struct SymbolTables {
     file_references: FxHashMap<Url, Vec<usize>>,
     symbol_references: FxHashMap<SymbolId, Vec<Location>>,
     inlay_hints: InlayHintIndex,
+    semantic_tokens: SemanticTokenIndex,
 }
 
 newtype_index! {
@@ -124,6 +130,7 @@ impl SymbolTables {
     /// The compiler's resolver data is scoped to one analysis run. This table copies out the
     /// source-level declarations that LSP requests can query after that run has finished.
     pub(crate) fn build(gcx: Gcx<'_>) -> Self {
+        let mut semantic_tokens = SemanticTokenBuilder::new(gcx);
         let mut tables = Self::default();
         tables.build_builtin_completions();
         let item_ids = gcx.hir.item_ids();
@@ -142,6 +149,7 @@ impl SymbolTables {
             let Some((name, name_span)) = declaration_name(gcx, item_id) else {
                 continue;
             };
+            semantic_tokens.push_declaration(item_id, name_span);
             let Some(location) = proto::span_to_location(gcx.sess.source_map(), item.span()) else {
                 continue;
             };
@@ -180,6 +188,7 @@ impl SymbolTables {
             let parent = item_symbols.get(&ItemId::Enum(enum_id)).copied();
 
             for (variant_index, variant) in enumm.variants.iter().enumerate() {
+                semantic_tokens.push_enum_variant(variant.span);
                 let Some(location) = proto::span_to_location(gcx.sess.source_map(), variant.span)
                 else {
                     continue;
@@ -204,8 +213,9 @@ impl SymbolTables {
         tables.build_scopes(gcx);
         tables.build_receiver_member_completions(gcx);
         tables.build_member_completions(gcx);
-        tables.build_references(gcx);
+        tables.build_references(gcx, &mut semantic_tokens);
         tables.inlay_hints = InlayHintIndex::build(gcx);
+        tables.semantic_tokens = semantic_tokens.finish();
         tables.rebuild_indexes();
         tables
     }
@@ -234,6 +244,7 @@ impl SymbolTables {
             self.builtin_member_completions = std::mem::take(&mut other.builtin_member_completions);
         }
         self.inlay_hints.extend(other.inlay_hints);
+        self.semantic_tokens.extend(other.semantic_tokens);
 
         if other.declarations.is_empty() {
             return;
@@ -281,6 +292,10 @@ impl SymbolTables {
 
     pub(crate) fn inlay_hints(&self, uri: &Url, range: Range) -> Vec<InlayHint> {
         self.inlay_hints.hints(uri, range)
+    }
+
+    pub(crate) fn semantic_tokens(&self, uri: &Url, range: Option<Range>) -> Vec<SemanticToken> {
+        self.semantic_tokens.tokens(uri, range)
     }
 
     pub(crate) fn document_symbols(&self, uri: &Url) -> Vec<DocumentSymbol> {
@@ -578,8 +593,13 @@ impl SymbolTables {
             .push(ScopedDeclaration { symbol_id, available_from: Some(available_from) });
     }
 
-    fn build_references(&mut self, gcx: Gcx<'_>) {
-        let mut collector = ReferenceCollector { tables: self, gcx, source: None, contract: None };
+    fn build_references<'gcx>(
+        &mut self,
+        gcx: Gcx<'gcx>,
+        semantic_tokens: &mut SemanticTokenBuilder<'gcx>,
+    ) {
+        let mut collector =
+            ReferenceCollector { tables: self, semantic_tokens, gcx, source: None, contract: None };
         for source_id in gcx.hir.source_ids() {
             collector.source = Some(source_id);
             collector.contract = None;
@@ -1187,6 +1207,7 @@ impl<'gcx> hir::Visit<'gcx> for MemberCompletionCollector<'_, 'gcx> {
 
 struct ReferenceCollector<'a, 'gcx> {
     tables: &'a mut SymbolTables,
+    semantic_tokens: &'a mut SemanticTokenBuilder<'gcx>,
     gcx: Gcx<'gcx>,
     source: Option<hir::SourceId>,
     contract: Option<hir::ContractId>,
@@ -1235,6 +1256,7 @@ impl<'gcx> ReferenceCollector<'_, 'gcx> {
 
     fn visit_using_directive(&mut self, using: &'gcx hir::UsingDirective<'gcx>) {
         for entry in using.entries {
+            self.semantic_tokens.push_using_entry(entry);
             let targets = match entry.kind {
                 UsingEntryKind::Library(contract_id) => {
                     self.symbol_ids_for_res([Res::Item(ItemId::Contract(contract_id))])
@@ -1266,6 +1288,7 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
         &mut self,
         modifier: &'gcx hir::Modifier<'gcx>,
     ) -> ControlFlow<Self::BreakValue> {
+        self.semantic_tokens.push_modifier(modifier);
         if let Some(symbol_id) =
             self.tables.symbols_by_key.get(&SymbolKey::Item(modifier.id)).copied()
         {
@@ -1285,6 +1308,9 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
         &mut self,
         contract: &'gcx hir::Contract<'gcx>,
     ) -> ControlFlow<Self::BreakValue> {
+        if let Some(layout) = contract.layout {
+            self.visit_expr(layout)?;
+        }
         for base in contract.bases_args {
             self.visit_modifier(base)?;
         }
@@ -1303,6 +1329,7 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
     fn visit_expr(&mut self, expr: &'gcx hir::Expr<'gcx>) -> ControlFlow<Self::BreakValue> {
         match expr.kind {
             hir::ExprKind::Ident(res) => {
+                self.semantic_tokens.push_ident_expr(expr, res);
                 let targets = if let Some(callee) = self.gcx.resolved_callee(expr.id) {
                     self.symbol_ids_for_res([callee.res])
                 } else {
@@ -1310,8 +1337,15 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
                 };
                 self.push_reference(expr.span, targets);
             }
-            hir::ExprKind::Member(receiver, ident) | hir::ExprKind::YulMember(receiver, ident) => {
+            hir::ExprKind::Member(receiver, ident) => {
                 self.visit_expr(receiver)?;
+                self.semantic_tokens.push_member_expr(expr, ident, false);
+                let targets = self.symbol_ids_for_member_expr(expr);
+                self.push_reference(ident.span, targets);
+            }
+            hir::ExprKind::YulMember(receiver, ident) => {
+                self.visit_expr(receiver)?;
+                self.semantic_tokens.push_member_expr(expr, ident, true);
                 let targets = self.symbol_ids_for_member_expr(expr);
                 self.push_reference(ident.span, targets);
             }
@@ -1323,6 +1357,7 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
     }
 
     fn visit_ty(&mut self, ty: &'gcx hir::Type<'gcx>) -> ControlFlow<Self::BreakValue> {
+        self.semantic_tokens.push_type(ty);
         self.push_type_reference(ty);
         match ty.kind {
             TypeKind::Elementary(_) | TypeKind::Custom(_) | TypeKind::Err(_) => {}

@@ -59,6 +59,7 @@ pub(crate) fn did_close_text_document(
     state: &mut GlobalState,
     params: DidCloseTextDocumentParams,
 ) -> NotifyResult {
+    state.clear_semantic_tokens(&params.text_document.uri);
     if let Some(path) = proto::vfs_path(&params.text_document.uri) {
         if !state.vfs.read().exists(&path) {
             error!(?path, "orphan DidCloseTextDocument");
@@ -115,6 +116,7 @@ pub(crate) fn did_change_watched_files(
                 if event.typ == FileChangeType::CREATED {
                     Arc::make_mut(&mut state.config).add_source_file(path.clone());
                 } else if event.typ == FileChangeType::DELETED {
+                    state.clear_semantic_tokens(&event.uri);
                     Arc::make_mut(&mut state.config).remove_source_file(&path);
                     removed_paths.push(path.clone());
                 }

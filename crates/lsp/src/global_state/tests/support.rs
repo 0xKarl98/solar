@@ -4,13 +4,16 @@ use async_lsp::ClientSocket;
 use lsp_types::{
     CompletionItem, CompletionParams, CompletionResponse, GotoDefinitionParams,
     GotoDefinitionResponse, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Location,
-    PartialResultParams, Position, Range, ReferenceContext, ReferenceParams,
-    TextDocumentIdentifier, TextDocumentPositionParams, Url, WorkDoneProgressParams,
+    PartialResultParams, Position, Range, ReferenceContext, ReferenceParams, SemanticToken,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    WorkDoneProgressParams,
 };
 use snapbox::{IntoData, assert_data_eq};
 use solar_config::CompileOpts;
 use solar_interface::data_structures::map::FxHashSet;
 use std::{
+    collections::BTreeSet,
     fmt::Write as _,
     future::Future,
     io::Read as _,
@@ -110,6 +113,108 @@ impl RequestFixture {
         );
     }
 
+    pub(super) fn semantic_tokens(&self, path: &str) -> Vec<SemanticToken> {
+        let mut state = self.state();
+        let uri = Url::from_file_path(self.marked.project().path(path)).unwrap();
+        let response = expect_ready(crate::handlers::semantic_tokens_full(
+            &mut state,
+            semantic_tokens_params(uri),
+        ))
+        .unwrap()
+        .unwrap();
+        let SemanticTokensResult::Tokens(tokens) = response else {
+            panic!("expected complete semantic tokens");
+        };
+        tokens.data
+    }
+
+    pub(super) fn check_semantic_token_summary(&self, path: &str, expected: impl IntoData) {
+        let tokens = self.semantic_tokens(path);
+        let contents = self.marked.project().read_file(path);
+        let mut values =
+            vec![BTreeSet::<String>::new(); crate::semantic_tokens::legend().token_types.len()];
+        let mut line = 0;
+        let mut character = 0;
+
+        for token in tokens {
+            line += token.delta_line;
+            character = if token.delta_line == 0 {
+                character + token.delta_start
+            } else {
+                token.delta_start
+            };
+            values[token.token_type as usize].insert(utf16_text_at(
+                &contents,
+                line,
+                character,
+                token.length,
+            ));
+        }
+
+        let mut output = String::new();
+        for (token_type, values) in crate::semantic_tokens::legend().token_types.iter().zip(values)
+        {
+            write!(output, "{}", token_type.as_str().to_ascii_uppercase()).unwrap();
+            for value in values {
+                write!(output, " `{value}`").unwrap();
+            }
+            output.push('\n');
+        }
+        assert_data_eq!(output, expected);
+    }
+
+    pub(super) fn check_semantic_tokens(&self, path: &str, expected: impl IntoData) {
+        let tokens = self.semantic_tokens(path);
+        assert_data_eq!(self.semantic_token_output(path, &tokens), expected);
+    }
+
+    pub(super) fn check_semantic_tokens_in_range(
+        &self,
+        path: &str,
+        range: Range,
+        expected: impl IntoData,
+    ) {
+        let mut state = self.state();
+        let uri = Url::from_file_path(self.marked.project().path(path)).unwrap();
+        let response = expect_ready(crate::handlers::semantic_tokens_range(
+            &mut state,
+            semantic_tokens_range_params(uri, range),
+        ))
+        .unwrap()
+        .unwrap();
+        let SemanticTokensRangeResult::Tokens(tokens) = response else {
+            panic!("expected complete semantic tokens");
+        };
+        assert_data_eq!(self.semantic_token_output(path, &tokens.data), expected);
+    }
+
+    fn semantic_token_output(&self, path: &str, tokens: &[SemanticToken]) -> String {
+        let contents = self.marked.project().read_file(path);
+        let legend = crate::semantic_tokens::legend();
+        let mut output = String::new();
+        let mut line = 0;
+        let mut character = 0;
+
+        for token in tokens {
+            line += token.delta_line;
+            character = if token.delta_line == 0 {
+                character + token.delta_start
+            } else {
+                token.delta_start
+            };
+            let token_type = legend.token_types[token.token_type as usize].as_str();
+            let text = utf16_text_at(&contents, line, character, token.length);
+            writeln!(
+                output,
+                "{line}:{character} {} {} `{text}`",
+                token.length,
+                token_type.to_ascii_uppercase()
+            )
+            .unwrap();
+        }
+        output
+    }
+
     fn inlay_hints(&self, uri: Url, range: Range) -> Vec<InlayHint> {
         let mut state = self.state();
         let response =
@@ -193,6 +298,28 @@ fn read_file(path: &Path) -> Option<String> {
     Some(contents)
 }
 
+fn utf16_text_at(contents: &str, line: u32, start: u32, length: u32) -> String {
+    let line = contents.split('\n').nth(line as usize).unwrap();
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let end = start + length;
+    let mut utf16 = 0;
+    let mut start_byte = None;
+    let mut end_byte = None;
+    for (byte, ch) in line.char_indices() {
+        if utf16 == start {
+            start_byte = Some(byte);
+        }
+        if utf16 == end {
+            end_byte = Some(byte);
+            break;
+        }
+        utf16 += ch.len_utf16() as u32;
+    }
+    let start_byte = start_byte.unwrap_or(line.len());
+    let end_byte = end_byte.unwrap_or(line.len());
+    line[start_byte..end_byte].to_string()
+}
+
 fn completion_output(items: &[CompletionItem]) -> String {
     let mut output = String::new();
     for item in items {
@@ -262,6 +389,23 @@ fn inlay_hint_params(uri: Url, range: Range) -> InlayHintParams {
         text_document: TextDocumentIdentifier { uri },
         range,
         work_done_progress_params: WorkDoneProgressParams::default(),
+    }
+}
+
+fn semantic_tokens_params(uri: Url) -> SemanticTokensParams {
+    SemanticTokensParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
+fn semantic_tokens_range_params(uri: Url, range: Range) -> SemanticTokensRangeParams {
+    SemanticTokensRangeParams {
+        text_document: TextDocumentIdentifier { uri },
+        range,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
     }
 }
 
