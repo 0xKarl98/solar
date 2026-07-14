@@ -14,6 +14,7 @@ use lsp_types::{
     InitializeParams, InitializeResult, InitializedParams, LogMessageParams, MessageType,
     PublishDiagnosticsParams, Registration, RegistrationParams, ServerInfo, Url, WatchKind,
     notification::{DidChangeWatchedFiles, Notification},
+    request::SemanticTokensRefresh,
 };
 use solar_config::{CompileOpts, version::SHORT_VERSION};
 use solar_interface::{
@@ -125,14 +126,14 @@ impl GlobalState {
 
     pub(crate) fn recompute_with_disk_files(&mut self, disk_paths: Vec<PathBuf>) {
         let version = self.analysis_version.fetch_add(1, Ordering::AcqRel) + 1;
-        self.spawn_with_snapshot(move |mut snapshot| {
+        let analysis = self.spawn_with_snapshot(move |mut snapshot| {
             if !snapshot.is_current(version) {
-                return;
+                return false;
             }
 
             let batches = snapshot.analysis_batches(disk_paths);
             if !snapshot.is_current(version) {
-                return;
+                return false;
             }
 
             let mut diagnostics = DiagnosticMap::default();
@@ -144,7 +145,7 @@ impl GlobalState {
                 }
 
                 if !snapshot.is_current(version) {
-                    return;
+                    return false;
                 }
 
                 let result = analyze(batch);
@@ -154,12 +155,22 @@ impl GlobalState {
                 }
 
                 if !snapshot.is_current(version) {
-                    return;
+                    return false;
                 }
             }
 
-            snapshot.commit_analysis(version, symbol_tables, diagnostics);
+            snapshot.commit_analysis(version, symbol_tables, diagnostics)
         });
+        if self.config.supports_semantic_token_refresh() {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                if analysis.await.is_ok_and(|refresh| refresh)
+                    && let Err(error) = client.request::<SemanticTokensRefresh>(()).await
+                {
+                    tracing::warn!(%error, "failed to refresh semantic tokens");
+                }
+            });
+        }
     }
 
     pub(crate) fn wait_for_latest_analysis(
@@ -364,6 +375,7 @@ impl GlobalStateSnapshot {
                 opts: workspace.compile_opts().clone(),
                 files: Vec::new(),
                 seen_paths: FxHashSet::default(),
+                semantic_tokens: self.config.supports_semantic_tokens(),
             })
             .collect::<Vec<_>>();
         let source_map = SourceMap::empty();
@@ -411,16 +423,19 @@ impl GlobalStateSnapshot {
         version: usize,
         symbol_tables: SymbolTables,
         diagnostics: DiagnosticMap,
-    ) {
+    ) -> bool {
         let shared_symbol_tables = self.symbol_tables.clone();
         let mut current_symbol_tables = shared_symbol_tables.write();
         if !self.is_current(version) {
-            return;
+            return false;
         }
 
+        let refresh_semantic_tokens =
+            self.config.supports_semantic_token_refresh() && *self.analysis_completed.borrow() != 0;
         *current_symbol_tables = symbol_tables;
         self.publish_diagnostics(DiagnosticOwner::Compiler, diagnostics);
         self.analysis_completed.send_replace(version);
+        refresh_semantic_tokens
     }
 
     fn analysis_workspaces(&self) -> Cow<'_, [crate::workspace::Workspace]> {
@@ -446,6 +461,7 @@ struct AnalysisBatch {
     opts: CompileOpts,
     files: Vec<(PathBuf, String)>,
     seen_paths: FxHashSet<PathBuf>,
+    semantic_tokens: bool,
 }
 
 impl AnalysisBatch {
@@ -462,6 +478,7 @@ impl AnalysisBatch {
 
 fn analyze(batch: AnalysisBatch) -> AnalysisResult {
     let (emitter, diag_buffer) = InMemoryEmitter::new();
+    let semantic_tokens = batch.semantic_tokens;
     let mut opts = batch.opts;
     opts.unstable.typeck = true;
     let sess = Session::builder().opts(opts).dcx(DiagCtxt::new(Box::new(emitter))).build();
@@ -497,7 +514,7 @@ fn analyze(batch: AnalysisBatch) -> AnalysisResult {
             }
         }
 
-        let symbol_tables = SymbolTables::build(compiler.gcx());
+        let symbol_tables = SymbolTables::build(compiler.gcx(), semantic_tokens);
         let diagnostics = diag_buffer
             .read()
             .iter()
@@ -633,7 +650,12 @@ mod tests {
         *state.vfs.write() = project.vfs();
 
         let generation = state.semantic_token_cache.read().generation();
-        state.semantic_token_cache.write().full_at_generation(uri.clone(), Vec::new(), generation);
+        state.semantic_token_cache.write().full_at_generation(
+            uri.clone(),
+            Vec::new(),
+            generation,
+            true,
+        );
         let _ = crate::handlers::did_close_text_document(
             &mut state,
             DidCloseTextDocumentParams {
@@ -643,7 +665,12 @@ mod tests {
         assert!(!state.semantic_token_cache.read().contains(&uri));
 
         let generation = state.semantic_token_cache.read().generation();
-        state.semantic_token_cache.write().full_at_generation(uri.clone(), Vec::new(), generation);
+        state.semantic_token_cache.write().full_at_generation(
+            uri.clone(),
+            Vec::new(),
+            generation,
+            true,
+        );
         project.remove_file("/Tokens.sol");
         let _ = crate::handlers::did_change_watched_files(
             &mut state,
@@ -657,6 +684,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn semantic_token_handlers_issue_full_and_delta_results() {
         let mut state = GlobalState::new(ClientSocket::new_closed());
+        state.config = Arc::new(semantic_token_config());
         let project = TestProject::new();
         let path = project.path("/Tokens.sol");
         let uri = Url::from_file_path(&path).unwrap();
@@ -792,6 +820,60 @@ mod tests {
         assert!(!state.semantic_token_cache.read().contains(&uri));
     }
 
+    #[test]
+    fn analysis_can_skip_semantic_token_index() {
+        let project = TestProject::from_fixture(
+            r#"
+            //- /Tokens.sol
+            contract Tokens {}
+            "#,
+        );
+        let path = project.path("/Tokens.sol");
+        let uri = Url::from_file_path(&path).unwrap();
+        let result = analyze(AnalysisBatch {
+            opts: CompileOpts::default(),
+            files: vec![(path, project.read_file("/Tokens.sol"))],
+            seen_paths: FxHashSet::default(),
+            semantic_tokens: false,
+        });
+
+        assert!(!result.symbol_tables.document_symbols(&uri).is_empty());
+        assert!(result.symbol_tables.semantic_tokens(&uri, None).is_empty());
+    }
+
+    #[test]
+    fn analysis_refreshes_semantic_tokens_after_the_initial_commit() {
+        let mut snapshot = snapshot_with_config(semantic_token_config(), Vfs::default());
+        snapshot.analysis_completed.send_replace(0);
+        snapshot.analysis_version.store(1, Ordering::Release);
+
+        assert!(!snapshot.commit_analysis(1, SymbolTables::default(), DiagnosticMap::default(),));
+
+        snapshot.analysis_version.store(2, Ordering::Release);
+        assert!(snapshot.commit_analysis(2, SymbolTables::default(), DiagnosticMap::default(),));
+    }
+
+    fn semantic_token_config() -> Config {
+        let params = InitializeParams {
+            capabilities: serde_json::from_value(serde_json::json!({
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": { "delta": true } },
+                        "tokenTypes": ["class"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                },
+                "workspace": {
+                    "semanticTokens": { "refreshSupport": true }
+                }
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+        negotiate_capabilities(params).1
+    }
+
     fn symbol_tables_for_contract(name: &str) -> SymbolTables {
         let project = TestProject::new();
         let path = project.path("/Contract.sol");
@@ -803,6 +885,7 @@ mod tests {
             opts: CompileOpts::default(),
             files: vec![(path, source)],
             seen_paths: FxHashSet::default(),
+            semantic_tokens: true,
         })
         .symbol_tables
     }
@@ -1227,6 +1310,7 @@ mod tests {
             opts: CompileOpts::default(),
             files: vec![(path, project.read_file("/Symbols.sol"))],
             seen_paths: FxHashSet::default(),
+            semantic_tokens: true,
         });
 
         assert!(result.diagnostics.is_empty());
@@ -1309,6 +1393,7 @@ mod tests {
             opts: CompileOpts::default(),
             files: vec![(path, project.read_file("/Symbols.sol"))],
             seen_paths: FxHashSet::default(),
+            semantic_tokens: true,
         });
 
         assert!(result.diagnostics.is_empty(), "{:#?}", result.diagnostics);

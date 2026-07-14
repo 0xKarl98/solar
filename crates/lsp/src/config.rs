@@ -30,6 +30,9 @@ pub(crate) struct Config {
     flychecks: Vec<FlycheckConfig>,
     watched_file_dynamic_registration: bool,
     hierarchical_document_symbol_support: bool,
+    semantic_tokens_support: bool,
+    semantic_tokens_delta_support: bool,
+    semantic_tokens_refresh_support: bool,
 }
 
 impl Config {
@@ -39,6 +42,18 @@ impl Config {
 
     pub(crate) fn supports_hierarchical_document_symbols(&self) -> bool {
         self.hierarchical_document_symbol_support
+    }
+
+    pub(crate) fn supports_semantic_tokens(&self) -> bool {
+        self.semantic_tokens_support
+    }
+
+    pub(crate) fn supports_semantic_token_delta(&self) -> bool {
+        self.semantic_tokens_delta_support
+    }
+
+    pub(crate) fn supports_semantic_token_refresh(&self) -> bool {
+        self.semantic_tokens_refresh_support
     }
 
     pub(crate) fn workspaces(&self) -> &[Workspace] {
@@ -155,13 +170,38 @@ pub(crate) fn negotiate_capabilities(params: InitializeParams) -> (ServerCapabil
     // `root_uri`.
     let watched_file_dynamic_registration = capabilities
         .workspace
-        .and_then(|workspace| workspace.did_change_watched_files)
+        .as_ref()
+        .and_then(|workspace| workspace.did_change_watched_files.as_ref())
         .and_then(|capabilities| capabilities.dynamic_registration)
         .unwrap_or(false);
     let hierarchical_document_symbol_support = capabilities
         .text_document
-        .and_then(|text_document| text_document.document_symbol)
+        .as_ref()
+        .and_then(|text_document| text_document.document_symbol.as_ref())
         .and_then(|capabilities| capabilities.hierarchical_document_symbol_support)
+        .unwrap_or(false);
+    let semantic_tokens = capabilities
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.semantic_tokens.as_ref());
+    let semantic_tokens_support = semantic_tokens.is_some_and(|capabilities| {
+        capabilities.requests.range == Some(true)
+            || capabilities.requests.full.as_ref().is_some_and(|full| match full {
+                SemanticTokensFullOptions::Bool(support) => *support,
+                SemanticTokensFullOptions::Delta { .. } => true,
+            })
+    });
+    let semantic_tokens_delta_support = semantic_tokens.is_some_and(|capabilities| {
+        matches!(
+            capabilities.requests.full.as_ref(),
+            Some(SemanticTokensFullOptions::Delta { delta: Some(true) })
+        )
+    });
+    let semantic_tokens_refresh_support = capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.semantic_tokens.as_ref())
+        .and_then(|capabilities| capabilities.refresh_support)
         .unwrap_or(false);
 
     let workspace_roots = workspace_folders
@@ -187,12 +227,7 @@ pub(crate) fn negotiate_capabilities(params: InitializeParams) -> (ServerCapabil
                     work_done_progress_options: Default::default(),
                     legend: semantic_tokens::legend(),
                     range: Some(true),
-                    full: Some(
-                        serde_json::from_value::<SemanticTokensFullOptions>(
-                            serde_json::json!({ "delta": true }),
-                        )
-                        .expect("semantic token delta options are valid"),
-                    ),
+                    full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                 }
                 .into(),
             ),
@@ -214,6 +249,9 @@ pub(crate) fn negotiate_capabilities(params: InitializeParams) -> (ServerCapabil
             flycheck_options,
             watched_file_dynamic_registration,
             hierarchical_document_symbol_support,
+            semantic_tokens_support,
+            semantic_tokens_delta_support,
+            semantic_tokens_refresh_support,
             ..Default::default()
         },
     )
@@ -326,6 +364,33 @@ mod tests {
         let (_, config) = negotiate_capabilities(params);
 
         assert!(config.supports_hierarchical_document_symbols());
+    }
+
+    #[test]
+    fn negotiate_capabilities_records_semantic_token_support() {
+        let params = InitializeParams {
+            capabilities: serde_json::from_value(serde_json::json!({
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "range": true, "full": { "delta": true } },
+                        "tokenTypes": ["class"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                },
+                "workspace": {
+                    "semanticTokens": { "refreshSupport": true }
+                }
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+
+        let (_, config) = negotiate_capabilities(params);
+
+        assert!(config.supports_semantic_tokens());
+        assert!(config.supports_semantic_token_delta());
+        assert!(config.supports_semantic_token_refresh());
     }
 
     #[test]

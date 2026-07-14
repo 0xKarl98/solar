@@ -129,8 +129,8 @@ impl SymbolTables {
     ///
     /// The compiler's resolver data is scoped to one analysis run. This table copies out the
     /// source-level declarations that LSP requests can query after that run has finished.
-    pub(crate) fn build(gcx: Gcx<'_>) -> Self {
-        let mut semantic_tokens = SemanticTokenBuilder::new(gcx);
+    pub(crate) fn build(gcx: Gcx<'_>, semantic_tokens_enabled: bool) -> Self {
+        let mut semantic_tokens = SemanticTokenBuilder::new(gcx, semantic_tokens_enabled);
         let mut tables = Self::default();
         tables.build_builtin_completions();
         let item_ids = gcx.hir.item_ids();
@@ -1340,6 +1340,10 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
 
     fn visit_expr(&mut self, expr: &'gcx hir::Expr<'gcx>) -> ControlFlow<Self::BreakValue> {
         match expr.kind {
+            hir::ExprKind::Call(callee, ref args, options) => {
+                self.semantic_tokens.push_call_names(callee, args, options);
+                hir::Visit::walk_expr(self, expr)?;
+            }
             hir::ExprKind::Ident(res) => {
                 let callee = self.gcx.resolved_callee(expr.id);
                 self.semantic_tokens.push_ident_expr(expr, res, callee);
@@ -1389,6 +1393,7 @@ impl<'gcx> hir::Visit<'gcx> for ReferenceCollector<'_, 'gcx> {
                 }
             }
             TypeKind::Mapping(mapping) => {
+                self.semantic_tokens.push_mapping_names(mapping);
                 self.visit_ty(&mapping.key)?;
                 self.visit_ty(&mapping.value)?;
             }

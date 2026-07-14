@@ -97,10 +97,11 @@ pub(crate) fn semantic_tokens_full(
     let cache = state.semantic_token_cache.clone();
     let uri = params.text_document.uri;
     let cache_generation = cache.read().generation();
+    let cache_result = state.config.supports_semantic_token_delta();
     async move {
         wait.await;
         let data = symbol_tables.read().semantic_tokens(&uri, None);
-        let tokens = cache.write().full_at_generation(uri, data, cache_generation);
+        let tokens = cache.write().full_at_generation(uri, data, cache_generation, cache_result);
         Ok(Some(tokens.into()))
     }
 }

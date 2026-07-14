@@ -142,6 +142,95 @@ OPERATOR `*`
 }
 
 #[test]
+fn classifies_named_syntax() {
+    let fixture = RequestFixture::new(
+        r#"
+        //- /Defs.sol
+        struct Payload { uint256 field; }
+        contract Target {
+            function callMe(uint256 amount) external payable {}
+        }
+
+        //- /Main.sol
+        import {Payload, Target} from "./Defs.sol";
+        contract C {
+            mapping(address owner => uint256 balance) values;
+            Target target;
+
+            function run() external {
+                Payload memory payload = Payload({field: 2});
+                target.callMe{gas: 1, value: 0}({amount: 1});
+            }
+        }
+        "#,
+        "/Main.sol",
+    );
+
+    fixture.check_semantic_token_summary(
+        "/Main.sol",
+        str![[r#"
+NAMESPACE
+TYPE `address` `uint256`
+CLASS `C` `Target`
+ENUM
+INTERFACE
+STRUCT `Payload`
+PARAMETER `amount` `balance` `owner`
+VARIABLE `payload`
+PROPERTY `field` `gas` `target` `value` `values`
+ENUMMEMBER
+EVENT
+FUNCTION
+METHOD `callMe` `run`
+KEYWORD `contract` `external` `from` `function` `import` `mapping` `memory`
+COMMENT
+STRING `"./Defs.sol"`
+NUMBER `0` `1` `2`
+OPERATOR `:` `=` `=>`
+
+"#]],
+    );
+}
+
+#[test]
+fn classifies_override_paths() {
+    let fixture = RequestFixture::new_allowing_diagnostics(
+        r#"
+        //- /Override.sol
+        contract C {
+            function run() external override(UniqueBase) {}
+        }
+        "#,
+        "/Override.sol",
+    );
+
+    fixture.check_semantic_token_summary(
+        "/Override.sol",
+        str![[r#"
+NAMESPACE
+TYPE
+CLASS `C` `UniqueBase`
+ENUM
+INTERFACE
+STRUCT
+PARAMETER
+VARIABLE
+PROPERTY
+ENUMMEMBER
+EVENT
+FUNCTION
+METHOD `run`
+KEYWORD `contract` `external` `function` `override`
+COMMENT
+STRING
+NUMBER
+OPERATOR
+
+"#]],
+    );
+}
+
+#[test]
 fn keeps_only_reliable_lexical_tokens_when_parsing_fails() {
     let fixture = RequestFixture::new_allowing_diagnostics(
         r#"

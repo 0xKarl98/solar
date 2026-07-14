@@ -107,12 +107,16 @@ pub async fn run_server_stdio(_args: LspArgs) -> async_lsp::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestProject;
     use async_lsp::{AnyNotification, AnyRequest, LanguageServer, LspService, router::Router};
     use lsp_types::{
-        DidChangeWatchedFilesClientCapabilities, DidChangeWatchedFilesParams,
-        DidSaveTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializedParams,
-        TextDocumentIdentifier, WorkspaceClientCapabilities, notification as notif,
-        notification::Notification, request, request::Request,
+        DidChangeTextDocumentParams, DidChangeWatchedFilesClientCapabilities,
+        DidChangeWatchedFilesParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+        FileChangeType, FileEvent, InitializeParams, InitializedParams, PartialResultParams,
+        SemanticTokensParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+        TextDocumentItem, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+        WorkspaceClientCapabilities, notification as notif, notification::Notification, request,
+        request::Request,
     };
     use std::ops::ControlFlow;
     use tokio::sync::oneshot;
@@ -237,6 +241,94 @@ mod tests {
                 .unwrap();
         let [registration] = registrations.registrations.try_into().unwrap();
         assert_eq!(registration.method, notif::DidChangeWatchedFiles::METHOD);
+
+        server.shutdown(()).await.unwrap();
+        server.exit(()).unwrap();
+        assert!(server_main.await.unwrap().is_ok());
+        assert!(matches!(client_main.await.unwrap(), Err(async_lsp::Error::Eof)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_token_changes_request_workspace_refresh() {
+        let project = TestProject::from_fixture(
+            r#"
+            //- /Main.sol
+            contract Main {}
+            "#,
+        );
+        let uri = lsp_types::Url::from_file_path(project.path("/Main.sol")).unwrap();
+        let text = project.read_file("/Main.sol");
+        let (server_main, _client) = async_lsp::MainLoop::new_server(new_router);
+        let (refresh_tx, refresh_rx) = oneshot::channel();
+        let (client_main, mut server) = async_lsp::MainLoop::new_client(|_| {
+            let mut router = Router::new(Some(refresh_tx));
+            router.request::<request::SemanticTokensRefresh, _>(|state, _| {
+                state.take().unwrap().send(()).unwrap();
+                async move { Ok(()) }
+            });
+            router.notification::<notif::LogMessage>(|_, _| ControlFlow::Continue(()));
+            router.notification::<notif::PublishDiagnostics>(|_, _| ControlFlow::Continue(()));
+            router
+        });
+
+        let (server_stream, client_stream) = tokio::io::duplex(64 << 10);
+        let (server_rx, server_tx) = tokio::io::split(server_stream);
+        let (server_rx, server_tx) = (server_rx.compat(), server_tx.compat_write());
+        let server_main =
+            tokio::spawn(async move { server_main.run_buffered(server_rx, server_tx).await });
+        let (client_rx, client_tx) = tokio::io::split(client_stream);
+        let (client_rx, client_tx) = (client_rx.compat(), client_tx.compat_write());
+        let client_main =
+            tokio::spawn(async move { client_main.run_buffered(client_rx, client_tx).await });
+
+        let mut params = project.initialize_params_with_roots(&["/"]);
+        params.capabilities = serde_json::from_value(serde_json::json!({
+            "textDocument": {
+                "semanticTokens": {
+                    "requests": { "full": { "delta": true } },
+                    "tokenTypes": ["class"],
+                    "tokenModifiers": [],
+                    "formats": ["relative"]
+                }
+            },
+            "workspace": {
+                "semanticTokens": { "refreshSupport": true }
+            }
+        }))
+        .unwrap();
+        server.initialize(params).await.unwrap();
+        server.initialized(InitializedParams {}).unwrap();
+        server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "solidity".into(),
+                    version: 1,
+                    text: text.clone(),
+                },
+            })
+            .unwrap();
+
+        server
+            .request::<request::SemanticTokensFullRequest>(SemanticTokensParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            })
+            .await
+            .unwrap();
+        server
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri, version: 2 },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "contract Main { uint256 value; }".into(),
+                }],
+            })
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), refresh_rx).await.unwrap().unwrap();
 
         server.shutdown(()).await.unwrap();
         server.exit(()).unwrap();

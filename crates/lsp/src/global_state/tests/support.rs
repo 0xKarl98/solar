@@ -42,6 +42,7 @@ impl RequestFixture {
             opts: CompileOpts::default(),
             files: vec![(path, contents)],
             seen_paths: FxHashSet::default(),
+            semantic_tokens: true,
         });
         Self { marked, result }
     }

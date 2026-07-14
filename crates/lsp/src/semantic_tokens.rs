@@ -3,7 +3,11 @@ use lsp_types::{
     SemanticTokensEdit, SemanticTokensFullDeltaResult, SemanticTokensLegend, Url,
 };
 use solar_interface::{
-    Span, Symbol, data_structures::map::FxHashMap, kw, source_map::SourceFile, sym,
+    Span, Symbol,
+    data_structures::{Never, map::FxHashMap},
+    kw,
+    source_map::SourceFile,
+    sym,
 };
 use solar_parse::{
     Cursor,
@@ -12,9 +16,9 @@ use solar_parse::{
 };
 use solar_sema::{
     Gcx,
-    ast::{ImportItems, ItemKind},
+    ast::{ImportItems, ItemKind, Visit as AstVisit},
     hir::{self, ContractKind, ItemId, Res, UsingEntry, UsingEntryKind, VarKind},
-    ty::{ResolvedCallee, ResolvedMember, TyKind},
+    ty::{CallableParamSource, ResolvedCallee, ResolvedMember, TyKind},
 };
 use std::{cmp::Reverse, collections::hash_map::Entry};
 
@@ -92,7 +96,11 @@ impl SemanticTokenCache {
         uri: Url,
         data: Vec<SemanticToken>,
         generation: u64,
+        cache_result: bool,
     ) -> SemanticTokens {
+        if !cache_result {
+            return SemanticTokens { result_id: None, data };
+        }
         if self.generation() != generation {
             return self.uncached_full(data);
         }
@@ -225,17 +233,24 @@ struct BuilderToken {
 pub(crate) struct SemanticTokenBuilder<'gcx> {
     gcx: Gcx<'gcx>,
     tokens: Vec<BuilderToken>,
+    enabled: bool,
 }
 
 impl<'gcx> SemanticTokenBuilder<'gcx> {
-    pub(crate) fn new(gcx: Gcx<'gcx>) -> Self {
-        let mut this = Self { gcx, tokens: Vec::new() };
-        this.collect_lexical_tokens();
-        this.collect_imports();
+    pub(crate) fn new(gcx: Gcx<'gcx>, enabled: bool) -> Self {
+        let mut this = Self { gcx, tokens: Vec::new(), enabled };
+        if enabled {
+            this.collect_lexical_tokens();
+            this.collect_imports();
+            this.collect_overrides();
+        }
         this
     }
 
     pub(crate) fn push_declaration(&mut self, item_id: ItemId, span: Span) {
+        if !self.enabled {
+            return;
+        }
         self.push_semantic(span, item_token_type(self.gcx, item_id));
     }
 
@@ -244,10 +259,16 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
     }
 
     pub(crate) fn push_modifier(&mut self, item_id: ItemId, span: Span) {
+        if !self.enabled {
+            return;
+        }
         self.push_last_ident(span, item_token_type(self.gcx, item_id));
     }
 
     pub(crate) fn push_using_entry(&mut self, entry: &UsingEntry<'gcx>) {
+        if !self.enabled {
+            return;
+        }
         let token_type = match entry.kind {
             UsingEntryKind::Library(_) => Some(token_type::NAMESPACE),
             UsingEntryKind::Functions(functions) => unanimous(
@@ -266,6 +287,9 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
         resolutions: &[Res],
         callee: Option<ResolvedCallee>,
     ) {
+        if !self.enabled {
+            return;
+        }
         let token_type = if let Some(callee) = callee {
             self.res_token_type(callee.res, expr, false)
         } else {
@@ -284,6 +308,9 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
         resolved: Option<ResolvedMember>,
         callee: Option<ResolvedCallee>,
     ) {
+        if !self.enabled {
+            return;
+        }
         let token_type = resolved
             .and_then(|resolved| self.resolved_member_token_type(resolved, expr))
             .or_else(|| callee.and_then(|callee| self.res_token_type(callee.res, expr, true)))
@@ -294,10 +321,65 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
     }
 
     pub(crate) fn push_custom_type(&mut self, item_id: ItemId, span: Span) {
+        if !self.enabled {
+            return;
+        }
         self.push_last_ident(span, item_token_type(self.gcx, item_id));
     }
 
+    pub(crate) fn push_call_names(
+        &mut self,
+        callee: &hir::Expr<'gcx>,
+        args: &hir::CallArgs<'gcx>,
+        options: Option<&hir::CallOptions<'gcx>>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        if let Some(options) = options {
+            for option in options.args {
+                if matches!(option.name.name, kw::Gas | sym::value | sym::salt) {
+                    self.push_semantic(option.name.span, token_type::PROPERTY);
+                }
+            }
+        }
+
+        let hir::CallArgsKind::Named(args) = args.kind else { return };
+        let Some(source) = self
+            .gcx
+            .type_of_expr(callee.id)
+            .and_then(|ty| self.gcx.callable_signature_of_ty(ty))
+            .and_then(|signature| signature.param_source)
+        else {
+            return;
+        };
+        let names = self.gcx.callable_param_names(source);
+        let token_type = if matches!(source, CallableParamSource::Struct(_)) {
+            token_type::PROPERTY
+        } else {
+            token_type::PARAMETER
+        };
+        for arg in args {
+            if names.iter().flatten().any(|&name| name == arg.name.name) {
+                self.push_semantic(arg.name.span, token_type);
+            }
+        }
+    }
+
+    pub(crate) fn push_mapping_names(&mut self, mapping: &hir::TypeMapping<'gcx>) {
+        if !self.enabled {
+            return;
+        }
+        for name in [mapping.key_name, mapping.value_name].into_iter().flatten() {
+            self.push_semantic(name.span, token_type::PARAMETER);
+        }
+    }
+
     pub(crate) fn finish(mut self) -> SemanticTokenIndex {
+        if !self.enabled {
+            return SemanticTokenIndex::default();
+        }
         self.tokens.sort_unstable_by_key(|token| {
             (token.span.lo(), Reverse(token.priority), token.span.hi(), token.token_type)
         });
@@ -330,12 +412,13 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
                 .as_real()
                 .and_then(|path| Url::from_file_path(path).ok())
                 .map(|uri| index.files.entry(uri).or_default());
+            let mut positions = PositionEncoder::new(file);
             while tokens.peek().is_some_and(|token| token.span.lo() <= file_end) {
                 let token = tokens.next().unwrap();
                 if token.span.hi() <= file_end
                     && let Some(output) = &mut output
                 {
-                    push_span_segments(output, file, token);
+                    push_span_segments(output, file, token, &mut positions);
                 }
             }
         }
@@ -425,6 +508,17 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
                     }
                 }
             }
+        }
+    }
+
+    fn collect_overrides(&mut self) {
+        let mut spans = Vec::new();
+        for ast in self.gcx.sources.asts() {
+            let mut collector = OverrideCollector { spans: &mut spans };
+            let _ = collector.visit_source_unit(ast);
+        }
+        for span in spans {
+            self.push_semantic(span, token_type::CLASS);
         }
     }
 
@@ -532,7 +626,7 @@ impl<'gcx> SemanticTokenBuilder<'gcx> {
     }
 
     fn push(&mut self, span: Span, token_type: u32, priority: u8) {
-        if !span.is_dummy() && span.lo() < span.hi() {
+        if self.enabled && !span.is_dummy() && span.lo() < span.hi() {
             self.tokens.push(BuilderToken { span, token_type, priority });
         }
     }
@@ -571,12 +665,82 @@ fn item_token_type(gcx: Gcx<'_>, item_id: ItemId) -> u32 {
     }
 }
 
-fn push_span_segments(tokens: &mut Vec<AbsoluteToken>, file: &SourceFile, token: BuilderToken) {
+struct PositionEncoder<'a> {
+    source: &'a str,
+    ascii: bool,
+    line: usize,
+    byte: usize,
+    character: u32,
+}
+
+impl<'a> PositionEncoder<'a> {
+    fn new(file: &'a SourceFile) -> Self {
+        Self {
+            source: &file.src,
+            ascii: file.multibyte_chars.is_empty(),
+            line: 0,
+            byte: 0,
+            character: 0,
+        }
+    }
+
+    fn columns(
+        &mut self,
+        line: usize,
+        line_start: usize,
+        segment_start: usize,
+        segment_end: usize,
+    ) -> (u32, u32) {
+        if self.ascii {
+            let start = (segment_start - line_start) as u32;
+            return (start, start + (segment_end - segment_start) as u32);
+        }
+
+        if self.line != line {
+            self.line = line;
+            self.byte = line_start;
+            self.character = 0;
+        }
+        debug_assert!(self.byte <= segment_start);
+        self.character += self.source[self.byte..segment_start].encode_utf16().count() as u32;
+        let start = self.character;
+        self.character += self.source[segment_start..segment_end].encode_utf16().count() as u32;
+        self.byte = segment_end;
+        (start, self.character)
+    }
+}
+
+struct OverrideCollector<'a> {
+    spans: &'a mut Vec<Span>,
+}
+
+impl<'ast> AstVisit<'ast> for OverrideCollector<'_> {
+    type BreakValue = Never;
+
+    fn visit_override(
+        &mut self,
+        override_: &'ast solar_sema::ast::Override<'ast>,
+    ) -> std::ops::ControlFlow<Self::BreakValue> {
+        self.spans.extend(
+            override_
+                .paths
+                .iter()
+                .filter_map(|path| path.segments().last().map(|ident| ident.span)),
+        );
+        self.walk_override(override_)
+    }
+}
+
+fn push_span_segments(
+    tokens: &mut Vec<AbsoluteToken>,
+    file: &SourceFile,
+    token: BuilderToken,
+    positions: &mut PositionEncoder<'_>,
+) {
     let start = file.relative_position(token.span.lo());
     let end = file.relative_position(token.span.hi());
     let Some(start_line) = file.lookup_line(start) else { return };
     let Some(end_line) = file.lookup_line(end) else { return };
-    let ascii = file.multibyte_chars.is_empty();
     let bytes = file.src.as_bytes();
     let start = start.to_usize();
     let end = end.to_usize();
@@ -596,16 +760,9 @@ fn push_span_segments(tokens: &mut Vec<AbsoluteToken>, file: &SourceFile, token:
             continue;
         }
 
-        let character = if ascii {
-            (segment_start - line_start) as u32
-        } else {
-            file.src[line_start..segment_start].encode_utf16().count() as u32
-        };
-        let length = if ascii {
-            (segment_end - segment_start) as u32
-        } else {
-            file.src[segment_start..segment_end].encode_utf16().count() as u32
-        };
+        let (character, end_character) =
+            positions.columns(line, line_start, segment_start, segment_end);
+        let length = end_character - character;
         if length == 0 {
             continue;
         }
@@ -784,8 +941,12 @@ mod tests {
         let uri = Url::parse("file:///tokens.sol").unwrap();
         let mut cache = SemanticTokenCache::default();
         let generation = cache.generation();
-        let first =
-            cache.full_at_generation(uri.clone(), vec![token(1), token(2), token(3)], generation);
+        let first = cache.full_at_generation(
+            uri.clone(),
+            vec![token(1), token(2), token(3)],
+            generation,
+            true,
+        );
         assert_eq!(first.result_id.as_deref(), Some("1"));
 
         let generation = cache.generation();
@@ -811,9 +972,21 @@ mod tests {
         cache.remove(&uri);
         assert!(!cache.contains(&uri));
 
-        let uncached = cache.full_at_generation(uri.clone(), vec![token(5)], 0);
+        let uncached = cache.full_at_generation(uri.clone(), vec![token(5)], 0, true);
         assert!(!cache.contains(&uri));
         assert!(uncached.result_id.is_some());
+    }
+
+    #[test]
+    fn cache_skips_history_without_delta_support() {
+        let uri = Url::parse("file:///tokens.sol").unwrap();
+        let mut cache = SemanticTokenCache::default();
+        let generation = cache.generation();
+
+        let full = cache.full_at_generation(uri.clone(), vec![token(1)], generation, false);
+
+        assert_eq!(full.result_id, None);
+        assert!(!cache.contains(&uri));
     }
 
     #[test]
