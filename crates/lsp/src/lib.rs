@@ -53,6 +53,20 @@ pub use global_state::benchmark::{
     BenchmarkRequest, BenchmarkResponse,
 };
 
+/// Runs the folding-range kernel for Criterion benchmarks.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub fn benchmark_folding_ranges(source: String) -> Vec<lsp_types::FoldingRange> {
+    folding_range::folding_ranges(source)
+}
+
+/// Runs the open-document folding-range kernel for Criterion benchmarks.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub fn benchmark_folding_ranges_from_rope(source: crop::Rope) -> Vec<lsp_types::FoldingRange> {
+    folding_range::folding_ranges_from_rope(source)
+}
+
 /// Runs the selection-range kernel for Criterion benchmarks.
 #[cfg(feature = "bench")]
 #[doc(hidden)]

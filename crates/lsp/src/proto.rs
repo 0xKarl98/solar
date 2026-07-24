@@ -100,17 +100,22 @@ impl<'a> LspPositionIndex<'a> {
     }
 
     pub(crate) fn position_at_byte(&self, byte: usize) -> Option<lsp_types::Position> {
+        let line = self.line_at_byte(byte)?;
+        let start = self.line_starts[line];
+        let character =
+            self.rope.byte_slice(start..byte).chars().map(|ch| ch.len_utf16()).sum::<usize>();
+        Some(lsp_types::Position::new(u32::try_from(line).ok()?, u32::try_from(character).ok()?))
+    }
+
+    pub(crate) fn line_at_byte(&self, byte: usize) -> Option<usize> {
         if byte > self.rope.byte_len() || !self.rope.is_char_boundary(byte) {
             return None;
         }
         let line = self.line_starts.partition_point(|&start| start <= byte).checked_sub(1)?;
-        let start = self.line_starts[line];
         if byte > self.line_end(line) {
             return None;
         }
-        let character =
-            self.rope.byte_slice(start..byte).chars().map(|ch| ch.len_utf16()).sum::<usize>();
-        Some(lsp_types::Position::new(u32::try_from(line).ok()?, u32::try_from(character).ok()?))
+        Some(line)
     }
 
     pub(crate) fn byte_len(&self) -> usize {
