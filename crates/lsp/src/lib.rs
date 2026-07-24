@@ -23,6 +23,7 @@ mod config;
 mod diagnostics;
 mod document_links;
 mod flycheck;
+mod folding_range;
 mod formatter;
 mod global_state;
 mod handlers;
@@ -98,6 +99,7 @@ fn new_router_with_state(this: GlobalState) -> Router<GlobalState> {
         .request::<req::Rename, _>(handlers::rename)
         .request::<req::SignatureHelpRequest, _>(handlers::signature_help)
         .request::<req::InlayHintRequest, _>(handlers::inlay_hints)
+        .request::<req::FoldingRangeRequest, _>(handlers::folding_range)
         .request::<req::SelectionRangeRequest, _>(handlers::selection_range)
         .request::<req::Completion, _>(handlers::completion)
         .request::<req::DocumentDiagnosticRequest, _>(handlers::document_diagnostic)
@@ -165,8 +167,8 @@ mod tests {
         DidChangeWatchedFilesClientCapabilities, DidChangeWatchedFilesParams,
         DidSaveTextDocumentParams, DocumentFormattingParams, DocumentHighlightParams,
         DocumentLinkParams, DocumentSymbolParams, ExecuteCommandParams, FileChangeType, FileEvent,
-        FormattingOptions, HoverParams, InitializeParams, InitializedParams, NumberOrString,
-        PartialResultParams, Position, SelectionRangeParams, SignatureHelpParams,
+        FoldingRangeParams, FormattingOptions, HoverParams, InitializeParams, InitializedParams,
+        NumberOrString, PartialResultParams, Position, SelectionRangeParams, SignatureHelpParams,
         TextDocumentIdentifier, TextDocumentPositionParams, TextDocumentSaveReason,
         WillSaveTextDocumentParams, WorkDoneProgressParams, WorkspaceClientCapabilities,
         notification as notif, notification::Notification, request, request::Request,
@@ -331,6 +333,31 @@ mod tests {
         let request = serde_json::from_value::<AnyRequest>(serde_json::json!({
             "id": 1,
             "method": request::DocumentLinkRequest::METHOD,
+            "params": params,
+        }))
+        .unwrap();
+
+        let response = router.call(request).await.unwrap();
+
+        assert_eq!(response, serde_json::json!([]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn router_handles_folding_range_requests() {
+        let project = TestProject::from_fixture("//- /Test.sol open\n");
+        let state = GlobalState::new(ClientSocket::new_closed());
+        *state.vfs.write() = project.vfs();
+        let mut router = new_router_with_state(state);
+        let params = FoldingRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: lsp_types::Url::from_file_path(project.path("/Test.sol")).unwrap(),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let request = serde_json::from_value::<AnyRequest>(serde_json::json!({
+            "id": 1,
+            "method": request::FoldingRangeRequest::METHOD,
             "params": params,
         }))
         .unwrap();
