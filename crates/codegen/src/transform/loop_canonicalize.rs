@@ -14,66 +14,72 @@
 use crate::{
     analysis::LoopAnalyzer,
     mir::{
-        BlockId, Function, InstId, InstKind, Instruction, Terminator, Value, ValueId,
+        BlockId, Function, InstId, InstKind, Instruction, Module, Terminator, Value, ValueId,
         utils::repair_reachability_phis,
     },
-    pass::FunctionPass,
+    pass::{MirPass, run_function_pass},
 };
-use solar_data_structures::map::FxHashSet;
+use solar_data_structures::bit_set::DenseBitSet;
+
+/// Function pass for loop canonicalization.
+pub(crate) struct LoopCanonicalize;
+
+impl MirPass for LoopCanonicalize {
+    fn name(&self) -> &'static str {
+        "loop-canonicalize"
+    }
+
+    fn run_pass(
+        &self,
+        _gcx: solar_sema::Gcx<'_>,
+        module: &mut Module,
+        analyses: &mut crate::pass::ModuleAnalyses,
+    ) -> bool {
+        run_function_pass(module, analyses, |func, _| {
+            LoopCanonicalizer::new().run(func).total() != 0
+        })
+    }
+}
 
 /// Statistics from loop canonicalization.
 #[derive(Clone, Debug, Default)]
-pub struct LoopCanonicalizeStats {
+struct LoopCanonicalizeStats {
     /// Number of preheader blocks inserted.
-    pub preheaders_inserted: usize,
+    preheaders_inserted: usize,
     /// Number of header phi nodes rewritten to use a preheader incoming value.
-    pub header_phis_rewritten: usize,
+    header_phis_rewritten: usize,
     /// Number of new preheader phi nodes inserted.
-    pub preheader_phis_inserted: usize,
+    preheader_phis_inserted: usize,
+    /// Whether CFG backlinks or phi inputs were repaired.
+    reachability_repaired: bool,
 }
 
 impl LoopCanonicalizeStats {
     /// Returns total canonicalization changes performed.
     #[must_use]
-    pub const fn total(&self) -> usize {
-        self.preheaders_inserted + self.header_phis_rewritten + self.preheader_phis_inserted
+    const fn total(&self) -> usize {
+        self.preheaders_inserted
+            + self.header_phis_rewritten
+            + self.preheader_phis_inserted
+            + self.reachability_repaired as usize
     }
 }
 
 /// Canonicalizes natural loops into a form expected by loop optimizers.
 #[derive(Debug, Default)]
-pub struct LoopCanonicalizer {
+struct LoopCanonicalizer {
     stats: LoopCanonicalizeStats,
-}
-
-/// Function pass for loop canonicalization.
-pub struct LoopCanonicalizePass;
-
-impl FunctionPass for LoopCanonicalizePass {
-    fn name(&self) -> &str {
-        "loop-canonicalize"
-    }
-
-    fn run_on_function(&mut self, func: &mut Function) -> bool {
-        LoopCanonicalizer::new().run(func).total() != 0
-    }
 }
 
 impl LoopCanonicalizer {
     /// Creates a new loop canonicalizer.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
-    /// Returns statistics from the last run.
-    #[must_use]
-    pub const fn stats(&self) -> &LoopCanonicalizeStats {
-        &self.stats
-    }
-
     /// Runs loop canonicalization to a fixed point.
-    pub fn run(&mut self, func: &mut Function) -> &LoopCanonicalizeStats {
+    fn run(&mut self, func: &mut Function) -> &LoopCanonicalizeStats {
         self.stats = LoopCanonicalizeStats::default();
 
         loop {
@@ -105,12 +111,12 @@ impl LoopCanonicalizer {
         func: &Function,
         loop_data: &crate::analysis::Loop,
     ) -> Vec<BlockId> {
-        let mut seen = FxHashSet::default();
+        let mut seen = DenseBitSet::new_empty(func.blocks.len());
         func.blocks[loop_data.header]
             .predecessors
             .iter()
             .copied()
-            .filter(|pred| !loop_data.blocks.contains(pred))
+            .filter(|&pred| !loop_data.blocks.contains(pred))
             .filter(|pred| seen.insert(*pred))
             .collect()
     }
@@ -128,7 +134,7 @@ impl LoopCanonicalizer {
         }
 
         for &inst_id in &func.blocks[header].instructions {
-            let InstKind::Phi(incoming) = &func.instructions[inst_id].kind else {
+            let InstKind::Phi(incoming) = &func.inst(inst_id).kind else {
                 continue;
             };
             if outside_preds
@@ -163,7 +169,7 @@ impl LoopCanonicalizer {
         }
 
         self.rewrite_header_phis(func, header, preheader, outside_preds);
-        repair_reachability_phis(func);
+        self.stats.reachability_repaired |= repair_reachability_phis(func);
         self.stats.preheaders_inserted += 1;
     }
 
@@ -178,7 +184,7 @@ impl LoopCanonicalizer {
             .instructions
             .iter()
             .copied()
-            .take_while(|&inst_id| matches!(func.instructions[inst_id].kind, InstKind::Phi(_)))
+            .take_while(|&inst_id| matches!(func.inst(inst_id).kind, InstKind::Phi(_)))
             .collect();
 
         let mut preheader_insert_pos = 0;
@@ -187,19 +193,19 @@ impl LoopCanonicalizer {
             let preheader_value =
                 self.canonical_preheader_value(func, inst_id, external_incoming, preheader);
 
-            let InstKind::Phi(incoming) = &mut func.instructions[inst_id].kind else {
+            let InstKind::Phi(incoming) = &mut func.inst_mut(inst_id).kind else {
                 continue;
             };
             incoming.retain(|(pred, _)| !outside_preds.contains(pred));
             incoming.push((preheader, preheader_value));
             self.stats.header_phis_rewritten += 1;
 
-            if let Value::Inst(phi_inst) = func.values[preheader_value]
-                && func.blocks[preheader].instructions.contains(&phi_inst)
+            if let Value::Inst(phi_inst) = func.value(preheader_value)
+                && func.blocks[preheader].instructions.contains(phi_inst)
                 && let Some(pos) = func.blocks[preheader]
                     .instructions
                     .iter()
-                    .position(|&existing| existing == phi_inst)
+                    .position(|&existing| existing == *phi_inst)
             {
                 let phi_inst = func.blocks[preheader].instructions.remove(pos);
                 func.blocks[preheader].instructions.insert(preheader_insert_pos, phi_inst);
@@ -214,7 +220,7 @@ impl LoopCanonicalizer {
         inst_id: InstId,
         outside_preds: &[BlockId],
     ) -> Vec<(BlockId, ValueId)> {
-        let InstKind::Phi(incoming) = &func.instructions[inst_id].kind else {
+        let InstKind::Phi(incoming) = &func.inst(inst_id).kind else {
             return Vec::new();
         };
         outside_preds
@@ -242,12 +248,12 @@ impl LoopCanonicalizer {
         }
 
         let result_ty =
-            func.instructions[header_phi].result_ty.expect("header phi should have result type");
-        let preheader_phi =
-            func.alloc_inst(Instruction::new(InstKind::Phi(incoming), Some(result_ty)));
+            func.inst(header_phi).result_ty.expect("header phi should have result type");
+        let (preheader_phi, result) =
+            func.alloc_value_inst(Instruction::new(InstKind::Phi(incoming), Some(result_ty)));
         func.blocks[preheader].instructions.push(preheader_phi);
         self.stats.preheader_phis_inserted += 1;
-        func.alloc_value(Value::Inst(preheader_phi))
+        result
     }
 
     fn redirect_terminator(
@@ -284,7 +290,8 @@ impl LoopCanonicalizer {
                     }
                 }
             }
-            Terminator::Return { .. }
+            Terminator::TailCall { .. }
+            | Terminator::Return { .. }
             | Terminator::Revert { .. }
             | Terminator::ReturnData { .. }
             | Terminator::Stop

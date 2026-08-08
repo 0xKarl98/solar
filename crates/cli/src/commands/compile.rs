@@ -1,4 +1,5 @@
-use solar_config::{CompileOpts, CompilerOutput};
+use solar_codegen::ContractSelection;
+use solar_config::CompileOpts;
 use solar_interface::{Result, Session};
 use solar_sema::{CompilerRef, ParsingContext};
 use std::{ops::ControlFlow, process::ExitCode};
@@ -21,7 +22,7 @@ pub fn run_compiler_args(opts: CompileOpts) -> Result {
 }
 
 fn run_default(compiler: &mut CompilerRef<'_>) -> Result {
-    run_pipeline(
+    let control_flow = run_pipeline(
         compiler,
         |pcx| {
             // Partition arguments into three categories:
@@ -49,8 +50,19 @@ fn run_default(compiler: &mut CompilerRef<'_>) -> Result {
             pcx.par_load_files(paths)
         },
         |_| {},
-    )
-    .map(|_| ())
+    )?;
+    if control_flow.is_break() {
+        return Ok(());
+    }
+
+    let bytecode_contracts =
+        if compiler.gcx().sess.opts.emit.iter().any(|output| output.is_codegen()) {
+            ContractSelection::All
+        } else {
+            ContractSelection::empty(compiler.gcx())
+        };
+    crate::emit::emit_requested(compiler, bytecode_contracts)?;
+    Ok(())
 }
 
 pub(crate) fn run_pipeline(
@@ -84,31 +96,26 @@ pub(crate) fn run_pipeline(
         return Ok(ControlFlow::Break(()));
     };
 
-    // Code generation (MIR and bytecode) is experimental and not part of the
+    // Code generation (MIR, EVM IR, and bytecode) is experimental and not part of the
     // stable, solc-compatible pipeline yet, so it is gated behind `-Zcodegen`.
-    let needs_codegen = sess.opts.emit.iter().any(|e| {
-        matches!(e, CompilerOutput::Mir | CompilerOutput::Bin | CompilerOutput::BinRuntime)
-    });
+    let needs_codegen = sess.opts.emit.iter().any(|e| e.is_codegen())
+        || sess.opts.unstable.dump.as_ref().is_some_and(|dump| dump.needs_codegen());
     if needs_codegen && !sess.opts.unstable.codegen {
         return Err(sess
             .dcx
             .err("code generation is experimental")
-            .help("pass `-Zcodegen` to emit MIR or bytecode")
+            .help("pass `-Zcodegen` to emit bytecode or dump MIR, EVM IR, or disassembly")
             .emit());
     }
-
-    crate::emit::emit_requested(compiler)?;
 
     Ok(ControlFlow::Continue(()))
 }
 
-fn run_compiler_with(
+pub(crate) fn run_compiler_with(
     opts: CompileOpts,
     f: impl FnOnce(&mut CompilerRef<'_>) -> Result + Send,
 ) -> Result {
-    let mut sess = Session::new(opts);
-    sess.infer_language();
-    run_compiler_session_with(sess, f, true)
+    run_compiler_session_with(Session::new(opts), f, true)
 }
 
 pub(crate) fn run_compiler_session_with(
@@ -119,14 +126,16 @@ pub(crate) fn run_compiler_session_with(
     sess.validate()?;
     let mut compiler = solar_sema::Compiler::new(sess);
     compiler.enter_mut(|compiler| {
-        let mut r = f(compiler);
-        if finish {
-            r = r.and(finish_diagnostics(compiler.gcx().sess));
+        let result = f(compiler);
+        if !finish {
+            return result;
         }
-        r
+        finish_session(compiler.gcx().sess, result)
     })
 }
 
-fn finish_diagnostics(sess: &Session) -> Result {
-    sess.dcx.print_error_count()
+fn finish_session(sess: &Session, result: Result) -> Result {
+    let diagnostics = sess.dcx.print_error_count();
+    result?;
+    diagnostics
 }

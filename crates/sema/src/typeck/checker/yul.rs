@@ -18,7 +18,7 @@ impl<'gcx> TypeChecker<'gcx> {
                     self.dcx().emit_err(lit.span, format!("string literal too long ({len} > 32)")),
                 );
             }
-            LitKind::Address(_) => return self.gcx.types.uint(256),
+            LitKind::Address(_) | LitKind::Bool(_) => return self.gcx.types.uint(256),
             _ => {}
         }
 
@@ -186,8 +186,8 @@ impl<'gcx> TypeChecker<'gcx> {
         &mut self,
         expr: &'gcx hir::Expr<'gcx>,
     ) -> (Ty<'gcx>, Option<hir::Res>) {
-        if let hir::ExprKind::Ident(res) = expr.kind {
-            let res = self.resolve_overloads(res, expr.span);
+        if let hir::ExprKind::Ident(resolutions) = expr.kind {
+            let res = self.resolve_value(expr, resolutions);
             if let Some(reason) = self.res_not_lvalue_reason(res) {
                 self.try_set_not_lvalue(reason);
             }

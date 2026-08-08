@@ -1,15 +1,18 @@
 //! MIR instructions.
 
-use super::{BlockId, Function, FunctionId, MirType, Value, ValueId};
+use super::{
+    AbiLayoutRef, BlockId, Function, FunctionId, ImmutableId, MemoryObjectKind, MemoryObjectLayout,
+    MirType, SliceLocation, StorageLayoutRef, Value, ValueId,
+};
 use alloy_primitives::U256;
-use smallvec::SmallVec;
+use smallvec::{Array, SmallVec};
 use solar_interface::Span;
 use solar_sema::hir;
 use std::fmt;
 
 /// Extra information attached to a MIR instruction by lowering or analysis passes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InstructionMetadata {
+pub(crate) struct InstructionMetadata {
     /// Proven storage alias key for `sload`/`sstore` instructions.
     storage_alias: Option<Box<StorageAlias>>,
     /// Source span that produced this instruction, when the lowerer can preserve it.
@@ -17,14 +20,14 @@ pub struct InstructionMetadata {
     /// HIR expression that produced this instruction, when the lowerer can preserve it.
     hir_expr: Option<hir::ExprId>,
     /// Loop nesting depth attached by loop-aware analyses.
-    pub loop_depth: u16,
-    /// Packed optional memory region, effect kind, and unchecked flag.
+    pub(crate) loop_depth: u16,
+    /// Packed optional memory region, effect kind, and boolean flags.
     flags: MetadataFlags,
 }
 
 impl InstructionMetadata {
     /// Empty instruction metadata.
-    pub const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         storage_alias: None,
         hir_expr: None,
         source_span: Span::DUMMY,
@@ -34,80 +37,92 @@ impl InstructionMetadata {
 
     /// Returns the proven storage alias key.
     #[must_use]
-    pub fn storage_alias(&self) -> Option<StorageAlias> {
+    pub(crate) fn storage_alias(&self) -> Option<StorageAlias> {
         self.storage_alias.as_deref().copied()
     }
 
     /// Sets the proven storage alias key.
-    pub fn set_storage_alias(&mut self, alias: Option<StorageAlias>) {
+    pub(crate) fn set_storage_alias(&mut self, alias: Option<StorageAlias>) {
         self.storage_alias = alias.map(Box::new);
     }
 
     /// Returns the HIR expression that produced this instruction.
     #[must_use]
-    pub fn hir_expr(&self) -> Option<hir::ExprId> {
+    pub(crate) fn hir_expr(&self) -> Option<hir::ExprId> {
         self.hir_expr
     }
 
     /// Sets the HIR expression that produced this instruction.
-    pub fn set_hir_expr(&mut self, expr: Option<hir::ExprId>) {
+    pub(crate) fn set_hir_expr(&mut self, expr: Option<hir::ExprId>) {
         self.hir_expr = expr;
     }
 
     /// Returns the source span that produced this instruction.
     #[must_use]
-    pub fn source_span(&self) -> Option<Span> {
+    pub(crate) fn source_span(&self) -> Option<Span> {
         (!self.source_span.is_dummy()).then_some(self.source_span)
     }
 
     /// Sets the source span that produced this instruction.
-    pub fn set_source_span(&mut self, span: Option<Span>) {
+    pub(crate) fn set_source_span(&mut self, span: Option<Span>) {
         self.source_span = span.unwrap_or(Span::DUMMY);
     }
 
     /// Returns the proven memory region.
     #[must_use]
-    pub fn memory_region(&self) -> Option<MemoryRegion> {
+    pub(crate) fn memory_region(&self) -> Option<MemoryRegion> {
         self.flags.memory_region()
     }
 
     /// Sets the proven memory region.
-    pub fn set_memory_region(&mut self, region: Option<MemoryRegion>) {
+    pub(crate) fn set_memory_region(&mut self, region: Option<MemoryRegion>) {
         self.flags.set_memory_region(region);
     }
 
     /// Returns whether this instruction was lowered from an unchecked arithmetic context.
     #[must_use]
-    pub fn unchecked(&self) -> bool {
+    pub(crate) fn unchecked(&self) -> bool {
         self.flags.unchecked()
     }
 
     /// Sets whether this instruction was lowered from an unchecked arithmetic context.
-    pub fn set_unchecked(&mut self, unchecked: bool) {
+    pub(crate) fn set_unchecked(&mut self, unchecked: bool) {
         self.flags.set_unchecked(unchecked);
     }
 
     /// Returns the conservative effect classification attached by lowering or analysis.
     #[must_use]
-    pub fn effect(&self) -> Option<EffectKind> {
+    pub(crate) fn effect(&self) -> Option<EffectKind> {
         self.flags.effect()
     }
 
     /// Sets the conservative effect classification attached by lowering or analysis.
-    pub fn set_effect(&mut self, effect: Option<EffectKind>) {
+    pub(crate) fn set_effect(&mut self, effect: Option<EffectKind>) {
         self.flags.set_effect(effect);
+    }
+
+    /// Returns whether final placement of this allocation is deferred to the backend.
+    #[must_use]
+    pub(crate) fn deferred_alloc(&self) -> bool {
+        self.flags.deferred_alloc()
+    }
+
+    /// Defers final placement of this allocation to the backend.
+    pub(crate) fn set_deferred_alloc(&mut self) {
+        self.flags.set_deferred_alloc();
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct MetadataFlags(u8);
+struct MetadataFlags(u16);
 
 impl MetadataFlags {
     const EMPTY: Self = Self(0);
-    const MEMORY_MASK: u8 = 0b0000_0111;
-    const EFFECT_MASK: u8 = 0b0111_1000;
-    const EFFECT_SHIFT: u8 = 3;
-    const UNCHECKED: u8 = 0b1000_0000;
+    const MEMORY_MASK: u16 = 0b0000_0111;
+    const EFFECT_MASK: u16 = 0b0111_1000;
+    const EFFECT_SHIFT: u16 = 3;
+    const UNCHECKED: u16 = 0b1000_0000;
+    const DEFERRED_ALLOC: u16 = 0b1_0000_0000;
 
     fn memory_region(self) -> Option<MemoryRegion> {
         match self.0 & Self::MEMORY_MASK {
@@ -145,6 +160,14 @@ impl MetadataFlags {
         }
     }
 
+    fn deferred_alloc(self) -> bool {
+        self.0 & Self::DEFERRED_ALLOC != 0
+    }
+
+    fn set_deferred_alloc(&mut self) {
+        self.0 |= Self::DEFERRED_ALLOC;
+    }
+
     fn effect(self) -> Option<EffectKind> {
         match (self.0 & Self::EFFECT_MASK) >> Self::EFFECT_SHIFT {
             0 => None,
@@ -160,6 +183,8 @@ impl MetadataFlags {
             10 => Some(EffectKind::InternalCall),
             11 => Some(EffectKind::Create),
             12 => Some(EffectKind::Log),
+            13 => Some(EffectKind::ImmutableRead),
+            14 => Some(EffectKind::ImmutableWrite),
             _ => unreachable!("invalid packed effect kind"),
         }
     }
@@ -179,6 +204,8 @@ impl MetadataFlags {
             Some(EffectKind::InternalCall) => 10,
             Some(EffectKind::Create) => 11,
             Some(EffectKind::Log) => 12,
+            Some(EffectKind::ImmutableRead) => 13,
+            Some(EffectKind::ImmutableWrite) => 14,
         } << Self::EFFECT_SHIFT;
         self.0 = (self.0 & !Self::EFFECT_MASK) | bits;
     }
@@ -186,7 +213,7 @@ impl MetadataFlags {
 
 /// A conservative storage alias key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum StorageAlias {
+pub(crate) enum StorageAlias {
     /// A known absolute storage slot.
     Slot(U256),
     /// A loop-invariant symbolic slot value.
@@ -203,10 +230,10 @@ pub enum StorageAlias {
 impl StorageAlias {
     /// Computes a conservative exact storage alias key for `value`.
     #[must_use]
-    pub fn for_value(func: &Function, value: ValueId) -> Self {
+    pub(crate) fn for_value(func: &Function, value: ValueId) -> Self {
         match func.value(value) {
             Value::Immediate(imm) => imm.as_u256().map_or(Self::Symbolic(value), Self::Slot),
-            Value::Inst(inst_id) => match func.instructions[*inst_id].kind {
+            Value::Inst(inst_id) => match func.inst(*inst_id).kind {
                 InstKind::Add(lhs, rhs) => {
                     if let Some(offset) = Self::immediate_u256(func, rhs) {
                         Self::add_offset(func, lhs, offset)
@@ -225,13 +252,13 @@ impl StorageAlias {
                 }
                 _ => Self::Symbolic(value),
             },
-            Value::Arg { .. } | Value::Undef(_) | Value::Error(_) => Self::Symbolic(value),
+            Value::Arg(_) | Value::Undef(_) | Value::Error(_) => Self::Symbolic(value),
         }
     }
 
     /// Returns true if two alias keys may refer to the same storage slot.
     #[must_use]
-    pub fn may_alias(self, other: Self) -> bool {
+    pub(crate) fn may_alias(self, other: Self) -> bool {
         match (self, other) {
             (Self::Slot(a), Self::Slot(b)) => a == b,
             (
@@ -251,15 +278,17 @@ impl StorageAlias {
 
     /// Returns the symbolic base value, if this alias has one.
     #[must_use]
-    pub const fn symbolic_base(self) -> Option<ValueId> {
+    pub(crate) const fn symbolic_base(self) -> Option<ValueId> {
         match self {
             Self::Symbolic(value) | Self::Offset { base: value, .. } => Some(value),
             Self::Slot(_) => None,
         }
     }
 
-    fn add_offset(func: &Function, value: ValueId, offset: U256) -> Self {
-        match Self::for_value(func, value) {
+    /// Returns this alias advanced by a constant slot offset.
+    #[must_use]
+    pub(crate) fn offset_by(self, offset: U256) -> Self {
+        match self {
             Self::Slot(slot) => Self::Slot(slot.wrapping_add(offset)),
             Self::Symbolic(base) if offset.is_zero() => Self::Symbolic(base),
             Self::Symbolic(base) => Self::Offset { base, offset },
@@ -268,6 +297,10 @@ impl StorageAlias {
                 if offset.is_zero() { Self::Symbolic(base) } else { Self::Offset { base, offset } }
             }
         }
+    }
+
+    fn add_offset(func: &Function, value: ValueId, offset: U256) -> Self {
+        Self::for_value(func, value).offset_by(offset)
     }
 
     fn immediate_u256(func: &Function, value: ValueId) -> Option<U256> {
@@ -280,7 +313,7 @@ impl StorageAlias {
 
 /// A coarse memory region understood by MIR analyses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MemoryRegion {
+pub(crate) enum MemoryRegion {
     /// Compiler-owned low-memory scratch space.
     Scratch,
     /// External ABI return buffer.
@@ -296,7 +329,7 @@ pub enum MemoryRegion {
 impl MemoryRegion {
     /// Returns the stable textual name used in MIR metadata.
     #[must_use]
-    pub const fn name(&self) -> &'static str {
+    pub(crate) const fn name(&self) -> &'static str {
         match self {
             Self::Scratch => "scratch",
             Self::AbiReturn => "abi_return",
@@ -309,7 +342,7 @@ impl MemoryRegion {
 
 /// Conservative side-effect class for an instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum EffectKind {
+pub(crate) enum EffectKind {
     /// Pure computation.
     Pure,
     /// Memory read.
@@ -334,12 +367,16 @@ pub enum EffectKind {
     Create,
     /// Event emission.
     Log,
+    /// Read from an immutable.
+    ImmutableRead,
+    /// Constructor assignment to an immutable.
+    ImmutableWrite,
 }
 
 impl EffectKind {
     /// Returns the stable textual name used in MIR metadata.
     #[must_use]
-    pub const fn name(&self) -> &'static str {
+    pub(crate) const fn name(&self) -> &'static str {
         match self {
             Self::Pure => "pure",
             Self::MemoryRead => "memory_read",
@@ -353,38 +390,124 @@ impl EffectKind {
             Self::InternalCall => "internal_call",
             Self::Create => "create",
             Self::Log => "log",
+            Self::ImmutableRead => "immutable_read",
+            Self::ImmutableWrite => "immutable_write",
         }
     }
 }
 
+/// Alignment applied to an abstract heap allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AllocationAlignment {
+    /// Reserve exactly the requested byte count.
+    Exact,
+    /// Round the reservation up to an EVM word.
+    Word,
+}
+
+/// Initialization performed for a newly reserved range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AllocationInitialization {
+    /// Preserve the range's existing bytes until explicitly overwritten.
+    Uninitialized,
+    /// Initialize every reserved byte to zero.
+    Zeroed,
+}
+
+/// Failure behavior attached to an allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AllocationFailure {
+    /// The producer has already proved the bump valid.
+    Infallible,
+    /// Revert with the memory-allocation panic when the bump overflows.
+    Panic,
+}
+
+/// Semantic shape produced by an allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AllocationKind {
+    /// Untyped compiler scratch or ABI staging memory.
+    Raw,
+    /// A Solidity memory object whose layout is owned by the memory model.
+    Object(MemoryObjectLayout),
+}
+
+impl AllocationKind {
+    /// Returns the MIR result type of this allocation.
+    #[must_use]
+    pub(crate) const fn result_type(self) -> MirType {
+        match self {
+            Self::Raw => MirType::MemPtr,
+            Self::Object(layout) => MirType::MemoryObject(layout.kind()),
+        }
+    }
+}
+
+/// Semantic allocation policy carried by [`InstKind::Alloc`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AllocationSemantics {
+    /// Requested alignment.
+    pub alignment: AllocationAlignment,
+    /// Requested initialization.
+    pub initialization: AllocationInitialization,
+    /// Requested failure behavior.
+    pub failure: AllocationFailure,
+}
+
+impl AllocationSemantics {
+    /// Exact-size, uninitialized allocation whose validity is already proven.
+    pub(crate) const INTERNAL: Self = Self {
+        alignment: AllocationAlignment::Exact,
+        initialization: AllocationInitialization::Uninitialized,
+        failure: AllocationFailure::Infallible,
+    };
+
+    /// Checked and zero-initialized Solidity object allocation.
+    ///
+    /// Object lowering includes the header and padding in `size`, so the
+    /// allocation must preserve that already-aligned extent exactly.
+    pub(crate) const SOLIDITY_ZEROED: Self = Self {
+        alignment: AllocationAlignment::Exact,
+        initialization: AllocationInitialization::Zeroed,
+        failure: AllocationFailure::Panic,
+    };
+}
+
 /// An instruction in the MIR.
 #[derive(Clone, Debug)]
-pub struct Instruction {
+pub(crate) struct Instruction {
     /// The kind of instruction.
-    pub kind: InstKind,
+    pub(crate) kind: InstKind,
     /// The result type (if any).
-    pub result_ty: Option<MirType>,
+    pub(crate) result_ty: Option<MirType>,
+    /// The value allocated for this instruction's result.
+    result: Option<ValueId>,
     /// Metadata produced by lowering or analysis.
-    pub metadata: InstructionMetadata,
+    pub(crate) metadata: InstructionMetadata,
 }
 
 impl Instruction {
     /// Creates a new instruction.
     #[must_use]
-    pub const fn new(kind: InstKind, result_ty: Option<MirType>) -> Self {
-        Self { kind, result_ty, metadata: InstructionMetadata::EMPTY }
+    pub(crate) const fn new(kind: InstKind, result_ty: Option<MirType>) -> Self {
+        Self { kind, result_ty, result: None, metadata: InstructionMetadata::EMPTY }
+    }
+
+    /// Returns the value allocated for this instruction's result.
+    #[must_use]
+    pub(super) const fn result(&self) -> Option<ValueId> {
+        self.result
+    }
+
+    /// Replaces the value allocated for this instruction's result.
+    pub(super) fn set_result(&mut self, result: Option<ValueId>) -> Option<ValueId> {
+        std::mem::replace(&mut self.result, result)
     }
 
     /// Returns the operands of this instruction.
     #[must_use]
-    pub fn operands(&self) -> SmallVec<[ValueId; 8]> {
+    pub(crate) fn operands(&self) -> SmallVec<[ValueId; 8]> {
         self.kind.operands()
-    }
-
-    /// Returns the metadata effect, or derives a conservative one from the instruction kind.
-    #[must_use]
-    pub fn effect_kind(&self) -> EffectKind {
-        self.metadata.effect().unwrap_or_else(|| self.kind.effect_kind())
     }
 }
 
@@ -394,7 +517,7 @@ impl Instruction {
 /// `Instruction { opcode: Opcode, operands: SmallVec<[ValueId; 4]>, ... }`. That would make generic
 /// operand visitors and rewrites less variant-heavy.
 #[derive(Clone, Debug)]
-pub enum InstKind {
+pub(crate) enum InstKind {
     // Arithmetic operations
     /// Addition: `a + b`
     Add(ValueId, ValueId),
@@ -426,6 +549,8 @@ pub enum InstKind {
     Xor(ValueId, ValueId),
     /// Bitwise NOT: `~a`
     Not(ValueId),
+    /// Count leading zero bits.
+    Clz(ValueId),
     /// Left shift: `a << b`
     Shl(ValueId, ValueId),
     /// Logical right shift: `a >> b`
@@ -456,8 +581,81 @@ pub enum InstKind {
     MStore(ValueId, ValueId),
     /// Store a single byte: `mstore8(offset, value)`
     MStore8(ValueId, ValueId),
+    /// Set a contiguous memory range to zero: `memory_zero(offset, size)`
+    MemoryZero(ValueId, ValueId),
     /// Get memory size: `msize()`
     MSize,
+    /// Read the free-memory pointer.
+    Fmp,
+    /// Set the free-memory pointer.
+    SetFmp(ValueId),
+    /// Reserve memory and return the previous free-memory pointer.
+    Alloc {
+        /// Requested byte count.
+        size: ValueId,
+        /// Semantic shape of the returned reference.
+        kind: AllocationKind,
+        /// Alignment, initialization, and failure behavior.
+        semantics: AllocationSemantics,
+    },
+    /// Read the logical length of a dynamic memory object.
+    MemoryObjectLen(ValueId, MemoryObjectKind),
+    /// Set the logical length of a dynamic memory object.
+    SetMemoryObjectLen(ValueId, ValueId, MemoryObjectKind),
+    /// Project the address of the first payload byte from an object.
+    MemoryObjectData(ValueId, MemoryObjectKind),
+    /// Address a direct field of a struct object.
+    MemoryObjectFieldAddr {
+        /// Struct object reference.
+        object: ValueId,
+        /// Complete direct-object layout.
+        layout: MemoryObjectLayout,
+        /// Zero-based direct field index.
+        field: u64,
+    },
+    /// Address an array element under the semantic object layout.
+    MemoryObjectElementAddr {
+        /// Array object reference.
+        object: ValueId,
+        /// Complete direct-object layout.
+        layout: MemoryObjectLayout,
+        /// Runtime element index.
+        index: ValueId,
+    },
+    /// ABI-encode values into a freshly allocated memory slice.
+    AbiEncode {
+        /// Optional left-aligned four-byte selector prefix.
+        selector: Option<ValueId>,
+        /// Values corresponding to the tuple layout.
+        args: Box<[ValueId]>,
+        /// Interned semantic ABI layout.
+        layout: AbiLayoutRef,
+    },
+    /// Copy a statically shaped aggregate from storage into an existing memory allocation.
+    StorageToMemory {
+        /// Base storage slot.
+        storage: ValueId,
+        /// Destination memory pointer.
+        memory: ValueId,
+        /// Interned aggregate layout.
+        layout: StorageLayoutRef,
+    },
+    /// Copy a statically shaped aggregate from memory into storage.
+    MemoryToStorage {
+        /// Source memory pointer.
+        memory: ValueId,
+        /// Base storage slot.
+        storage: ValueId,
+        /// Interned aggregate layout.
+        layout: StorageLayoutRef,
+    },
+    /// Clear every storage slot occupied by a statically shaped aggregate.
+    ClearStorage {
+        /// Base storage slot.
+        storage: ValueId,
+        /// Interned aggregate layout.
+        layout: StorageLayoutRef,
+    },
     /// Copy memory: `mcopy(dest, src, len)`
     MCopy(ValueId, ValueId, ValueId),
 
@@ -478,8 +676,23 @@ pub enum InstKind {
     CalldataCopy(ValueId, ValueId, ValueId),
     /// Get calldata size: `calldatasize()`
     CalldataSize,
+    /// Construct a logical `(pointer, length, location)` slice.
+    MakeSlice {
+        /// Address of the first element or byte.
+        ptr: ValueId,
+        /// Logical element or byte length.
+        len: ValueId,
+        /// Address space containing the slice data.
+        location: SliceLocation,
+    },
+    /// Project the data pointer from a slice.
+    SlicePtr(ValueId),
+    /// Project the logical length from a slice.
+    SliceLen(ValueId),
     /// Address inside the current internal-call frame.
     InternalFrameAddr(u64),
+    /// Base address of the constructor's copied ABI argument blob.
+    ConstructorArgsBase,
 
     // Code operations
     /// Get code size: `codesize()`
@@ -492,12 +705,15 @@ pub enum InstKind {
     ExtCodeCopy(ValueId, ValueId, ValueId, ValueId),
     /// Get external code hash: `extcodehash(addr)`
     ExtCodeHash(ValueId),
-    /// Read an immutable word identified by its byte offset: `loadimmutable <offset>`
+    /// Assign an immutable during construction: `storeimmutable <name>, value`.
+    /// Lowered to constructor staging memory after MIR optimization.
+    StoreImmutable(ImmutableId, ValueId),
+    /// Read an immutable declared by the module: `loadimmutable <name>`.
     ///
-    /// In runtime code this assembles to a `PUSH32` placeholder that the
+    /// In runtime code this assembles to a typed `PUSH<N>` placeholder that the
     /// constructor patches with the staged value before returning the runtime
-    /// code. In constructor code it reads the staged scratch word instead.
-    LoadImmutable(u32),
+    /// code. In constructor code it reads the staging word instead.
+    LoadImmutable(ImmutableId),
 
     // Return data operations
     /// Get return data size: `returndatasize()`
@@ -546,12 +762,42 @@ pub enum InstKind {
     // Hashing
     /// Keccak256 hash: `keccak256(offset, size)`
     Keccak256(ValueId, ValueId),
+    /// Keccak256 hash of a `memorybytes` object's contents:
+    /// `keccak256_bytes(object)`.
+    ///
+    /// Consumes the object reference directly, so the optimizer sees one
+    /// whole-object read instead of separate length and data-pointer
+    /// projections. `lower-memory-objects` expands it into those projections
+    /// and a physical `keccak256`.
+    Keccak256Bytes(ValueId),
+    /// Hash a fixed-width mapping key and its parent slot.
+    ///
+    /// The temporary scratch memory used by its late lowering is not an
+    /// observable part of this instruction's MIR semantics.
+    MappingSlot(ValueId, ValueId),
+    /// Hash a `[length][data...]` memory value and its parent mapping slot.
+    MappingSlotMemory(ValueId, ValueId),
+    /// Hash a dynamically-sized calldata value and its parent mapping slot.
+    ///
+    /// The temporary scratch memory used by its late lowering is not an
+    /// observable part of this instruction's MIR semantics.
+    MappingSlotCalldata(ValueId, ValueId),
 
     // Call operations
     // TODO(codegen): Consider unifying external calls as one instruction with a call-kind enum
     // and shared operands once the MIR shape stabilizes.
     /// External call: `call(gas, addr, value, argsOffset, argsSize, retOffset, retSize)`
     Call {
+        gas: ValueId,
+        addr: ValueId,
+        value: ValueId,
+        args_offset: ValueId,
+        args_size: ValueId,
+        ret_offset: ValueId,
+        ret_size: ValueId,
+    },
+    /// Call code: `callcode(gas, addr, value, argsOffset, argsSize, retOffset, retSize)`
+    CallCode {
         gas: ValueId,
         addr: ValueId,
         value: ValueId,
@@ -612,9 +858,29 @@ pub enum InstKind {
 }
 
 impl InstKind {
+    /// Returns binary operands whose evaluation order may be exchanged during EVM lowering.
+    ///
+    /// This includes commutative instructions and comparisons whose opcode can be reversed with
+    /// their operands.
+    pub(crate) const fn reorderable_binary_operands(&self) -> Option<(ValueId, ValueId)> {
+        match self {
+            Self::Add(a, b)
+            | Self::Mul(a, b)
+            | Self::And(a, b)
+            | Self::Or(a, b)
+            | Self::Xor(a, b)
+            | Self::Eq(a, b)
+            | Self::Lt(a, b)
+            | Self::Gt(a, b)
+            | Self::SLt(a, b)
+            | Self::SGt(a, b) => Some((*a, *b)),
+            _ => None,
+        }
+    }
+
     /// Collects all operands of this instruction into the provided vector.
     /// This is the canonical way to get all operands for liveness analysis.
-    pub fn collect_operands(&self, out: &mut SmallVec<[ValueId; 8]>) {
+    pub(crate) fn collect_operands<A: Array<Item = ValueId>>(&self, out: &mut SmallVec<A>) {
         match self {
             // Binary operations
             Self::Add(a, b)
@@ -639,19 +905,46 @@ impl InstKind {
             | Self::Eq(a, b)
             | Self::MStore(a, b)
             | Self::MStore8(a, b)
+            | Self::MemoryZero(a, b)
             | Self::SStore(a, b)
             | Self::TStore(a, b)
             | Self::Keccak256(a, b)
+            | Self::MappingSlot(a, b)
+            | Self::MappingSlotMemory(a, b)
+            | Self::MappingSlotCalldata(a, b)
             | Self::Log0(a, b)
             | Self::SignExtend(a, b) => {
                 out.push(*a);
                 out.push(*b);
             }
 
+            Self::MakeSlice { ptr, len, .. } => {
+                out.push(*ptr);
+                out.push(*len);
+            }
+
+            Self::SetMemoryObjectLen(object, len, _)
+            | Self::MemoryObjectElementAddr { object, index: len, .. } => {
+                out.push(*object);
+                out.push(*len);
+            }
+
+            Self::StorageToMemory { storage, memory, .. }
+            | Self::MemoryToStorage { memory, storage, .. } => {
+                out.push(*storage);
+                out.push(*memory);
+            }
+
+            Self::AbiEncode { selector, args, .. } => {
+                out.extend(selector.iter().chain(args).copied());
+            }
+
             // Unary operations
             Self::Not(a)
+            | Self::Clz(a)
             | Self::IsZero(a)
             | Self::MLoad(a)
+            | Self::SetFmp(a)
             | Self::SLoad(a)
             | Self::TLoad(a)
             | Self::CalldataLoad(a)
@@ -659,9 +952,20 @@ impl InstKind {
             | Self::ExtCodeHash(a)
             | Self::Balance(a)
             | Self::BlockHash(a)
-            | Self::BlobHash(a) => {
+            | Self::BlobHash(a)
+            | Self::StoreImmutable(_, a)
+            | Self::Keccak256Bytes(a)
+            | Self::MemoryObjectLen(a, _)
+            | Self::MemoryObjectData(a, _)
+            | Self::MemoryObjectFieldAddr { object: a, .. } => {
                 out.push(*a);
             }
+
+            Self::Alloc { size, .. } => out.push(*size),
+
+            Self::ClearStorage { storage, .. } => out.push(*storage),
+
+            Self::SlicePtr(slice) | Self::SliceLen(slice) => out.push(*slice),
 
             // Ternary operations
             Self::MCopy(a, b, c)
@@ -706,7 +1010,8 @@ impl InstKind {
             }
 
             // Call operations
-            Self::Call { gas, addr, value, args_offset, args_size, ret_offset, ret_size } => {
+            Self::Call { gas, addr, value, args_offset, args_size, ret_offset, ret_size }
+            | Self::CallCode { gas, addr, value, args_offset, args_size, ret_offset, ret_size } => {
                 out.push(*gas);
                 out.push(*addr);
                 out.push(*value);
@@ -744,8 +1049,10 @@ impl InstKind {
 
             // Nullary operations - no operands
             Self::MSize
+            | Self::Fmp
             | Self::CalldataSize
             | Self::InternalFrameAddr(_)
+            | Self::ConstructorArgsBase
             | Self::CodeSize
             | Self::LoadImmutable(_)
             | Self::ReturnDataSize
@@ -769,14 +1076,14 @@ impl InstKind {
 
     /// Returns the operands of this instruction.
     #[must_use]
-    pub fn operands(&self) -> SmallVec<[ValueId; 8]> {
+    pub(crate) fn operands(&self) -> SmallVec<[ValueId; 8]> {
         let mut out = SmallVec::new();
         self.collect_operands(&mut out);
         out
     }
 
     /// Visits every operand mutably.
-    pub fn visit_operands_mut(&mut self, mut f: impl FnMut(&mut ValueId)) {
+    pub(crate) fn visit_operands_mut(&mut self, mut f: impl FnMut(&mut ValueId)) {
         match self {
             Self::Add(a, b)
             | Self::Sub(a, b)
@@ -800,18 +1107,50 @@ impl InstKind {
             | Self::Eq(a, b)
             | Self::MStore(a, b)
             | Self::MStore8(a, b)
+            | Self::MemoryZero(a, b)
             | Self::SStore(a, b)
             | Self::TStore(a, b)
             | Self::Keccak256(a, b)
+            | Self::MappingSlot(a, b)
+            | Self::MappingSlotMemory(a, b)
+            | Self::MappingSlotCalldata(a, b)
             | Self::Log0(a, b)
             | Self::SignExtend(a, b) => {
                 f(a);
                 f(b);
             }
 
+            Self::MakeSlice { ptr, len, .. } => {
+                f(ptr);
+                f(len);
+            }
+
+            Self::SetMemoryObjectLen(object, len, _)
+            | Self::MemoryObjectElementAddr { object, index: len, .. } => {
+                f(object);
+                f(len);
+            }
+
+            Self::StorageToMemory { storage, memory, .. }
+            | Self::MemoryToStorage { memory, storage, .. } => {
+                f(storage);
+                f(memory);
+            }
+
+            Self::AbiEncode { selector, args, .. } => {
+                if let Some(selector) = selector {
+                    f(selector);
+                }
+                for arg in args {
+                    f(arg);
+                }
+            }
+
             Self::Not(a)
+            | Self::Clz(a)
             | Self::IsZero(a)
             | Self::MLoad(a)
+            | Self::SetFmp(a)
             | Self::SLoad(a)
             | Self::TLoad(a)
             | Self::CalldataLoad(a)
@@ -819,7 +1158,18 @@ impl InstKind {
             | Self::ExtCodeHash(a)
             | Self::Balance(a)
             | Self::BlockHash(a)
-            | Self::BlobHash(a) => f(a),
+            | Self::BlobHash(a)
+            | Self::StoreImmutable(_, a)
+            | Self::SlicePtr(a)
+            | Self::Keccak256Bytes(a)
+            | Self::SliceLen(a)
+            | Self::MemoryObjectLen(a, _)
+            | Self::MemoryObjectData(a, _)
+            | Self::MemoryObjectFieldAddr { object: a, .. } => f(a),
+
+            Self::Alloc { size, .. } => f(size),
+
+            Self::ClearStorage { storage, .. } => f(storage),
 
             Self::MCopy(a, b, c)
             | Self::CalldataCopy(a, b, c)
@@ -859,7 +1209,8 @@ impl InstKind {
                 f(g);
             }
 
-            Self::Call { gas, addr, value, args_offset, args_size, ret_offset, ret_size } => {
+            Self::Call { gas, addr, value, args_offset, args_size, ret_offset, ret_size }
+            | Self::CallCode { gas, addr, value, args_offset, args_size, ret_offset, ret_size } => {
                 f(gas);
                 f(addr);
                 f(value);
@@ -890,8 +1241,10 @@ impl InstKind {
             }
 
             Self::MSize
+            | Self::Fmp
             | Self::CalldataSize
             | Self::InternalFrameAddr(_)
+            | Self::ConstructorArgsBase
             | Self::CodeSize
             | Self::LoadImmutable(_)
             | Self::ReturnDataSize
@@ -913,58 +1266,9 @@ impl InstKind {
         }
     }
 
-    /// Returns true if this instruction may mutate persistent storage.
-    #[must_use]
-    pub const fn may_mutate_storage(&self) -> bool {
-        matches!(
-            self,
-            Self::SStore(_, _)
-                | Self::Call { .. }
-                | Self::DelegateCall { .. }
-                | Self::InternalCall { .. }
-                | Self::Create(_, _, _)
-                | Self::Create2(_, _, _, _)
-        )
-    }
-
-    /// Returns true if this instruction may mutate transient storage.
-    #[must_use]
-    pub const fn may_mutate_transient_storage(&self) -> bool {
-        matches!(
-            self,
-            Self::TStore(_, _)
-                | Self::Call { .. }
-                | Self::DelegateCall { .. }
-                | Self::InternalCall { .. }
-                | Self::Create(_, _, _)
-                | Self::Create2(_, _, _, _)
-        )
-    }
-
-    /// Returns true if this instruction writes or may write memory.
-    #[must_use]
-    pub const fn may_mutate_memory(&self) -> bool {
-        matches!(
-            self,
-            Self::MStore(_, _)
-                | Self::MStore8(_, _)
-                | Self::MCopy(_, _, _)
-                | Self::CalldataCopy(_, _, _)
-                | Self::CodeCopy(_, _, _)
-                | Self::ReturnDataCopy(_, _, _)
-                | Self::ExtCodeCopy(_, _, _, _)
-                | Self::Call { .. }
-                | Self::StaticCall { .. }
-                | Self::DelegateCall { .. }
-                | Self::InternalCall { .. }
-                | Self::Create(_, _, _)
-                | Self::Create2(_, _, _, _)
-        )
-    }
-
     /// Returns the mnemonic for this instruction.
     #[must_use]
-    pub const fn mnemonic(&self) -> &'static str {
+    pub(crate) const fn mnemonic(&self) -> &'static str {
         match self {
             Self::Add(_, _) => "add",
             Self::Sub(_, _) => "sub",
@@ -980,6 +1284,7 @@ impl InstKind {
             Self::Or(_, _) => "or",
             Self::Xor(_, _) => "xor",
             Self::Not(_) => "not",
+            Self::Clz(_) => "clz",
             Self::Shl(_, _) => "shl",
             Self::Shr(_, _) => "shr",
             Self::Sar(_, _) => "sar",
@@ -993,7 +1298,20 @@ impl InstKind {
             Self::MLoad(_) => "mload",
             Self::MStore(_, _) => "mstore",
             Self::MStore8(_, _) => "mstore8",
+            Self::MemoryZero(_, _) => "memory_zero",
             Self::MSize => "msize",
+            Self::Fmp => "fmp",
+            Self::SetFmp(_) => "set_fmp",
+            Self::Alloc { .. } => "alloc",
+            Self::MemoryObjectLen(_, _) => "memory_object_len",
+            Self::SetMemoryObjectLen(_, _, _) => "set_memory_object_len",
+            Self::MemoryObjectData(_, _) => "memory_object_data",
+            Self::MemoryObjectFieldAddr { .. } => "memory_object_field_addr",
+            Self::MemoryObjectElementAddr { .. } => "memory_object_element_addr",
+            Self::AbiEncode { .. } => "abi_encode",
+            Self::StorageToMemory { .. } => "storage_to_memory",
+            Self::MemoryToStorage { .. } => "memory_to_storage",
+            Self::ClearStorage { .. } => "clear_storage",
             Self::MCopy(_, _, _) => "mcopy",
             Self::SLoad(_) => "sload",
             Self::SStore(_, _) => "sstore",
@@ -1002,8 +1320,15 @@ impl InstKind {
             Self::CalldataLoad(_) => "calldataload",
             Self::CalldataCopy(_, _, _) => "calldatacopy",
             Self::CalldataSize => "calldatasize",
+            Self::MakeSlice { location: SliceLocation::Memory, .. } => "make_memory_slice",
+            Self::MakeSlice { location: SliceLocation::Calldata, .. } => "make_calldata_slice",
+            Self::MakeSlice { location: SliceLocation::Returndata, .. } => "make_returndata_slice",
+            Self::SlicePtr(_) => "slice_ptr",
+            Self::SliceLen(_) => "slice_len",
+            Self::ConstructorArgsBase => "constructor_args_base",
             Self::CodeSize => "codesize",
             Self::CodeCopy(_, _, _) => "codecopy",
+            Self::StoreImmutable(..) => "storeimmutable",
             Self::LoadImmutable(_) => "loadimmutable",
             Self::ExtCodeSize(_) => "extcodesize",
             Self::ExtCodeCopy(_, _, _, _) => "extcodecopy",
@@ -1030,7 +1355,12 @@ impl InstKind {
             Self::BlobBaseFee => "blobbasefee",
             Self::BlobHash(_) => "blobhash",
             Self::Keccak256(_, _) => "keccak256",
+            Self::Keccak256Bytes(_) => "keccak256_bytes",
+            Self::MappingSlot(_, _) => "mapping_slot",
+            Self::MappingSlotMemory(_, _) => "mapping_slot_memory",
+            Self::MappingSlotCalldata(_, _) => "mapping_slot_calldata",
             Self::Call { .. } => "call",
+            Self::CallCode { .. } => "callcode",
             Self::StaticCall { .. } => "staticcall",
             Self::DelegateCall { .. } => "delegatecall",
             Self::InternalCall { .. } => "internal_call",
@@ -1050,18 +1380,27 @@ impl InstKind {
     /// Returns true if this instruction has side effects.
     /// Side-effect instructions must not be eliminated by DCE.
     #[must_use]
-    pub const fn has_side_effects(&self) -> bool {
+    pub(crate) const fn has_side_effects(&self) -> bool {
         matches!(
             self,
             // Storage writes
             Self::SStore(_, _)
+            | Self::MemoryToStorage { .. }
+            | Self::ClearStorage { .. }
             | Self::TStore(_, _)
             // Memory writes (may affect external calls)
             | Self::MStore(_, _)
             | Self::MStore8(_, _)
+            | Self::MemoryZero(_, _)
+            | Self::SetFmp(_)
+            | Self::Alloc { .. }
+            | Self::SetMemoryObjectLen(_, _, _)
+            | Self::AbiEncode { .. }
+            | Self::StorageToMemory { .. }
             | Self::MCopy(_, _, _)
             // External calls
             | Self::Call { .. }
+            | Self::CallCode { .. }
             | Self::StaticCall { .. }
             | Self::DelegateCall { .. }
             | Self::InternalCall { .. }
@@ -1079,28 +1418,46 @@ impl InstKind {
             | Self::CodeCopy(_, _, _)
             | Self::ExtCodeCopy(_, _, _, _)
             | Self::ReturnDataCopy(_, _, _)
+            // Immutable assignment.
+            | Self::StoreImmutable(..)
         )
     }
 
     /// Returns a conservative effect classification for this instruction.
     #[must_use]
-    pub const fn effect_kind(&self) -> EffectKind {
+    pub(crate) const fn effect_kind(&self) -> EffectKind {
         match self {
             Self::MStore(_, _)
             | Self::MStore8(_, _)
+            | Self::MemoryZero(_, _)
+            | Self::SetFmp(_)
+            | Self::Alloc { .. }
+            | Self::SetMemoryObjectLen(_, _, _)
+            | Self::AbiEncode { .. }
+            | Self::StorageToMemory { .. }
             | Self::MCopy(_, _, _)
             | Self::CalldataCopy(_, _, _)
             | Self::CodeCopy(_, _, _)
             | Self::ExtCodeCopy(_, _, _, _)
             | Self::ReturnDataCopy(_, _, _) => EffectKind::MemoryWrite,
-            Self::MLoad(_) | Self::MSize | Self::Keccak256(_, _) => EffectKind::MemoryRead,
+            Self::StoreImmutable(..) => EffectKind::ImmutableWrite,
+            Self::MLoad(_)
+            | Self::MemoryObjectLen(_, _)
+            | Self::Fmp
+            | Self::MSize
+            | Self::Keccak256(_, _)
+            | Self::Keccak256Bytes(_)
+            | Self::MappingSlotMemory(_, _) => EffectKind::MemoryRead,
             Self::SLoad(_) => EffectKind::StorageRead,
-            Self::SStore(_, _) => EffectKind::StorageWrite,
+            Self::SStore(_, _) | Self::MemoryToStorage { .. } | Self::ClearStorage { .. } => {
+                EffectKind::StorageWrite
+            }
             Self::TLoad(_) => EffectKind::TransientRead,
             Self::TStore(_, _) => EffectKind::TransientWrite,
-            Self::Call { .. } | Self::StaticCall { .. } | Self::DelegateCall { .. } => {
-                EffectKind::ExternalCall
-            }
+            Self::Call { .. }
+            | Self::CallCode { .. }
+            | Self::StaticCall { .. }
+            | Self::DelegateCall { .. } => EffectKind::ExternalCall,
             Self::InternalCall { .. } => EffectKind::InternalCall,
             Self::Create(_, _, _) | Self::Create2(_, _, _, _) => EffectKind::Create,
             Self::Log0(_, _)
@@ -1109,9 +1466,10 @@ impl InstKind {
             | Self::Log3(_, _, _, _, _)
             | Self::Log4(_, _, _, _, _, _) => EffectKind::Log,
             Self::CalldataLoad(_)
+            | Self::MappingSlotCalldata(_, _)
             | Self::CalldataSize
+            | Self::ConstructorArgsBase
             | Self::CodeSize
-            | Self::LoadImmutable(_)
             | Self::ExtCodeSize(_)
             | Self::ExtCodeHash(_)
             | Self::ReturnDataSize
@@ -1133,7 +1491,9 @@ impl InstKind {
             | Self::BaseFee
             | Self::BlobBaseFee
             | Self::BlobHash(_) => EffectKind::EnvironmentRead,
+            Self::LoadImmutable(_) => EffectKind::ImmutableRead,
             Self::Add(_, _)
+            | Self::MappingSlot(_, _)
             | Self::Sub(_, _)
             | Self::Mul(_, _)
             | Self::Div(_, _)
@@ -1147,6 +1507,7 @@ impl InstKind {
             | Self::Or(_, _)
             | Self::Xor(_, _)
             | Self::Not(_)
+            | Self::Clz(_)
             | Self::Shl(_, _)
             | Self::Shr(_, _)
             | Self::Sar(_, _)
@@ -1157,6 +1518,12 @@ impl InstKind {
             | Self::SGt(_, _)
             | Self::Eq(_, _)
             | Self::IsZero(_)
+            | Self::MakeSlice { .. }
+            | Self::SlicePtr(_)
+            | Self::SliceLen(_)
+            | Self::MemoryObjectData(_, _)
+            | Self::MemoryObjectFieldAddr { .. }
+            | Self::MemoryObjectElementAddr { .. }
             | Self::InternalFrameAddr(_)
             | Self::Phi(_)
             | Self::Select(_, _, _)
@@ -1181,7 +1548,7 @@ mod tests {
     #[test]
     fn phi_operands_include_incoming_values() {
         let mut func = Function::new(Ident::DUMMY);
-        let pred_a = func.entry_block;
+        let pred_a = BlockId::ENTRY;
         let pred_b = func.alloc_block();
         let a = func.alloc_value(Value::Immediate(Immediate::uint256(U256::from(1))));
         let b = func.alloc_value(Value::Immediate(Immediate::uint256(U256::from(2))));

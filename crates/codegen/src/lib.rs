@@ -10,42 +10,27 @@
 extern crate derive_more as _;
 extern crate tracing as _;
 
-pub use solar_data_structures::map::FxHashMap;
-pub use solar_sema as sema;
-
-/// Constructor scratch memory used to stage immutable words before appending
-/// them to runtime bytecode.
-pub const IMMUTABLE_SCRATCH_BASE: u64 = 0x2000;
-
 pub mod mir;
-pub use mir::{
-    BasicBlock, BlockId, Function, FunctionId, Immediate, InstId, InstKind, Instruction, MirType,
-    Module, Terminator, Value, ValueId,
-};
 
-pub mod analysis;
-pub use analysis::{InductionVariable, Liveness, LivenessInfo, Loop, LoopAnalyzer, LoopInfo};
+pub(crate) mod memory;
+
+mod analysis;
+mod immutable;
 
 pub mod backend;
-pub use backend::{
-    Backend,
-    evm::{
-        AssembledCode, Assembler, AssemblerConfig, EvmArtifact, EvmCodegen, EvmCodegenConfig,
-        EvmIrBlock, EvmIrBlockHotness, EvmIrBlockId, EvmIrBlockMetadata, EvmIrInstruction,
-        EvmIrMetadata, EvmIrMetadataItem, EvmIrModule, EvmIrOperand, EvmIrParseError,
-        EvmIrStackEffect, EvmIrTerminator, EvmIrTerminatorKind, EvmIrValue, EvmIrValueId, Label,
-        SpillManager, SpillSlot, StackModel, StackScheduler, parse_evm_ir_module,
-    },
+pub use backend::{Backend, evm::EvmCodegen};
+
+mod contract;
+pub use contract::{
+    ContractArtifact, ContractSelection, ImmutableReference, generate_contract_bytecodes,
 };
+
+mod ir_parse;
 
 pub mod lower;
-pub use lower::Lowerer;
 
 pub mod pass;
-pub mod transform;
+mod pass_manager;
+mod timing;
+mod transform;
 pub(crate) mod utils;
-pub use transform::{
-    CommonSubexprEliminator, DceStats, DeadCodeEliminator, FunctionInlineInfo, InlineAnalyzer,
-    InlineConfig, InlineDecision, InlineStats, InstSimplifier, JumpThreader, JumpThreadingStats,
-    LoopOptConfig, LoopOptStats, LoopOptimizer, OptLevel,
-};

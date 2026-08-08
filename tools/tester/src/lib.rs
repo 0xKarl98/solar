@@ -1,8 +1,11 @@
-//! Solar test runner.
+//! Compiler integration test support.
 //!
-//! This crate is invoked in `crates/solar/tests.rs` with the path to the `solar` binary.
+//! `crates/solar/tests.rs` uses [`run_tests`] for the compiler test suites.
 
 #![allow(unreachable_pub)]
+
+#[cfg(test)]
+use cfg_if as _;
 
 use eyre::{Result, eyre};
 use std::{
@@ -22,14 +25,16 @@ use ui_test::{
 };
 
 mod errors;
+#[cfg(test)]
+mod foundry;
+mod run_call;
 mod solc;
+mod standard_json;
 mod utils;
 
 /// Runs all the tests.
 ///
-/// `cmd` is the path to the `solar` binary used by all modes. `Mode::Mir`
-/// invokes it as `solar mir-opt …`; `Mode::EvmIr` invokes it as
-/// `solar evm-opt …`.
+/// `cmd` is the path to the `solar` binary used by all modes.
 pub fn run_tests(cmd: &'static Path) -> Result<()> {
     ui_test::color_eyre::install()?;
 
@@ -104,7 +109,7 @@ fn config(cmd: &'static Path, args: &ui_test::Args, mode: Mode) -> ui_test::Conf
     let path = match mode {
         Mode::Ui | Mode::StandardJson => "tests/ui/",
         Mode::Mir => "tests/ui/codegen/mir/",
-        Mode::EvmIr => "tests/ui/codegen/evm-ir/",
+        Mode::EvmIr => "tests/ui/codegen/",
         Mode::SolcSolidity => "testdata/solidity/test/",
         Mode::SolcYul => "testdata/solidity/test/libyul/",
     };
@@ -123,21 +128,20 @@ fn config(cmd: &'static Path, args: &ui_test::Args, mode: Mode) -> ui_test::Conf
         program: ui_test::CommandBuilder {
             program: cmd.into(),
             args: {
-                let mut args: Vec<OsString> = match mode {
-                    // `Mir` and `EvmIr` modes run subcommands which don't
-                    // accept the normal compiler flags.
-                    Mode::Mir => vec!["mir-opt".into()],
-                    Mode::EvmIr => vec!["evm-opt".into()],
-                    Mode::StandardJson => vec![
-                        "--standard-json".into(),
-                        "--pretty-json".into(),
-                        "-Zui-testing".into(),
-                    ],
-                    _ => vec!["-j1", "--error-format=rustc-json", "-Zui-testing", "-Zparse-yul"]
-                        .into_iter()
-                        .map(Into::into)
-                        .collect(),
-                };
+                let mut args: Vec<OsString> =
+                    ["-j1", "--error-format=rustc-json"].into_iter().map(Into::into).collect();
+                match mode {
+                    Mode::Mir | Mode::EvmIr => {
+                        args.extend(["-Zui-testing", "-Zparse-yul", "-Zpass-diff"].map(Into::into))
+                    }
+                    Mode::StandardJson => {
+                        args.extend(
+                            ["-Zui-testing", "-Zparse-yul", "--standard-json", "--pretty-json"]
+                                .map(Into::into),
+                        );
+                    }
+                    _ => args.extend(["-Zui-testing", "-Zparse-yul"].map(Into::into)),
+                }
                 if mode.is_solc() {
                     args.push("--stop-after=parsing".into());
                 }
@@ -166,9 +170,10 @@ fn config(cmd: &'static Path, args: &ui_test::Args, mode: Mode) -> ui_test::Conf
             )*
         };
     }
-    register_custom_flags![FileCheck];
+    register_custom_flags![FileCheck, run_call::RunCall, run_call::RunCallFail];
 
     config.comment_defaults.base().exit_status = None.into();
+    config.infer_exit_status_from_annotations = !mode.is_solc();
     config.comment_defaults.base().require_annotations = Spanned::dummy(true).into();
     config.comment_defaults.base().require_annotations_for_level =
         Spanned::dummy(ui_test::diagnostics::Level::Warn).into();
@@ -259,7 +264,7 @@ fn mode_from_config(config: &ui_test::Config) -> Mode {
         Mode::StandardJson
     } else if config.root_dir.ends_with("tests/ui/codegen/mir") {
         Mode::Mir
-    } else if config.root_dir.ends_with("tests/ui/codegen/evm-ir") {
+    } else if config.root_dir.ends_with("tests/ui/codegen") {
         Mode::EvmIr
     } else if config.root_dir.ends_with("testdata/solidity/test/libyul") {
         Mode::SolcYul
@@ -271,6 +276,11 @@ fn mode_from_config(config: &ui_test::Config) -> Mode {
 }
 
 fn file_filter(path: &Path, config: &ui_test::Config, cfg: MyConfig<'_>) -> Option<bool> {
+    if matches!(cfg.mode, Mode::Ui)
+        && path.strip_prefix(&config.root_dir).is_ok_and(|path| path.starts_with("standard-json"))
+    {
+        return Some(false);
+    }
     match cfg.mode {
         Mode::Mir => {
             path.extension().filter(|&ext| ext == "mir")?;
@@ -312,15 +322,17 @@ fn per_file_config(config: &mut ui_test::Config, file: &Spanned<Vec<u8>>, cfg: M
         if path.with_extension("stdout").exists() {
             config.comment_defaults.base().add_custom(FileCheck::NAME, FileCheck::default());
         }
+        if path.file_name().is_some_and(|name| name == "input.jsonc") {
+            standard_json::configure_directory_fixture(config, path, cfg.tmp_dir);
+        }
         return;
     }
 
     assert_eq!(config.comment_start, "//");
-    let has_annotations = src.contains("//~");
-    config.comment_defaults.base().require_annotations = Spanned::dummy(has_annotations).into();
-    let code = if has_annotations && src.contains("ERROR:") { 1 } else { 0 };
-    config.comment_defaults.base().exit_status = Spanned::dummy(code).into();
-
+    if matches!(cfg.mode, Mode::Ui) && src.lines().any(run_call::is_directive) {
+        config.program.args.extend(["-Zcodegen".into(), "--emit=abi,bin".into()]);
+        config.stdout_filter(r"(?s).+", "");
+    }
     if src.lines().any(|line| {
         let line = line.trim_start();
         line.starts_with("//@")
@@ -363,11 +375,9 @@ fn solc_per_file_config(config: &mut ui_test::Config, src: &str, path: &Path, cf
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Ui,
-    /// MIR-level tests: runs `solar mir-opt` on `.mir` files under
-    /// `tests/ui/codegen/mir/`.
+    /// MIR-level tests: runs `solar` on `.mir` files under `tests/ui/codegen/mir/`.
     Mir,
-    /// EVM-IR-level tests: runs `solar evm-opt` on `.evmir` files under
-    /// `tests/ui/codegen/evm-ir/`.
+    /// EVM-IR-level tests: runs `solar` on `.evmir` files under `tests/ui/codegen/`.
     EvmIr,
     StandardJson,
     SolcSolidity,

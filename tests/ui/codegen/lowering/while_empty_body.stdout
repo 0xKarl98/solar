@@ -1,0 +1,53 @@
+// === ROOT/tests/ui/codegen/lowering/while_empty_body.sol:WhileEmptyBody (creation) ===
+// === deployment ===
+@module deployment
+bb0:
+  push 52
+  dup1
+  push 9
+  push 0
+  codecopy
+  push 0
+  return
+
+// === runtime ===
+@module runtime
+bb0:
+  push 128
+  push 64
+  mstore
+  callvalue
+  push bb4
+  jumpi
+  calldatasize
+  iszero
+  push bb4
+  jumpi
+  push 0
+  calldataload
+  push 224
+  shr
+  dup1
+  push 0xb3de648b
+  sub
+  push bb4
+  jumpi
+  calldatasize
+  push 4
+  swap1
+  sub
+  push 32
+  sgt
+  push bb4
+  jumpi
+  jump bb6
+bb6:
+  push 4
+  calldataload
+  push bb6
+  jumpi
+  stop
+bb4 [cold]:
+  push 0
+  dup1
+  revert

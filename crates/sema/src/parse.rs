@@ -2,6 +2,7 @@ use crate::{Gcx, hir::SourceId, ty::GcxMut};
 use rayon::prelude::*;
 use solar_ast::{self as ast, Span};
 use solar_data_structures::{
+    bit_set::DenseBitSet,
     index::{Idx, IndexVec, index_vec},
     map::{FxHashMap, FxHashSet},
     sync::Mutex,
@@ -207,7 +208,7 @@ impl<'gcx> ParsingContext<'gcx> {
         let _ = self.gcx.advance_stage(CompilerStage::Parsing);
 
         let mut sources = std::mem::take(self.sources);
-        if !sources.is_empty() {
+        if self.sess.opts.language.is_source() && !sources.is_empty() {
             let dbg = enabled!(tracing::Level::DEBUG);
             let len_before = sources.len();
             let sources_parsed_before = if dbg { sources.count_parsed() } else { 0 };
@@ -592,14 +593,24 @@ impl<'ast> Sources<'ast> {
 
         let mut order = IndexVec::with_capacity(len);
         let mut map = index_vec![SourceId::MAX; len];
-        let mut seen = FxHashSet::with_capacity_and_hasher(len, Default::default());
+        let mut seen = DenseBitSet::new_empty(len);
         debug_span!("topo_order").in_scope(|| {
-            for id in self.sources.indices() {
+            // Roots in source-name order: for acyclic imports any root order
+            // yields a valid topological order, but cyclic imports are cut at
+            // the first back edge from the root, so the root order decides
+            // whether a base contract's source still precedes its derived
+            // contract's. solc roots its DFS in name order (`m_sources` is an
+            // ordered map); match it so cycles are cut identically.
+            let mut roots: Vec<SourceId> = self.sources.indices().collect();
+            roots.sort_unstable_by(|&a, &b| {
+                self.sources[a].file.name.cmp(&self.sources[b].file.name)
+            });
+            for id in roots {
                 self.topo_order(id, &mut order, &mut map, &mut seen);
             }
         });
         debug_assert!(
-            order.len() == len && !map.contains(&SourceId::MAX) && seen.len() == len,
+            order.len() == len && !map.contains(&SourceId::MAX) && seen.count() == len,
             "topo_order did not visit all sources"
         );
 
@@ -625,7 +636,7 @@ impl<'ast> Sources<'ast> {
         id: SourceId,
         order: &mut IndexVec<SourceId, SourceId>,
         map: &mut IndexVec<SourceId, SourceId>,
-        seen: &mut FxHashSet<SourceId>,
+        seen: &mut DenseBitSet<SourceId>,
     ) {
         if !seen.insert(id) {
             return;

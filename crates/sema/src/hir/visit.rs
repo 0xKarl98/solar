@@ -78,7 +78,7 @@ pub trait Visit<'hir> {
     }
 
     fn visit_modifier(&mut self, modifier: &'hir Modifier<'hir>) -> ControlFlow<Self::BreakValue> {
-        let Modifier { span: _, id: _, args } = modifier;
+        let Modifier { span: _, name_span: _, id: _, args } = modifier;
         self.visit_call_args(args)
     }
 
@@ -97,7 +97,10 @@ pub trait Visit<'hir> {
         self.visit_enum(self.hir().enumm(id))
     }
 
-    fn visit_enum(&mut self, _enumm: &'hir Enum<'hir>) -> ControlFlow<Self::BreakValue> {
+    fn visit_enum(&mut self, enumm: &'hir Enum<'hir>) -> ControlFlow<Self::BreakValue> {
+        for &variant in enumm.variants {
+            self.visit_nested_var(variant)?;
+        }
         ControlFlow::Continue(())
     }
 

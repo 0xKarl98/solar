@@ -1,33 +1,105 @@
 //! ABI encoding of external function return values.
 //!
-//! Driven by the sema [`Ty`] of each return (obtained via `gcx.type_of_hir_ty`),
+//! Driven by the cached sema [`Ty`] of each return,
 //! this lays out the Solidity ABI tuple encoding (head slots + dynamic tail) for
 //! a function's return values into a memory buffer and terminates the function
 //! with [`crate::mir::Terminator::ReturnData`]. Internal-frame functions do NOT
 //! use this — they return raw words/pointers through the internal frame.
 
 use super::Lowerer;
-use crate::mir::{FunctionBuilder, Value, ValueId};
+use crate::{
+    mir::{AbiLayout, AbiType, FunctionBuilder, MemoryObjectKind, MirType, SliceLocation, ValueId},
+    transform::lower_abi_encode,
+};
 use alloy_primitives::U256;
 use solar_ast::ElementaryType;
-use solar_sema::ty::{Ty, TyKind};
+use solar_data_structures::map::FxHashSet;
+use solar_interface::diagnostics::ErrorGuaranteed;
+use solar_sema::{
+    builtins::Builtin,
+    hir,
+    ty::{Ty, TyKind},
+};
 
-const STATIC_RETURN_BUFFER: u64 = 0x80;
-
-#[derive(Clone, Copy)]
-struct AbiScratch {
-    base: Option<ValueId>,
-    depth: u64,
-}
-
-#[derive(Clone, Copy)]
-struct AbiValueDest {
-    head_addr: ValueId,
-    tuple_base: ValueId,
-    tail: ValueId,
+struct LoweredAbiItems<'gcx> {
+    items: Vec<(ValueId, Ty<'gcx>)>,
+    calldata_slices: FxHashSet<ValueId>,
 }
 
 impl<'gcx> Lowerer<'gcx> {
+    pub(super) fn abi_type(&self, ty: Ty<'gcx>, calldata: bool) -> Option<AbiType> {
+        let mut visiting = FxHashSet::default();
+        self.abi_type_inner(ty, calldata, &mut visiting)
+    }
+
+    pub(super) fn abi_type_error(&self) -> ErrorGuaranteed {
+        self.recovery_error(None, "codegen cannot materialize this ABI type")
+    }
+
+    fn abi_type_inner(
+        &self,
+        ty: Ty<'gcx>,
+        calldata: bool,
+        visiting: &mut FxHashSet<solar_sema::hir::StructId>,
+    ) -> Option<AbiType> {
+        if matches!(ty.kind, TyKind::Mapping(..) | TyKind::Ref(_, solar_ast::DataLocation::Storage))
+        {
+            return Some(AbiType::Word);
+        }
+        let location = if calldata { SliceLocation::Calldata } else { SliceLocation::Memory };
+        Some(match ty.peel_refs().kind {
+            TyKind::Elementary(ElementaryType::Bytes | ElementaryType::String) => {
+                AbiType::Bytes(location)
+            }
+            TyKind::DynArray(element) => AbiType::DynamicArray {
+                element: Box::new(self.abi_type_inner(element, false, visiting)?),
+                location,
+            },
+            TyKind::Slice(inner) => self.abi_type_inner(inner, calldata, visiting)?,
+            TyKind::Array(element, len) => {
+                let len = match u64::try_from(len) {
+                    Ok(len) => len,
+                    Err(_) => {
+                        self.abi_head_size_overflow();
+                        return None;
+                    }
+                };
+                let element = Box::new(self.abi_type_inner(element, false, visiting)?);
+                if len.checked_mul(element.head_size()).is_none() {
+                    self.abi_head_size_overflow();
+                    return None;
+                }
+                AbiType::FixedArray { element, len }
+            }
+            TyKind::Struct(id) => {
+                if !visiting.insert(id) {
+                    return None;
+                }
+                // A field's sema type may carry a storage location ref, but a
+                // field of a memory/calldata aggregate is a value, never a
+                // storage pointer: peel it so the top-level library
+                // storage-parameter guard cannot collapse it to one word.
+                let fields = self
+                    .gcx
+                    .struct_field_types(id)
+                    .iter()
+                    .map(|&field| self.abi_type_inner(field.peel_refs(), false, visiting))
+                    .collect::<Option<Vec<_>>>()?;
+                visiting.remove(&id);
+                AbiType::Tuple(fields.into())
+            }
+            TyKind::Tuple(fields) => AbiType::Tuple(
+                fields
+                    .iter()
+                    .map(|&field| self.abi_type_inner(field.peel_refs(), false, visiting))
+                    .collect::<Option<Vec<_>>>()?
+                    .into(),
+            ),
+            TyKind::Udvt(inner, _) => self.abi_type_inner(inner, calldata, visiting)?,
+            _ => AbiType::Word,
+        })
+    }
+
     /// Whether `ty` is encoded dynamically (offset slot in the head + data in the
     /// tail): `bytes`/`string`, dynamic arrays, and any aggregate containing one.
     pub(super) fn abi_is_dynamic(&self, ty: Ty<'gcx>) -> bool {
@@ -50,21 +122,46 @@ impl<'gcx> Lowerer<'gcx> {
     /// Static ABI head size, in bytes, of one top-level item: 32 for any dynamic
     /// type (an offset slot), the recursive sum for a static struct, `N *
     /// head(T)` for a static `T[N]`, and 32 for every value type.
-    pub(super) fn abi_head_size(&self, ty: Ty<'gcx>) -> u64 {
+    ///
+    /// Returns the existing diagnostic guarantee when the size exceeds `u64`.
+    pub(super) fn abi_head_size(&self, ty: Ty<'gcx>) -> Result<u64, ErrorGuaranteed> {
+        // A storage reference (a mapping, or a struct/array in storage — legal
+        // for library function parameters) travels as its slot: one word.
+        if matches!(ty.kind, TyKind::Mapping(..) | TyKind::Ref(_, solar_ast::DataLocation::Storage))
+        {
+            return Ok(32);
+        }
         let ty = ty.peel_refs();
         if self.abi_is_dynamic(ty) {
-            return 32;
+            return Ok(32);
         }
         match ty.kind {
-            TyKind::Array(elem, n) => n.to::<u64>() * self.abi_head_size(elem),
-            TyKind::Struct(id) => {
-                self.gcx.struct_field_types(id).iter().map(|&f| self.abi_head_size(f)).sum()
+            TyKind::Array(elem, n) => {
+                let len = u64::try_from(n).map_err(|_| self.abi_head_size_overflow())?;
+                len.checked_mul(self.abi_head_size(elem)?)
+                    .ok_or_else(|| self.abi_head_size_overflow())
             }
-            _ => 32,
+            TyKind::Struct(id) => {
+                self.abi_head_size_sum(self.gcx.struct_field_types(id).iter().copied())
+            }
+            _ => Ok(32),
         }
     }
 
-    /// `base + off` (or `base` when `off == 0`).
+    pub(super) fn abi_head_size_sum(
+        &self,
+        tys: impl IntoIterator<Item = Ty<'gcx>>,
+    ) -> Result<u64, ErrorGuaranteed> {
+        tys.into_iter().try_fold(0u64, |size, ty| {
+            size.checked_add(self.abi_head_size(ty)?).ok_or_else(|| self.abi_head_size_overflow())
+        })
+    }
+
+    pub(super) fn abi_head_size_overflow(&self) -> ErrorGuaranteed {
+        self.recovery_error(None, "ABI head size exceeds codegen limits")
+    }
+
+    /// Returns `base + off`, avoiding a redundant add for the first item.
     pub(super) fn offset_ptr(
         &self,
         builder: &mut FunctionBuilder<'_>,
@@ -73,14 +170,11 @@ impl<'gcx> Lowerer<'gcx> {
     ) -> ValueId {
         if off == 0 {
             base
-        } else if matches!(
-            builder.func().value(base),
-            Value::Immediate(imm) if imm.as_u256().is_some_and(|v| v.is_zero())
-        ) {
+        } else if builder.func().value_u256(base).is_some_and(|base| base.is_zero()) {
             builder.imm_u64(off)
         } else {
-            let o = builder.imm_u64(off);
-            builder.add(base, o)
+            let off = builder.imm_u64(off);
+            builder.add(base, off)
         }
     }
 
@@ -92,35 +186,18 @@ impl<'gcx> Lowerer<'gcx> {
         builder: &mut FunctionBuilder<'_>,
         items: &[(ValueId, Ty<'gcx>)],
         dest: ValueId,
-        scratch: AbiScratch,
+        calldata_slices: &FxHashSet<ValueId>,
+        scratch: lower_abi_encode::AbiScratch,
     ) -> ValueId {
-        let head_size: u64 = items.iter().map(|&(_, t)| self.abi_head_size(t)).sum();
-        let has_dynamic = items.iter().any(|&(_, ty)| self.abi_is_dynamic(ty));
-        if !has_dynamic {
-            let mut head_off = 0u64;
-            for &(val, ty) in items {
-                let head_addr = self.offset_ptr(builder, dest, head_off);
-                self.abi_encode_static(builder, ty, val, head_addr);
-                head_off += self.abi_head_size(ty);
-            }
-            return builder.imm_u64(head_size);
-        }
-
-        let head_size_val = builder.imm_u64(head_size);
-        let mut tail = builder.add(dest, head_size_val);
-        let mut head_off = 0u64;
-        for &(val, ty) in items {
-            let head_addr = self.offset_ptr(builder, dest, head_off);
-            tail = self.abi_encode_value(
-                builder,
-                ty,
-                val,
-                AbiValueDest { head_addr, tuple_base: dest, tail },
-                scratch,
-            );
-            head_off += self.abi_head_size(ty);
-        }
-        builder.sub(tail, dest)
+        let values: Vec<_> = items.iter().map(|&(value, _)| value).collect();
+        let types = items
+            .iter()
+            .map(|&(value, ty)| self.abi_type(ty, calldata_slices.contains(&value)))
+            .collect::<Option<Vec<_>>>();
+        let Some(types) = types else {
+            return builder.error_value(self.abi_type_error());
+        };
+        lower_abi_encode::encode_tuple(builder, &values, &types, dest, scratch)
     }
 
     /// Emits ABI-encoded custom error data and terminates with `REVERT`.
@@ -130,7 +207,14 @@ impl<'gcx> Lowerer<'gcx> {
         selector: [u8; 4],
         items: &[(ValueId, Ty<'gcx>)],
     ) {
-        let head_size: u64 = items.iter().map(|&(_, ty)| self.abi_head_size(ty)).sum();
+        let head_size = match self.abi_head_size_sum(items.iter().map(|&(_, ty)| ty)) {
+            Ok(size) => size,
+            Err(guar) => {
+                let err = builder.error_value(guar);
+                builder.revert(err, err);
+                return;
+            }
+        };
         let scratch_words = self.abi_scratch_words(items);
         let scratch_base =
             (scratch_words > 0).then(|| self.allocate_memory(builder, scratch_words * 32));
@@ -140,319 +224,31 @@ impl<'gcx> Lowerer<'gcx> {
         let selector = builder.imm_u256(selector);
         builder.mstore(buf, selector);
 
-        let args_base = self.offset_ptr(builder, buf, 4);
-        let args_size = if items.is_empty() {
-            builder.imm_u64(0)
+        let size = if items.is_empty() {
+            builder.imm_u64(4)
         } else {
-            self.abi_encode_tuple(
+            let args_base = self.offset_ptr(builder, buf, 4);
+            let calldata_slices = FxHashSet::default();
+            let args_size = self.abi_encode_tuple(
                 builder,
                 items,
                 args_base,
-                AbiScratch { base: scratch_base, depth: 0 },
-            )
+                &calldata_slices,
+                lower_abi_encode::AbiScratch { base: scratch_base, depth: 0 },
+            );
+            let selector_size = builder.imm_u64(4);
+            builder.add(args_size, selector_size)
         };
-        let selector_size = builder.imm_u64(4);
-        let size = builder.add(args_size, selector_size);
         builder.revert(buf, size);
     }
 
-    /// Encodes one ABI tuple element. Dynamic values write their tail offset into
-    /// `head_addr` and append the dynamic body at `tail`; static values are
-    /// encoded directly into the head.
-    fn abi_encode_value(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-        ty: Ty<'gcx>,
-        value: ValueId,
-        dest: AbiValueDest,
-        scratch: AbiScratch,
-    ) -> ValueId {
-        if self.abi_is_dynamic(ty) {
-            let rel_off = builder.sub(dest.tail, dest.tuple_base);
-            builder.mstore(dest.head_addr, rel_off);
-            self.abi_encode_dynamic_body(builder, ty, value, dest.tail, scratch)
-        } else {
-            self.abi_encode_static(builder, ty, value, dest.head_addr);
-            dest.tail
-        }
-    }
-
-    /// Encodes a statically-encoded value into the head region at `head_addr`.
-    /// Value types write one word; a static struct/array recurses field/element
-    /// wise (each field/element word read from the value's memory pointer).
-    fn abi_encode_static(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-        ty: Ty<'gcx>,
-        value: ValueId,
-        head_addr: ValueId,
-    ) {
-        let ty = ty.peel_refs();
-        match ty.kind {
-            TyKind::Struct(id) => {
-                let fields = self.gcx.struct_field_types(id);
-                let mut field_head = head_addr;
-                for (i, &fty) in fields.iter().enumerate() {
-                    let slot = self.offset_ptr(builder, value, (i as u64) * 32);
-                    let fval = builder.mload(slot);
-                    self.abi_encode_static(builder, fty, fval, field_head);
-                    let fhs = self.abi_head_size(fty);
-                    field_head = self.offset_ptr(builder, field_head, fhs);
-                }
-            }
-            TyKind::Array(elem, n) => {
-                let mut elem_head = head_addr;
-                let ehs = self.abi_head_size(elem);
-                for i in 0..n.to::<u64>() {
-                    let slot = self.offset_ptr(builder, value, i * 32);
-                    let ev = builder.mload(slot);
-                    self.abi_encode_static(builder, elem, ev, elem_head);
-                    elem_head = self.offset_ptr(builder, elem_head, ehs);
-                }
-            }
-            _ => {
-                builder.mstore(head_addr, value);
-            }
-        }
-    }
-
-    /// Encodes a dynamic value body at `dst` and returns the advanced tail
-    /// cursor.
-    fn abi_encode_dynamic_body(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-        ty: Ty<'gcx>,
-        value: ValueId,
-        dst: ValueId,
-        scratch: AbiScratch,
-    ) -> ValueId {
-        match ty.peel_refs().kind {
-            TyKind::Elementary(ElementaryType::Bytes | ElementaryType::String) => {
-                self.abi_encode_bytes_or_string_body(builder, value, dst)
-            }
-            TyKind::DynArray(elem) if self.abi_is_word_element(elem) => {
-                let len = builder.mload(value);
-                builder.mstore(dst, len);
-
-                let word = builder.imm_u64(32);
-                let bytes = builder.mul(len, word);
-                let data_dst = builder.add(dst, word);
-                let data_src = builder.add(value, word);
-                let new_tail = builder.add(data_dst, bytes);
-                self.mcopy(builder, data_dst, data_src, bytes, None);
-                new_tail
-            }
-            TyKind::DynArray(elem) => self.abi_encode_dynamic_array_body(
-                builder,
-                elem,
-                value,
-                dst,
-                scratch.base.expect("dynamic ABI array encoding requires scratch memory"),
-                scratch.depth,
-            ),
-            TyKind::Array(elem, n) => {
-                let mut items = Vec::new();
-                for i in 0..n.to::<u64>() {
-                    let slot = self.offset_ptr(builder, value, i * 32);
-                    items.push((builder.mload(slot), elem));
-                }
-                let size = self.abi_encode_tuple(builder, &items, dst, scratch);
-                builder.add(dst, size)
-            }
-            TyKind::Struct(id) => {
-                let fields: Vec<_> = self.gcx.struct_field_types(id).to_vec();
-                let mut items = Vec::with_capacity(fields.len());
-                for (i, &fty) in fields.iter().enumerate() {
-                    let slot = self.offset_ptr(builder, value, (i as u64) * 32);
-                    items.push((builder.mload(slot), fty));
-                }
-                let size = self.abi_encode_tuple(builder, &items, dst, scratch);
-                builder.add(dst, size)
-            }
-            TyKind::Tuple(fields) => {
-                let fields: Vec<_> = fields.to_vec();
-                let mut items = Vec::with_capacity(fields.len());
-                for (i, &fty) in fields.iter().enumerate() {
-                    let slot = self.offset_ptr(builder, value, (i as u64) * 32);
-                    items.push((builder.mload(slot), fty));
-                }
-                let size = self.abi_encode_tuple(builder, &items, dst, scratch);
-                builder.add(dst, size)
-            }
-            _ => unreachable!("unsupported dynamic ABI return type: {:?}", ty.peel_refs()),
-        }
-    }
-
-    fn abi_encode_dynamic_array_body(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-        elem: Ty<'gcx>,
-        value: ValueId,
-        dst: ValueId,
-        scratch_base: ValueId,
-        scratch_depth: u64,
-    ) -> ValueId {
-        let len = builder.mload(value);
-        builder.mstore(dst, len);
-
-        let word = builder.imm_u64(32);
-        let elem_area = builder.add(dst, word);
-        let elem_head_size = self.abi_head_size(elem);
-        let elem_head_size_val = builder.imm_u64(elem_head_size);
-        let head_bytes = builder.mul(len, elem_head_size_val);
-        let initial_tail = builder.add(elem_area, head_bytes);
-        let source_cursor = builder.add(value, word);
-
-        let remaining_slot = self.abi_scratch_slot(builder, scratch_base, scratch_depth, 0);
-        let tail_slot = self.abi_scratch_slot(builder, scratch_base, scratch_depth, 1);
-        let head_slot = self.abi_scratch_slot(builder, scratch_base, scratch_depth, 2);
-        let source_slot = self.abi_scratch_slot(builder, scratch_base, scratch_depth, 3);
-        let tuple_base_slot = self.abi_scratch_slot(builder, scratch_base, scratch_depth, 4);
-        builder.mstore(remaining_slot, len);
-        builder.mstore(tail_slot, initial_tail);
-        builder.mstore(head_slot, elem_area);
-        builder.mstore(source_slot, source_cursor);
-        builder.mstore(tuple_base_slot, elem_area);
-
-        let cond_block = builder.create_block();
-        let body_block = builder.create_block();
-        let done_block = builder.create_block();
-        builder.jump(cond_block);
-
-        builder.switch_to_block(cond_block);
-        let remaining = builder.mload(remaining_slot);
-        let zero = builder.imm_u64(0);
-        let has_next = builder.gt(remaining, zero);
-        builder.branch(has_next, body_block, done_block);
-
-        builder.switch_to_block(body_block);
-        let source = builder.mload(source_slot);
-        let elem_value = builder.mload(source);
-        let elem_head = builder.mload(head_slot);
-        let current_tail = builder.mload(tail_slot);
-        let tuple_base = builder.mload(tuple_base_slot);
-        let new_tail = self.abi_encode_value(
-            builder,
-            elem,
-            elem_value,
-            AbiValueDest { head_addr: elem_head, tuple_base, tail: current_tail },
-            AbiScratch { base: Some(scratch_base), depth: scratch_depth + 1 },
-        );
-        builder.mstore(tail_slot, new_tail);
-
-        let remaining = builder.mload(remaining_slot);
-        let one = builder.imm_u64(1);
-        let next_remaining = builder.sub(remaining, one);
-        builder.mstore(remaining_slot, next_remaining);
-        let source = builder.mload(source_slot);
-        let next_source = builder.add(source, word);
-        builder.mstore(source_slot, next_source);
-        let elem_head = builder.mload(head_slot);
-        let next_head = builder.add(elem_head, elem_head_size_val);
-        builder.mstore(head_slot, next_head);
-        builder.jump(cond_block);
-
-        builder.switch_to_block(done_block);
-        builder.mload(tail_slot)
-    }
-
-    fn abi_encode_bytes_or_string_body(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-        value: ValueId,
-        dst: ValueId,
-    ) -> ValueId {
-        let len = builder.mload(value);
-        builder.mstore(dst, len);
-
-        let word = builder.imm_u64(32);
-        let thirty_one = builder.imm_u64(31);
-        let padded_mask = builder.not(thirty_one);
-        let len_plus_rounding = builder.add(len, thirty_one);
-        let padded = builder.and(len_plus_rounding, padded_mask);
-        let data_dst = builder.add(dst, word);
-
-        let zero_block = builder.create_block();
-        let copy_block = builder.create_block();
-        let is_empty = builder.iszero(padded);
-        builder.branch(is_empty, copy_block, zero_block);
-
-        builder.switch_to_block(zero_block);
-        let last_word_off = builder.sub(padded, word);
-        let last_word = builder.add(data_dst, last_word_off);
-        let zero = builder.imm_u64(0);
-        builder.mstore(last_word, zero);
-        builder.jump(copy_block);
-
-        builder.switch_to_block(copy_block);
-        let data_src = builder.add(value, word);
-        let new_tail = builder.add(data_dst, padded);
-        self.mcopy(builder, data_dst, data_src, len, None);
-        new_tail
-    }
-
-    /// Allocates a return buffer, ABI-encodes `items` into it, and terminates the
-    /// function with `ReturnData`.
-    pub(super) fn emit_abi_return(
-        &mut self,
-        builder: &mut FunctionBuilder<'_>,
-        items: &[(ValueId, Ty<'gcx>)],
-    ) {
-        if items.is_empty() {
-            builder.stop();
-            return;
-        }
-        let head_size: u64 = items.iter().map(|&(_, t)| self.abi_head_size(t)).sum();
-        let has_dynamic = items.iter().any(|&(_, ty)| self.abi_is_dynamic(ty));
-        if !has_dynamic {
-            let buf = builder.imm_u64(STATIC_RETURN_BUFFER);
-            let size =
-                self.abi_encode_tuple(builder, items, buf, AbiScratch { base: None, depth: 0 });
-            builder.ret_data(buf, size);
-            return;
-        }
-
-        let scratch_words = self.abi_scratch_words(items);
-        let scratch_base =
-            (scratch_words > 0).then(|| self.allocate_memory(builder, scratch_words * 32));
-        let buf = self.allocate_memory(builder, head_size);
-        let size =
-            self.abi_encode_tuple(builder, items, buf, AbiScratch { base: scratch_base, depth: 0 });
-        builder.ret_data(buf, size);
-    }
-
     fn abi_scratch_words(&self, items: &[(ValueId, Ty<'gcx>)]) -> u64 {
-        items.iter().map(|&(_, ty)| self.abi_loop_depth(ty)).max().unwrap_or(0) * 5
-    }
-
-    fn abi_loop_depth(&self, ty: Ty<'gcx>) -> u64 {
-        match ty.peel_refs().kind {
-            TyKind::DynArray(elem) if self.abi_is_word_element(elem) => 0,
-            TyKind::DynArray(elem) => 1 + self.abi_loop_depth(elem),
-            TyKind::Array(elem, _) => self.abi_loop_depth(elem),
-            TyKind::Struct(id) => self
-                .gcx
-                .struct_field_types(id)
-                .iter()
-                .map(|&f| self.abi_loop_depth(f))
-                .max()
-                .unwrap_or(0),
-            TyKind::Tuple(fields) => {
-                fields.iter().map(|&f| self.abi_loop_depth(f)).max().unwrap_or(0)
-            }
-            TyKind::Udvt(inner, _) => self.abi_loop_depth(inner),
-            _ => 0,
-        }
-    }
-
-    fn abi_scratch_slot(
-        &self,
-        builder: &mut FunctionBuilder<'_>,
-        scratch_base: ValueId,
-        scratch_depth: u64,
-        slot: u64,
-    ) -> ValueId {
-        self.offset_ptr(builder, scratch_base, scratch_depth * 160 + slot * 32)
+        items
+            .iter()
+            .map(|&(_, ty)| self.abi_type(ty, false).map_or(0, |ty| ty.loop_depth()))
+            .max()
+            .unwrap_or(0)
+            * 5
     }
 
     pub(super) fn abi_is_word_element(&self, ty: Ty<'gcx>) -> bool {
@@ -464,31 +260,45 @@ impl<'gcx> Lowerer<'gcx> {
         }
     }
 
-    pub(super) fn allocate_memory_dynamic(
+    /// Allocates a shaped Solidity memory object with a dynamic byte size.
+    pub(super) fn allocate_memory_object_dynamic(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         size: ValueId,
+        kind: crate::mir::MemoryObjectKind,
     ) -> ValueId {
-        let free_ptr_addr = builder.imm_u64(0x40);
-        let ptr = builder.mload(free_ptr_addr);
-        let new_free_ptr = builder.add(ptr, size);
-        let free_ptr_addr = builder.imm_u64(0x40);
-        builder.mstore(free_ptr_addr, new_free_ptr);
-        ptr
+        let layout = match kind {
+            crate::mir::MemoryObjectKind::Bytes => crate::mir::MemoryObjectLayout::Bytes,
+            crate::mir::MemoryObjectKind::DynamicArray => {
+                crate::mir::MemoryObjectLayout::DynamicArray { element_words: 1 }
+            }
+            crate::mir::MemoryObjectKind::FixedArray | crate::mir::MemoryObjectKind::Struct => {
+                unreachable!("statically shaped objects require a constant allocation size")
+            }
+        };
+        builder.alloc_object(size, layout, crate::mir::AllocationSemantics::INTERNAL)
     }
 
     /// Resolves each argument's ABI type and lowers it to a `(value, type)`
-    /// item for the tuple encoder. Returns `None` when an argument's type
-    /// cannot be determined. Arguments are evaluated before any output buffer
-    /// is reserved: lowering an argument can allocate memory of its own.
-    fn lower_abi_encode_items(
+    /// item for the tuple encoder. Calldata bytes and word arrays stay as
+    /// slices so the encoder can copy them directly into the destination.
+    /// Arguments are evaluated before any output buffer is reserved: lowering
+    /// an argument can allocate memory of its own.
+    fn lower_abi_encode_items<'hir>(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        arg_exprs: &[&solar_sema::hir::Expr<'_>],
-    ) -> Option<Vec<(ValueId, Ty<'gcx>)>> {
+        arg_exprs: impl ExactSizeIterator<Item = &'hir hir::Expr<'hir>> + Clone,
+    ) -> Result<LoweredAbiItems<'gcx>, ErrorGuaranteed> {
         let mut tys = Vec::with_capacity(arg_exprs.len());
-        for arg in arg_exprs {
-            let ty = self.get_expr_type(arg)?;
+        for arg in arg_exprs.clone() {
+            let Some(ty) = self.get_expr_type(arg) else {
+                return Err(self
+                    .gcx
+                    .dcx()
+                    .err("codegen cannot determine this ABI argument's type")
+                    .span(arg.span)
+                    .emit());
+            };
             // String literals encode as `string memory` values.
             let ty = match ty.peel_refs().kind {
                 TyKind::StringLiteral(..) => self.gcx.types.string_ref.memory,
@@ -496,33 +306,49 @@ impl<'gcx> Lowerer<'gcx> {
             };
             tys.push(ty);
         }
-        Some(
-            arg_exprs
-                .iter()
-                .zip(tys)
-                .map(|(arg, ty)| (self.lower_return_value_for_ty(builder, arg, ty), ty))
-                .collect(),
-        )
+        let mut items = Vec::with_capacity(arg_exprs.len());
+        let mut calldata_slices = FxHashSet::default();
+        for (arg, ty) in arg_exprs.zip(tys) {
+            let value = if let Some((slice, is_bytes)) = self.calldata_dyn_slice(builder, arg)
+                && (is_bytes
+                    || matches!(ty.peel_refs().kind, TyKind::DynArray(elem) if self.abi_is_word_element(elem)))
+            {
+                calldata_slices.insert(slice);
+                slice
+            } else if self.expr_is_calldata_dynamic_bytes(arg) {
+                let value = self.lower_value_expr(builder, arg);
+                // A decoded calldata-struct member is already a memory bytes
+                // pointer despite its calldata-located type; only genuine
+                // slices stay lazy in the payload.
+                if Self::value_is_calldata_slice(builder, value) {
+                    calldata_slices.insert(value);
+                }
+                value
+            } else {
+                self.lower_return_value_for_ty(builder, arg, ty)
+            };
+            items.push((value, ty));
+        }
+        Ok(LoweredAbiItems { items, calldata_slices })
     }
 
     /// Lowers `abi.encode(...)` to a fresh `bytes memory` allocation
     /// (`[length][ABI tuple encoding]`) from the free memory pointer and
-    /// returns the pointer. Returns `None` when an argument's type cannot be
-    /// determined.
+    /// returns the pointer.
     pub(super) fn lower_abi_encode_to_bytes(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        arg_exprs: &[&solar_sema::hir::Expr<'_>],
-    ) -> Option<ValueId> {
-        let items = self.lower_abi_encode_items(builder, arg_exprs)?;
+        arg_exprs: &[hir::Expr<'_>],
+    ) -> Result<ValueId, ErrorGuaranteed> {
+        let LoweredAbiItems { items, calldata_slices } =
+            self.lower_abi_encode_items(builder, arg_exprs.iter())?;
         let scratch_words = self.abi_scratch_words(&items);
         let scratch_base =
             (scratch_words > 0).then(|| self.allocate_memory(builder, scratch_words * 32));
 
-        let free_ptr_addr = builder.imm_u64(0x40);
-        let ptr = builder.mload(free_ptr_addr);
+        let ptr = builder.fmp_object(crate::mir::MemoryObjectLayout::Bytes);
         let word = builder.imm_u64(32);
-        let dest = builder.add(ptr, word);
+        let dest = builder.memory_object_data(ptr, MemoryObjectKind::Bytes);
         let size = if items.is_empty() {
             builder.imm_u64(0)
         } else {
@@ -530,10 +356,11 @@ impl<'gcx> Lowerer<'gcx> {
                 builder,
                 &items,
                 dest,
-                AbiScratch { base: scratch_base, depth: 0 },
+                &calldata_slices,
+                lower_abi_encode::AbiScratch { base: scratch_base, depth: 0 },
             )
         };
-        builder.mstore(ptr, size);
+        builder.set_memory_object_len(ptr, size, MemoryObjectKind::Bytes);
 
         // Finalize the allocation: length word + encoded data. The tuple
         // encoder itself never allocates (its scratch is reserved above), so
@@ -542,29 +369,27 @@ impl<'gcx> Lowerer<'gcx> {
         // pointer word-aligned.
         let total = builder.add(size, word);
         let new_free_ptr = builder.add(ptr, total);
-        let free_ptr_addr = builder.imm_u64(0x40);
-        builder.mstore(free_ptr_addr, new_free_ptr);
-        Some(ptr)
+        builder.set_fmp(new_free_ptr);
+        Ok(ptr)
     }
 
     /// Lowers `keccak256(abi.encode(...))` without materializing a `bytes`
     /// object: the tuple encoding is staged at the unbumped free memory
-    /// pointer and hashed in place, like solc. Returns `None` when an
-    /// argument's type cannot be determined.
+    /// pointer and hashed in place, like solc.
     pub(super) fn lower_keccak_abi_encode(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        arg_exprs: &[&solar_sema::hir::Expr<'_>],
-    ) -> Option<ValueId> {
-        let items = self.lower_abi_encode_items(builder, arg_exprs)?;
+        arg_exprs: &[hir::Expr<'_>],
+    ) -> Result<ValueId, ErrorGuaranteed> {
+        let LoweredAbiItems { items, calldata_slices } =
+            self.lower_abi_encode_items(builder, arg_exprs.iter())?;
         // Loop scratch must be a real allocation so it sits below the staging
         // area read by the hash.
         let scratch_words = self.abi_scratch_words(&items);
         let scratch_base =
             (scratch_words > 0).then(|| self.allocate_memory(builder, scratch_words * 32));
 
-        let free_ptr_addr = builder.imm_u64(0x40);
-        let data = builder.mload(free_ptr_addr);
+        let data = builder.fmp();
         let size = if items.is_empty() {
             builder.imm_u64(0)
         } else {
@@ -572,10 +397,11 @@ impl<'gcx> Lowerer<'gcx> {
                 builder,
                 &items,
                 data,
-                AbiScratch { base: scratch_base, depth: 0 },
+                &calldata_slices,
+                lower_abi_encode::AbiScratch { base: scratch_base, depth: 0 },
             )
         };
-        Some(builder.keccak256(data, size))
+        Ok(builder.keccak256(data, size))
     }
 
     /// ABI-encodes already-lowered tuple items into a fresh allocation from
@@ -585,8 +411,8 @@ impl<'gcx> Lowerer<'gcx> {
         builder: &mut FunctionBuilder<'_>,
         items: &[(ValueId, Ty<'gcx>)],
     ) -> (ValueId, ValueId) {
-        let zero = builder.imm_u64(0);
         if items.is_empty() {
+            let zero = builder.imm_u64(0);
             return (zero, zero);
         }
 
@@ -594,13 +420,14 @@ impl<'gcx> Lowerer<'gcx> {
         let scratch_base =
             (scratch_words > 0).then(|| self.allocate_memory(builder, scratch_words * 32));
 
-        let free_ptr_addr = builder.imm_u64(0x40);
-        let data = builder.mload(free_ptr_addr);
+        let data = builder.fmp();
+        let calldata_slices = FxHashSet::default();
         let size = self.abi_encode_tuple(
             builder,
             items,
             data,
-            AbiScratch { base: scratch_base, depth: 0 },
+            &calldata_slices,
+            lower_abi_encode::AbiScratch { base: scratch_base, depth: 0 },
         );
 
         let thirty_one = builder.imm_u64(31);
@@ -608,56 +435,91 @@ impl<'gcx> Lowerer<'gcx> {
         let mask = builder.not(thirty_one);
         let aligned = builder.and(rounded, mask);
         let new_free_ptr = builder.add(data, aligned);
-        let free_ptr_addr = builder.imm_u64(0x40);
-        builder.mstore(free_ptr_addr, new_free_ptr);
+        builder.set_fmp(new_free_ptr);
 
         (data, size)
     }
 
+    /// ABI-encodes static event data in scratch memory.
+    pub(super) fn abi_encode_event_data(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        items: &[(ValueId, Ty<'gcx>)],
+    ) -> (ValueId, ValueId) {
+        if items.is_empty() {
+            let zero = builder.imm_u64(0);
+            return (zero, zero);
+        }
+        if items.iter().any(|&(_, ty)| self.abi_is_dynamic(ty)) {
+            return self.abi_encode_items_to_memory(builder, items);
+        }
+
+        let data = builder.imm_u64(0);
+        let calldata_slices = FxHashSet::default();
+        let size = self.abi_encode_tuple(
+            builder,
+            items,
+            data,
+            &calldata_slices,
+            lower_abi_encode::AbiScratch { base: None, depth: 0 },
+        );
+        (data, size)
+    }
+
+    /// Lowers `abi.encodeCall(F, (args...))` to a `(data, len)` payload: the
+    /// function reference `F` supplies the 4-byte selector, and the second
+    /// argument's tuple elements are ABI-encoded after it.
+    pub(super) fn abi_encode_call_from_args(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        args: &hir::CallArgs<'_>,
+    ) -> Result<(ValueId, ValueId), ErrorGuaranteed> {
+        let [func_ref, args_tuple] = self.builtin_args(Builtin::AbiEncodeCall, args)?;
+        let selector = self.lower_resolved_function_selector(func_ref).ok_or_else(|| {
+            self.gcx
+                .dcx()
+                .err("codegen cannot resolve the `abi.encodeCall` function reference")
+                .span(func_ref.span)
+                .emit()
+        })?;
+        let selector_word = builder.imm_u256(U256::from(selector) << 224);
+        let arg_exprs: Vec<_> = match &args_tuple.kind {
+            hir::ExprKind::Tuple(elems) => elems.iter().filter_map(|e| *e).collect(),
+            _ => vec![args_tuple],
+        };
+        self.abi_encode_call_payload(builder, Some(selector_word), arg_exprs.iter().copied())
+    }
+
     /// ABI-encodes call arguments (optionally prefixed by a left-aligned
     /// 4-byte selector word) into a fresh allocation from the free memory
-    /// pointer. Returns `(offset, size)` of the encoded payload, or `None`
-    /// when an argument's type cannot be determined.
-    pub(super) fn abi_encode_call_payload(
+    /// pointer. Returns `(offset, size)` of the encoded payload.
+    pub(super) fn abi_encode_call_payload<'hir>(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         selector: Option<ValueId>,
-        arg_exprs: &[&solar_sema::hir::Expr<'_>],
-    ) -> Option<(ValueId, ValueId)> {
-        let items = self.lower_abi_encode_items(builder, arg_exprs)?;
-        let scratch_words = self.abi_scratch_words(&items);
-        let scratch_base =
-            (scratch_words > 0).then(|| self.allocate_memory(builder, scratch_words * 32));
-
-        let sel_size = if selector.is_some() { 4u64 } else { 0 };
-        let free_ptr_addr = builder.imm_u64(0x40);
-        let buf = builder.mload(free_ptr_addr);
-        if let Some(sel) = selector {
-            builder.mstore(buf, sel);
-        }
-        let dest = self.offset_ptr(builder, buf, sel_size);
-        let size = self.abi_encode_tuple(
-            builder,
-            &items,
-            dest,
-            AbiScratch { base: scratch_base, depth: 0 },
-        );
-        let sel_size_val = builder.imm_u64(sel_size);
-        let total = builder.add(size, sel_size_val);
-
-        // Finalize the allocation, keeping the free memory pointer
-        // word-aligned. The tuple encoder itself never allocates (its scratch
-        // is reserved above), so nothing else writes into the buffer region
-        // before this bump.
-        let thirty_one = builder.imm_u64(31);
-        let rounded = builder.add(total, thirty_one);
-        let mask = builder.not(thirty_one);
-        let aligned = builder.and(rounded, mask);
-        let new_free_ptr = builder.add(buf, aligned);
-        let free_ptr_addr = builder.imm_u64(0x40);
-        builder.mstore(free_ptr_addr, new_free_ptr);
-
-        Some((buf, total))
+        arg_exprs: impl ExactSizeIterator<Item = &'hir hir::Expr<'hir>> + Clone,
+    ) -> Result<(ValueId, ValueId), ErrorGuaranteed> {
+        let LoweredAbiItems { items, calldata_slices } =
+            self.lower_abi_encode_items(builder, arg_exprs.clone())?;
+        let types = items
+            .iter()
+            .zip(arg_exprs)
+            .map(|(&(value, ty), arg)| {
+                self.abi_type(ty, calldata_slices.contains(&value)).ok_or_else(|| {
+                    self.gcx
+                        .dcx()
+                        .err("codegen cannot encode this ABI argument's type")
+                        .span(arg.span)
+                        .emit()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let layout = self.module.intern_abi_layout(AbiLayout::new(types));
+        let args: Vec<_> = items.into_iter().map(|(value, _)| value).collect();
+        let payload = builder.abi_encode(layout, selector, args);
+        let ptr = builder.slice_ptr(payload);
+        let len = builder.slice_len(payload);
+        Ok((ptr, len))
     }
 
     pub(super) fn lower_return_value_for_ty(
@@ -666,6 +528,37 @@ impl<'gcx> Lowerer<'gcx> {
         expr: &solar_sema::hir::Expr<'_>,
         ty: Ty<'gcx>,
     ) -> ValueId {
+        if self.expr_is_calldata_dynamic_bytes(expr) {
+            let value = self.lower_value_expr(builder, expr);
+            if Self::value_is_calldata_slice(builder, value) {
+                return self.materialize_calldata_bytes(builder, value);
+            }
+            // A decoded calldata-struct member is already a memory bytes
+            // pointer despite its calldata-located type.
+            return value;
+        }
+        if let Some((slice, is_bytes)) = self.calldata_bytes_source(builder, expr) {
+            return if is_bytes {
+                self.materialize_calldata_bytes(builder, slice)
+            } else {
+                self.materialize_calldata_dyn_array_for_ty(builder, ty, slice)
+            };
+        }
+        if matches!(ty.kind, TyKind::Ref(_, solar_ast::DataLocation::Calldata)) {
+            let value = self.lower_value_expr(builder, expr);
+            if !Self::value_is_calldata_slice(builder, value) {
+                return value;
+            }
+            return match ty.peel_refs().kind {
+                TyKind::Elementary(ElementaryType::Bytes | ElementaryType::String) => {
+                    self.materialize_calldata_bytes(builder, value)
+                }
+                TyKind::DynArray(_) | TyKind::Slice(_) => {
+                    self.materialize_calldata_dyn_array_for_ty(builder, ty, value)
+                }
+                _ => value,
+            };
+        }
         if matches!(
             ty.peel_refs().kind,
             TyKind::Elementary(ElementaryType::Bytes | ElementaryType::String)
@@ -674,12 +567,34 @@ impl<'gcx> Lowerer<'gcx> {
         {
             return ptr;
         }
-        self.lower_expr(builder, expr)
+        let value = self.lower_value_expr(builder, expr);
+        self.coerce_memory_slice_value(builder, value)
     }
 
     /// Decodes a storage `bytes`/`string` slot into the memory layout the ABI
-    /// encoder expects: `[length][data...]`.
+    /// encoder expects (`[length][data...]`), through the module's shared
+    /// `__load_storage_bytes` helper: the short/long-form decode and copy loop
+    /// is far larger than a call, and real contracts read storage strings from
+    /// several sites.
     pub(super) fn materialize_storage_bytes(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        slot: ValueId,
+    ) -> ValueId {
+        if self.synthesizing_helper {
+            return self.materialize_storage_bytes_inline(builder, slot);
+        }
+        let helper = self.ensure_load_storage_bytes_helper();
+        builder.internal_call(
+            helper,
+            vec![slot],
+            MirType::MemoryObject(crate::mir::MemoryObjectKind::Bytes),
+            1,
+        )
+    }
+
+    /// The out-of-line body of [`Self::materialize_storage_bytes`].
+    pub(super) fn materialize_storage_bytes_inline(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         slot: ValueId,
@@ -705,10 +620,14 @@ impl<'gcx> Lowerer<'gcx> {
         let data_size = builder.select(is_empty, word_size, padded);
         let total_size = builder.add(word_size, data_size);
 
-        let scratch_base = self.allocate_memory(builder, 96);
-        let ptr = self.allocate_memory_dynamic(builder, total_size);
-        builder.mstore(ptr, len);
-        let data_ptr = builder.add(ptr, word_size);
+        let scratch_base = self.allocate_memory(builder, 32);
+        let ptr = self.allocate_memory_object_dynamic(
+            builder,
+            total_size,
+            crate::mir::MemoryObjectKind::Bytes,
+        );
+        builder.set_memory_object_len(ptr, len, MemoryObjectKind::Bytes);
+        let data_ptr = builder.memory_object_data(ptr, MemoryObjectKind::Bytes);
 
         let short_block = builder.create_block();
         let long_block = builder.create_block();
@@ -725,36 +644,32 @@ impl<'gcx> Lowerer<'gcx> {
         builder.mstore(scratch_base, slot);
         let data_slot = builder.keccak256(scratch_base, word_size);
         let remaining = builder.div(padded, word_size);
-        let remaining_slot = self.offset_ptr(builder, scratch_base, 32);
-        let storage_slot_slot = self.offset_ptr(builder, scratch_base, 64);
-        builder.mstore(scratch_base, data_ptr);
-        builder.mstore(remaining_slot, remaining);
-        builder.mstore(storage_slot_slot, data_slot);
 
         let cond_block = builder.create_block();
         let body_block = builder.create_block();
+        let preheader = builder.current_block();
         builder.jump(cond_block);
 
         builder.switch_to_block(cond_block);
-        let remaining = builder.mload(remaining_slot);
+        let remaining_phi = builder.phi(vec![(preheader, remaining)]);
+        let storage_slot_phi = builder.phi(vec![(preheader, data_slot)]);
+        let dst_phi = builder.phi(vec![(preheader, data_ptr)]);
         let zero = builder.imm_u64(0);
-        let has_remaining = builder.gt(remaining, zero);
+        let has_remaining = builder.gt(remaining_phi, zero);
         builder.branch(has_remaining, body_block, done_block);
 
         builder.switch_to_block(body_block);
-        let current_storage_slot = builder.mload(storage_slot_slot);
-        let data_word = builder.sload(current_storage_slot);
-        let current_dst = builder.mload(scratch_base);
-        builder.mstore(current_dst, data_word);
-        let next_storage_slot = builder.add(current_storage_slot, one);
-        builder.mstore(storage_slot_slot, next_storage_slot);
+        let data_word = builder.sload(storage_slot_phi);
+        builder.mstore(dst_phi, data_word);
+        let next_storage_slot = builder.add(storage_slot_phi, one);
         let word_size = builder.imm_u64(32);
-        let next_dst = builder.add(current_dst, word_size);
-        builder.mstore(scratch_base, next_dst);
-        let remaining = builder.mload(remaining_slot);
-        let next_remaining = builder.sub(remaining, one);
-        builder.mstore(remaining_slot, next_remaining);
+        let next_dst = builder.add(dst_phi, word_size);
+        let next_remaining = builder.sub(remaining_phi, one);
+        let latch = builder.current_block();
         builder.jump(cond_block);
+        builder.add_phi_incoming(remaining_phi, latch, next_remaining);
+        builder.add_phi_incoming(storage_slot_phi, latch, next_storage_slot);
+        builder.add_phi_incoming(dst_phi, latch, next_dst);
 
         builder.switch_to_block(done_block);
         ptr
@@ -770,9 +685,9 @@ impl<'gcx> Lowerer<'gcx> {
         slot: ValueId,
         ptr: ValueId,
     ) {
-        let len = builder.mload(ptr);
+        let len = builder.memory_object_len(ptr, MemoryObjectKind::Bytes);
         let word_size = builder.imm_u64(32);
-        let data = builder.add(ptr, word_size);
+        let data = builder.memory_object_data(ptr, MemoryObjectKind::Bytes);
 
         // Decode the previous value's data-word count so stale slots are cleared.
         let old_word = builder.sload(slot);
@@ -879,19 +794,14 @@ impl<'gcx> Lowerer<'gcx> {
         builder.switch_to_block(done_block);
     }
 
-    /// Terminates the current function for the implicit-return epilogue's gathered
-    /// `items` (one per declared return). External entries go through the ABI
-    /// encoder; internal-frame functions return raw words/pointers.
-    pub(super) fn finish_external_or_internal_return(
+    /// Terminates the current function with the raw values gathered for its
+    /// declared returns. `lower-abi` turns returns from external entries into
+    /// ABI-encoded returndata; internal functions keep this convention.
+    pub(super) fn finish_return(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         items: Vec<(ValueId, Ty<'gcx>)>,
-        external: bool,
     ) {
-        if external {
-            self.emit_abi_return(builder, &items);
-            return;
-        }
         let vals: Vec<ValueId> = items.into_iter().map(|(v, _)| v).collect();
         builder.ret(vals);
     }
@@ -909,28 +819,38 @@ impl<'gcx> Lowerer<'gcx> {
         let Some(expr) = value else {
             return Vec::new();
         };
+        // A return expression with no declared return types is malformed input
+        // that upstream analysis already reported; do not index an empty list.
+        if tys.is_empty() {
+            return Vec::new();
+        }
         if let ExprKind::Tuple(elements) = &expr.kind {
             return elements
                 .iter()
                 .flatten()
-                .enumerate()
-                .map(|(i, e)| (self.lower_return_value_for_ty(builder, e, tys[i]), tys[i]))
+                .zip(tys)
+                .map(|(e, ty)| (self.lower_return_value_for_ty(builder, e, ty), ty))
                 .collect();
         }
         if let Some(arity) = self.get_ternary_tuple_arity(expr) {
-            let _ = self.lower_expr(builder, expr);
-            return (0..arity)
-                .map(|i| {
-                    let off = builder.imm_u64((i * 32) as u64);
-                    (builder.mload(off), tys[i])
-                })
-                .collect();
+            let first = self.lower_value_expr(builder, expr);
+            let mut items = Vec::with_capacity(arity);
+            items.push((first, tys[0]));
+            if arity > 1 {
+                let base = self.multi_return_buffer_base(builder);
+                for (i, &ty) in tys.iter().enumerate().take(arity).skip(1) {
+                    items.push((self.load_multi_return_value(builder, base, i), ty));
+                }
+            }
+            return items;
         }
         let first = self.lower_return_value_for_ty(builder, expr, tys[0]);
         let mut items = vec![(first, tys[0])];
-        for (i, &ty) in tys.iter().enumerate().skip(1) {
-            let off = builder.imm_u64((i * 32) as u64);
-            items.push((builder.mload(off), ty));
+        if tys.len() > 1 {
+            let tail_base = self.multi_return_buffer_base(builder);
+            for (i, &ty) in tys.iter().enumerate().skip(1) {
+                items.push((self.load_multi_return_value(builder, tail_base, i), ty));
+            }
         }
         items
     }

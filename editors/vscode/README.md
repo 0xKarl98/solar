@@ -34,6 +34,28 @@ the local binary:
 Formatting uses `forge fmt`, so install Foundry or disable
 `solarLsp.formatOnSave`.
 
+## Protocol tracing
+
+The `Solar LSP` output channel separates client wire tracing from server
+execution tracing. Set its log level to `Trace`, then use
+`solarLsp.trace.server` with `messages` or `verbose` for the server-side
+completion status and processing time. Request parameters and response
+payloads remain in the language client's wire trace and are not duplicated by
+the server.
+
+## CodeLens
+
+CodeLens annotations are enabled by default for function selectors, reference
+counts, and contract inheritance. Select a selector to copy it, a reference
+count to open Peek References, or inheritance information to open Type
+Hierarchy.
+
+Use `solarLsp.codeLens.enable` to disable all annotations, or configure
+`solarLsp.codeLens.selectors`, `solarLsp.codeLens.references`, and
+`solarLsp.codeLens.inheritance` separately. These settings are sent when the
+language server starts, so changing one restarts the client. Lenses refresh
+after the workspace is reanalyzed. Test and run actions are not yet supported.
+
 ## License
 
 Dual licensed under MIT or Apache-2.0.

@@ -1,0 +1,78 @@
+{
+  "contracts": {
+    "ROOT/tests/ui/codegen/lowering/udvt_selector.sol:UdvtSelector": {
+      "hashes": {
+        "unwrapAndAdd(uint256,uint256)": "8d2f9995"
+      }
+    }
+  },
+  "version": "VERSION"
+}
+// === ROOT/tests/ui/codegen/lowering/udvt_selector.sol:UdvtSelector (runtime) ===
+@module runtime
+bb0:
+  push 192
+  push 64
+  mstore
+  callvalue
+  push bb4
+  jumpi
+  calldatasize
+  iszero
+  push bb4
+  jumpi
+  push 0
+  calldataload
+  push 224
+  shr
+  dup1
+  push 0x8d2f9995
+  sub
+  push bb4
+  jumpi
+  calldatasize
+  push 4
+  swap1
+  sub
+  push 64
+  sgt
+  push bb4
+  jumpi
+  push 36
+  calldataload
+  push 4
+  calldataload
+  add
+  dup1
+  push 160
+  mstore
+  push 4
+  calldataload
+  dup2
+  lt
+  push bb9
+  jumpi
+  dup1
+  push 160
+  mstore
+  push 128
+  mstore
+  push 32
+  push 128
+  return
+bb4 [cold]:
+  push 0
+  dup1
+  revert
+bb9 [cold]:
+  push 0x4e487b71
+  push 224
+  shl
+  push 0
+  mstore
+  push 17
+  push 4
+  mstore
+  push 36
+  push 0
+  revert

@@ -85,18 +85,18 @@ pub struct Hir<'hir> {
     pub(crate) contracts: IndexVec<ContractId, Contract<'hir>>,
     /// All functions.
     pub(crate) functions: IndexVec<FunctionId, Function<'hir>>,
+    /// All constants and variables.
+    pub(crate) variables: IndexVec<VariableId, Variable<'hir>>,
     /// All structs.
     pub(crate) structs: IndexVec<StructId, Struct<'hir>>,
     /// All enums.
     pub(crate) enums: IndexVec<EnumId, Enum<'hir>>,
     /// All user-defined value types.
     pub(crate) udvts: IndexVec<UdvtId, Udvt<'hir>>,
-    /// All events.
-    pub(crate) events: IndexVec<EventId, Event<'hir>>,
     /// All custom errors.
     pub(crate) errors: IndexVec<ErrorId, Error<'hir>>,
-    /// All constants and variables.
-    pub(crate) variables: IndexVec<VariableId, Variable<'hir>>,
+    /// All events.
+    pub(crate) events: IndexVec<EventId, Event<'hir>>,
 }
 
 macro_rules! indexvec_methods {
@@ -181,12 +181,12 @@ impl<'hir> Hir<'hir> {
             docs,
             contracts: IndexVec::new(),
             functions: IndexVec::new(),
+            variables: IndexVec::new(),
             structs: IndexVec::new(),
             enums: IndexVec::new(),
             udvts: IndexVec::new(),
-            events: IndexVec::new(),
             errors: IndexVec::new(),
-            variables: IndexVec::new(),
+            events: IndexVec::new(),
         }
     }
 
@@ -195,12 +195,12 @@ impl<'hir> Hir<'hir> {
         doc => docs, DocId => Doc<'hir>;
         contract => contracts, ContractId => Contract<'hir>;
         function => functions, FunctionId => Function<'hir>;
+        variable => variables, VariableId => Variable<'hir>;
         strukt => structs, StructId => Struct<'hir>;
         enumm => enums, EnumId => Enum<'hir>;
         udvt => udvts, UdvtId => Udvt<'hir>;
-        event => events, EventId => Event<'hir>;
         error => errors, ErrorId => Error<'hir>;
-        variable => variables, VariableId => Variable<'hir>;
+        event => events, EventId => Event<'hir>;
     }
 
     /// Returns the item associated with the given ID.
@@ -218,9 +218,54 @@ impl<'hir> Hir<'hir> {
         }
     }
 
+    /// Returns an ID that is unique across all HIR item kinds.
+    pub fn global_item_id(&self, id: impl Into<ItemId>) -> usize {
+        self.global_item_id_(id.into())
+    }
+
+    fn global_item_id_(&self, id: ItemId) -> usize {
+        let mut base = 0;
+        'out: {
+            macro_rules! sum_base {
+                ($($kind:ident : $kinds:ident,)*) => {
+                    $(
+                        if id.kind() > ItemKind::$kind {
+                            base += self.$kinds.len();
+                        } else {
+                            break 'out;
+                        }
+                    )*
+                };
+            }
+            sum_base!(
+                Contract : contracts,
+                Function : functions,
+                Variable : variables,
+                Struct : structs,
+                Enum : enums,
+                Udvt : udvts,
+                Error : errors,
+                Event : events,
+            );
+        }
+        base + id.raw_index()
+    }
+
     /// Returns an iterator over all item IDs.
     pub fn item_ids(&self) -> impl Iterator<Item = ItemId> + Clone {
         self.item_ids_vec().into_iter()
+    }
+
+    /// Returns the total number of items.
+    pub fn item_count(&self) -> usize {
+        self.contracts.len()
+            + self.functions.len()
+            + self.variables.len()
+            + self.structs.len()
+            + self.enums.len()
+            + self.udvts.len()
+            + self.errors.len()
+            + self.events.len()
     }
 
     /// Returns a parallel iterator over all item IDs.
@@ -231,16 +276,7 @@ impl<'hir> Hir<'hir> {
     fn item_ids_vec(&self) -> Vec<ItemId> {
         // NOTE: This is essentially an unrolled `.chain().chain() ... .collect()` since it's not
         // very efficient.
-        #[rustfmt::skip]
-        let len =
-              self.contracts.len()
-            + self.functions.len()
-            + self.variables.len()
-            + self.structs.len()
-            + self.enums.len()
-            + self.udvts.len()
-            + self.errors.len()
-            + self.events.len();
+        let len = self.item_count();
         let mut v = Vec::<ItemId>::with_capacity(len);
         let mut items = v.spare_capacity_mut().iter_mut();
         macro_rules! extend_unchecked {
@@ -506,6 +542,13 @@ pub struct Doc<'hir> {
     pub(crate) ast_comments: ast::DocComments<'hir>,
 }
 
+impl<'hir> Doc<'hir> {
+    /// Returns the raw AST documentation comments.
+    pub fn ast_comments(&self) -> &ast::DocComments<'hir> {
+        &self.ast_comments
+    }
+}
+
 #[derive(Clone, Copy, Debug, EnumIs)]
 pub enum Item<'a, 'hir> {
     Contract(&'a Contract<'hir>),
@@ -686,6 +729,19 @@ impl<'hir> Item<'_, 'hir> {
     }
 }
 
+/// HIR item kinds in global ID order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ItemKind {
+    Contract,
+    Function,
+    Variable,
+    Struct,
+    Enum,
+    Udvt,
+    Error,
+    Event,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, From, EnumIs)]
 pub enum ItemId {
     Contract(ContractId),
@@ -715,6 +771,34 @@ impl fmt::Debug for ItemId {
 }
 
 impl ItemId {
+    #[inline]
+    fn kind(self) -> ItemKind {
+        match self {
+            Self::Contract(_) => ItemKind::Contract,
+            Self::Function(_) => ItemKind::Function,
+            Self::Variable(_) => ItemKind::Variable,
+            Self::Struct(_) => ItemKind::Struct,
+            Self::Enum(_) => ItemKind::Enum,
+            Self::Udvt(_) => ItemKind::Udvt,
+            Self::Error(_) => ItemKind::Error,
+            Self::Event(_) => ItemKind::Event,
+        }
+    }
+
+    #[inline]
+    fn raw_index(self) -> usize {
+        match self {
+            Self::Contract(id) => id.index(),
+            Self::Function(id) => id.index(),
+            Self::Variable(id) => id.index(),
+            Self::Struct(id) => id.index(),
+            Self::Enum(id) => id.index(),
+            Self::Udvt(id) => id.index(),
+            Self::Error(id) => id.index(),
+            Self::Event(id) => id.index(),
+        }
+    }
+
     /// Returns the description of the item.
     pub fn description(&self) -> &'static str {
         match self {
@@ -759,6 +843,11 @@ impl ItemId {
     /// Returns the variable ID if this is a variable.
     pub fn as_variable(&self) -> Option<VariableId> {
         if let Self::Variable(v) = *self { Some(v) } else { None }
+    }
+
+    /// Returns the enum ID if this is an enum.
+    pub fn as_enum(&self) -> Option<EnumId> {
+        if let Self::Enum(v) = *self { Some(v) } else { None }
     }
 }
 
@@ -877,6 +966,8 @@ pub fn can_receive_ether(contract: &Contract<'_>, gcx: Gcx<'_>) -> bool {
 pub struct Modifier<'hir> {
     /// The span of the modifier or base class call.
     pub span: Span,
+    /// The span of the final name segment.
+    pub name_span: Span,
     /// The modifier or base class ID.
     pub id: ItemId,
     /// The arguments to the modifier or base class call.
@@ -1048,7 +1139,7 @@ pub struct Enum<'hir> {
     /// The enum name.
     pub name: Ident,
     /// The enum variants.
-    pub variants: &'hir [Ident],
+    pub variants: &'hir [VariableId],
 }
 
 /// A user-defined value type.
@@ -1274,6 +1365,8 @@ pub enum VarKind {
     State,
     /// Defined in a struct.
     Struct,
+    /// Defined in an enum.
+    Enum,
     /// Defined in an event.
     Event,
     /// Defined in an error.
@@ -1298,6 +1391,7 @@ impl VarKind {
             Self::Global => "file-level variable",
             Self::State => "state variable",
             Self::Struct => "struct field",
+            Self::Enum => "enum variant",
             Self::Event => "event parameter",
             Self::Error => "error parameter",
             Self::FunctionParam | Self::FunctionTyParam => "function parameter",
@@ -1534,8 +1628,37 @@ impl Res {
         }
     }
 
+    /// Returns the function ID if this resolves to a function.
+    pub fn as_function(&self) -> Option<FunctionId> {
+        if let Self::Item(id) = self { id.as_function() } else { None }
+    }
+
+    /// Returns the variable ID if this resolves to a variable.
     pub fn as_variable(&self) -> Option<VariableId> {
         if let Self::Item(id) = self { id.as_variable() } else { None }
+    }
+
+    /// Returns the builtin if this resolves to a builtin.
+    pub fn as_builtin(&self) -> Option<Builtin> {
+        if let Self::Builtin(builtin) = self { Some(*builtin) } else { None }
+    }
+
+    fn var_parent(self, hir: &Hir<'_>) -> Option<ItemId> {
+        hir.variable(self.as_variable()?).parent
+    }
+
+    /// Returns the field index if this resolves to a struct field.
+    pub fn struct_field_index(self, hir: &Hir<'_>) -> Option<usize> {
+        let variable = self.as_variable()?;
+        let strukt = hir.strukt(self.var_parent(hir)?.as_struct()?);
+        strukt.fields.iter().position(|&field| field == variable)
+    }
+
+    /// Returns the variant index if this resolves to an enum variant.
+    pub fn enum_variant_index(self, hir: &Hir<'_>) -> Option<usize> {
+        let variable = self.as_variable()?;
+        let enumm = hir.enumm(self.var_parent(hir)?.as_enum()?);
+        enumm.variants.iter().position(|&variant| variant == variable)
     }
 }
 
@@ -1556,6 +1679,120 @@ impl Expr<'_> {
             expr = inner;
         }
         expr
+    }
+
+    /// Returns the resolution if this is an unambiguous identifier expression.
+    ///
+    /// Prefer using [`Gcx::resolved_expr`] instead, since this method does not account for
+    /// overloads.
+    ///
+    /// Parentheses are ignored.
+    pub fn as_res(&self) -> Option<Res> {
+        let ExprKind::Ident([res]) = self.peel_parens().kind else { return None };
+        Some(*res)
+    }
+
+    /// Returns the variable ID if this is an unambiguous variable expression.
+    ///
+    /// Parentheses are ignored, but expressions with multiple resolutions are rejected even if
+    /// one of those resolutions is a variable.
+    pub fn as_variable(&self) -> Option<VariableId> {
+        self.as_res()?.as_variable()
+    }
+
+    /// Returns an error referenced by this expression.
+    pub fn references_error(&self, hir: &Hir<'_>) -> Result<(), ErrorGuaranteed> {
+        match self.visit(&mut |expr| {
+            let guar = match &expr.kind {
+                ExprKind::Err(guar) => Some(*guar),
+                ExprKind::Lit(lit) => match lit.kind {
+                    ast::LitKind::Err(guar) => Some(guar),
+                    _ => None,
+                },
+                ExprKind::Ident(resolutions) => resolutions.iter().find_map(|res| match res {
+                    Res::Err(guar) => Some(*guar),
+                    _ => None,
+                }),
+                ExprKind::New(ty) | ExprKind::TypeCall(ty) | ExprKind::Type(ty) => {
+                    return match ty.references_error(hir) {
+                        Ok(()) => ControlFlow::Continue(()),
+                        Err(guar) => ControlFlow::Break(guar),
+                    };
+                }
+                _ => None,
+            };
+            match guar {
+                Some(guar) => ControlFlow::Break(guar),
+                None => ControlFlow::Continue(()),
+            }
+        }) {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(guar) => Err(guar),
+        }
+    }
+
+    /// Visits the expression and its subexpressions.
+    pub fn visit<T>(&self, f: &mut impl FnMut(&Self) -> ControlFlow<T>) -> ControlFlow<T> {
+        f(self)?;
+        match &self.kind {
+            ExprKind::Call(callee, args, options) => {
+                callee.visit(f)?;
+                if let Some(options) = options {
+                    for arg in options.args {
+                        arg.value.visit(f)?;
+                    }
+                }
+                for arg in args.exprs() {
+                    arg.visit(f)?;
+                }
+            }
+            ExprKind::Delete(expr)
+            | ExprKind::Member(expr, _)
+            | ExprKind::Payable(expr)
+            | ExprKind::Unary(_, expr)
+            | ExprKind::YulMember(expr, _) => expr.visit(f)?,
+            ExprKind::Assign(lhs, _, rhs) | ExprKind::Binary(lhs, _, rhs) => {
+                lhs.visit(f)?;
+                rhs.visit(f)?;
+            }
+            ExprKind::Index(expr, index) => {
+                expr.visit(f)?;
+                if let Some(index) = index {
+                    index.visit(f)?;
+                }
+            }
+            ExprKind::Slice(expr, start, end) => {
+                expr.visit(f)?;
+                if let Some(start) = start {
+                    start.visit(f)?;
+                }
+                if let Some(end) = end {
+                    end.visit(f)?;
+                }
+            }
+            ExprKind::Ternary(cond, true_, false_) => {
+                cond.visit(f)?;
+                true_.visit(f)?;
+                false_.visit(f)?;
+            }
+            ExprKind::Array(exprs) => {
+                for expr in *exprs {
+                    expr.visit(f)?;
+                }
+            }
+            ExprKind::Tuple(exprs) => {
+                for expr in exprs.iter().flatten() {
+                    expr.visit(f)?;
+                }
+            }
+            ExprKind::Err(_)
+            | ExprKind::Ident(_)
+            | ExprKind::Lit(_)
+            | ExprKind::New(_)
+            | ExprKind::TypeCall(_)
+            | ExprKind::Type(_) => {}
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -1629,6 +1866,13 @@ pub struct NamedArg<'hir> {
     pub value: Expr<'hir>,
 }
 
+impl NamedArg<'_> {
+    /// Returns the declaration-order parameter index for this named argument.
+    pub(crate) fn parameter_index(&self, parameter_names: &[Option<Symbol>]) -> Option<usize> {
+        parameter_names.iter().position(|&name| name == Some(self.name.name))
+    }
+}
+
 /// Function call options: `foo{ gas: 100_000 }`.
 #[derive(Clone, Copy, Debug)]
 pub struct CallOptions<'hir> {
@@ -1684,6 +1928,25 @@ impl<'hir> CallArgs<'hir> {
         &self,
     ) -> impl ExactSizeIterator<Item = &Expr<'hir>> + DoubleEndedIterator + Clone {
         self.kind.exprs()
+    }
+
+    /// Returns the source argument bound to the parameter at `index`.
+    ///
+    /// `parameter_names` is only required for named arguments and must be in declaration order.
+    pub fn argument_for_parameter(
+        &self,
+        index: usize,
+        parameter_names: Option<&[Option<Symbol>]>,
+    ) -> Option<&'hir Expr<'hir>> {
+        match self.kind {
+            CallArgsKind::Unnamed(exprs) => exprs.get(index),
+            CallArgsKind::Named(args) => {
+                let parameter_names = parameter_names?;
+                args.iter()
+                    .find(|arg| arg.parameter_index(parameter_names) == Some(index))
+                    .map(|arg| &arg.value)
+            }
+        }
     }
 }
 
@@ -1748,7 +2011,7 @@ pub struct Type<'hir> {
     pub kind: TypeKind<'hir>,
 }
 
-impl<'hir> Type<'hir> {
+impl Type<'_> {
     /// Dummy placeholder type.
     pub const DUMMY: Self =
         Self { span: Span::DUMMY, kind: TypeKind::Err(ErrorGuaranteed::new_unchecked()) };
@@ -1758,10 +2021,21 @@ impl<'hir> Type<'hir> {
         self.span == Span::DUMMY && matches!(self.kind, TypeKind::Err(_))
     }
 
+    /// Returns an error referenced by this type.
+    pub fn references_error(&self, hir: &Hir<'_>) -> Result<(), ErrorGuaranteed> {
+        match self.visit(hir, &mut |ty| match ty.kind {
+            TypeKind::Err(guar) => ControlFlow::Break(guar),
+            _ => ControlFlow::Continue(()),
+        }) {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(guar) => Err(guar),
+        }
+    }
+
     pub fn visit<T>(
         &self,
-        hir: &Hir<'hir>,
-        f: &mut impl FnMut(&Self) -> ControlFlow<T>,
+        hir: &Hir<'_>,
+        f: &mut impl FnMut(&Type<'_>) -> ControlFlow<T>,
     ) -> ControlFlow<T> {
         f(self)?;
         match self.kind {
@@ -1850,6 +2124,38 @@ pub struct TypeMapping<'hir> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_projections() {
+        let function = FunctionId::new(1);
+        let variable = VariableId::new(2);
+
+        assert_eq!(Res::Item(ItemId::Function(function)).as_function(), Some(function));
+        assert_eq!(Res::Item(ItemId::Variable(variable)).as_function(), None);
+        assert_eq!(Res::Builtin(Builtin::Require).as_builtin(), Some(Builtin::Require));
+        assert_eq!(Res::Item(ItemId::Variable(variable)).as_builtin(), None);
+    }
+
+    #[test]
+    fn expression_variable_resolution_is_unambiguous() {
+        let variable = VariableId::new(1);
+        let function = FunctionId::new(2);
+        let variable_res = [Res::Item(ItemId::Variable(variable))];
+        let variable_expr =
+            Expr { id: ExprId::new(1), kind: ExprKind::Ident(&variable_res), span: Span::DUMMY };
+        let paren_values = [Some(&variable_expr)];
+        let paren_expr =
+            Expr { id: ExprId::new(2), kind: ExprKind::Tuple(&paren_values), span: Span::DUMMY };
+        assert_eq!(paren_expr.as_res(), Some(Res::Item(ItemId::Variable(variable))));
+        assert_eq!(paren_expr.as_variable(), Some(variable));
+
+        let ambiguous_res =
+            [Res::Item(ItemId::Variable(variable)), Res::Item(ItemId::Function(function))];
+        let ambiguous_expr =
+            Expr { id: ExprId::new(3), kind: ExprKind::Ident(&ambiguous_res), span: Span::DUMMY };
+        assert_eq!(ambiguous_expr.as_res(), None);
+        assert_eq!(ambiguous_expr.as_variable(), None);
+    }
 
     // Ensure that we track the size of individual HIR nodes.
     #[test]

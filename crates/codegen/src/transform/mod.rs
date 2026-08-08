@@ -1,56 +1,41 @@
 //! Optimization and transformation passes for the Solar compiler.
 
-mod adce;
-mod cfg_simplify;
-mod check_elim;
-mod cse;
-mod dce;
-mod frame_promotion;
-mod gvn;
-mod indvar_simplify;
-mod inline;
-mod inst_simplify;
-mod jump_threading;
-mod load_pre;
-mod loop_canonicalize;
-mod loop_opt;
-mod memory_dse;
-mod pre;
-mod pure_eval;
-mod sccp;
-mod storage_dse;
-mod storage_load_cse;
-mod storage_promotion;
-
-pub use adce::{AdcePass, AdceStats, AggressiveDeadCodeEliminator};
-pub use cfg_simplify::{
-    CfgSimplifier, CfgSimplifyPass, CfgSimplifyStats, DeadFunctionEliminator, FunctionDcePass,
-    simplify_cfg, simplify_module_cfg,
-};
-pub use check_elim::{CheckElimPass, CheckElimStats, CheckEliminator};
-pub use cse::{CommonSubexprEliminator, CsePass};
-pub use dce::{DcePass, DceStats, DeadCodeEliminator};
-pub use frame_promotion::{
-    FramePromotionStats, FrameSlotPromoter, FrameSlotPromotionPass, PromotedSlot,
-    PromotedSlotSummary,
-};
-pub use gvn::{GlobalValueNumberer, GvnPass};
-pub use indvar_simplify::{IndVarSimplifier, IndVarSimplifyPass, IndVarSimplifyStats};
-pub use inline::{
-    FunctionInlineInfo, InlineAnalyzer, InlineConfig, InlineDecision, InlinePass, InlineStats,
-    MirInlineConfig, MirInlineStats, MirInliner, OptLevel,
-};
-pub use inst_simplify::{InstSimplifier, InstSimplifyPass};
-pub use jump_threading::{JumpThreader, JumpThreadingPass, JumpThreadingStats};
-pub use load_pre::{LoadPrePass, LoadPreStats, LoadRedundancyEliminator};
-pub use loop_canonicalize::{LoopCanonicalizePass, LoopCanonicalizeStats, LoopCanonicalizer};
-pub use loop_opt::{LicmPass, LoopOptConfig, LoopOptStats, LoopOptimizer};
-pub use memory_dse::{MemoryDsePass, MemoryStoreEliminator};
-pub use pre::{PartialRedundancyEliminator, PrePass, PreStats};
-pub use pure_eval::{PureEvalPass, PureEvalStats, PureEvaluator};
-pub use sccp::{SccpPass, SccpStats, SccpTransformPass};
-pub use storage_dse::{StorageDsePass, StorageStoreEliminator};
-pub use storage_load_cse::{StorageLoadCse, StorageLoadCsePass};
-pub use storage_promotion::{
-    StoragePromotionStats, StorageScalarPromoter, StorageScalarPromotionPass,
-};
+pub(crate) mod adce;
+pub(crate) mod cfg_simplify;
+pub(crate) mod check_elim;
+pub(crate) mod copy_elision;
+pub(crate) mod cse;
+pub(crate) mod dce;
+pub(crate) mod evm_inst_schedule;
+pub(crate) mod frame_promotion;
+pub(crate) mod gvn;
+pub(crate) mod indvar_simplify;
+pub(crate) mod inline;
+pub(crate) mod inst_simplify;
+pub(crate) mod jump_threading;
+pub(crate) mod load_pre;
+pub(crate) mod loop_canonicalize;
+pub(crate) mod loop_opt;
+pub(crate) mod lower_abi;
+pub(crate) mod lower_abi_encode;
+pub(crate) mod lower_aggregates;
+pub(crate) mod lower_alloc;
+pub(crate) mod lower_dispatch;
+pub(crate) mod lower_evm_shaped;
+pub(crate) mod lower_immutables;
+pub(crate) mod lower_mapping_slots;
+pub(crate) mod lower_mcopy;
+pub(crate) mod lower_memory_objects;
+pub(crate) mod lower_memory_zero;
+pub(crate) mod lower_slices;
+pub(crate) mod memory_dse;
+pub(crate) mod outline_reverts;
+pub(crate) mod pre;
+pub(crate) mod pure_eval;
+pub(crate) mod sccp;
+pub(crate) mod sroa;
+pub(crate) mod static_alloc;
+pub(crate) mod storage_dse;
+pub(crate) mod storage_load_cse;
+pub(crate) mod storage_promotion;
+mod utils;

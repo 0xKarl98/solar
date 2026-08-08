@@ -26,34 +26,50 @@
 use crate::{
     analysis::CfgInfo,
     mir::{
-        BlockId, Function, InstKind, Terminator, Value, ValueId, utils::repair_reachability_phis,
+        BlockId, Function, InstKind, Module, Terminator, Value, ValueId,
+        utils::repair_reachability_phis,
     },
-    pass::FunctionPass,
+    pass::{MirPass, run_function_pass},
 };
 use alloy_primitives::U256;
-use solar_data_structures::map::{FxHashMap, FxHashSet};
+use solar_data_structures::{
+    index::{IndexVec, index_vec},
+    map::{FxHashMap, FxHashSet},
+};
+use std::rc::Rc;
+
+/// Function pass for range-based overflow-check elimination.
+pub(crate) struct CheckElim;
+
+impl MirPass for CheckElim {
+    fn name(&self) -> &'static str {
+        "check-elim"
+    }
+
+    fn run_pass(
+        &self,
+        _gcx: solar_sema::Gcx<'_>,
+        module: &mut Module,
+        analyses: &mut crate::pass::ModuleAnalyses,
+    ) -> bool {
+        run_function_pass(module, analyses, |func, analyses| {
+            let mut eliminator = CheckEliminator::new();
+            eliminator.cfg = Some(Rc::clone(&analyses.cfg));
+            let changed = eliminator.run(func) != 0;
+            let repaired = repair_reachability_phis(func);
+            changed || repaired
+        })
+    }
+}
 
 /// Maximum recursion depth when evaluating value ranges and conditions.
 const MAX_DEPTH: usize = 12;
 
 /// Statistics from check elimination.
 #[derive(Debug, Default, Clone)]
-pub struct CheckElimStats {
+struct CheckElimStats {
     /// Number of branches folded to unconditional jumps.
-    pub branches_folded: usize,
-}
-
-/// Function pass adapter for range-based overflow-check elimination.
-pub struct CheckElimPass;
-
-impl FunctionPass for CheckElimPass {
-    fn name(&self) -> &str {
-        "check-elim"
-    }
-
-    fn run_on_function(&mut self, func: &mut Function) -> bool {
-        CheckEliminator::new().run(func) != 0
-    }
+    branches_folded: usize,
 }
 
 /// An inclusive unsigned 256-bit interval.
@@ -109,9 +125,11 @@ fn ordered(a: ValueId, b: ValueId) -> (ValueId, ValueId) {
 
 /// Range-based overflow-check eliminator.
 #[derive(Default)]
-pub struct CheckEliminator {
+struct CheckEliminator {
+    /// Shared CFG snapshot taken at entry, matching the previous fresh build.
+    cfg: Option<Rc<CfgInfo>>,
     /// Statistics from the last run.
-    pub stats: CheckElimStats,
+    stats: CheckElimStats,
     ranges: FxHashMap<ValueId, Range>,
     relations: FxHashSet<Relation>,
     range_undo: Vec<(ValueId, Option<Range>)>,
@@ -121,26 +139,22 @@ pub struct CheckEliminator {
 impl CheckEliminator {
     /// Creates a new check eliminator.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     /// Runs check elimination on a function. Returns the number of folded
     /// branches.
-    pub fn run(&mut self, func: &mut Function) -> usize {
+    fn run(&mut self, func: &mut Function) -> usize {
         self.stats = CheckElimStats::default();
-        if func.blocks.is_empty() {
-            return 0;
-        }
-
-        let cfg = CfgInfo::new(func);
+        let cfg = self.cfg.as_ref().map_or_else(|| Rc::new(CfgInfo::new(func)), Rc::clone);
 
         // Predecessors recomputed from reachable terminators: facts must only
         // come from edges that can actually execute.
-        let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); func.blocks.len()];
+        let mut preds = index_vec![Vec::new(); func.blocks.len()];
         for &block in cfg.rpo() {
             for &succ in cfg.successors(block) {
-                preds[succ.index()].push(block);
+                preds[succ].push(block);
             }
         }
 
@@ -156,7 +170,6 @@ impl CheckEliminator {
         for &(block, keep) in &folds {
             func.blocks[block].terminator = Some(Terminator::Jump(keep));
         }
-        repair_reachability_phis(func);
         self.stats.branches_folded = folds.len();
         folds.len()
     }
@@ -167,7 +180,7 @@ impl CheckEliminator {
         &mut self,
         func: &Function,
         cfg: &CfgInfo,
-        preds: &[Vec<BlockId>],
+        preds: &IndexVec<BlockId, Vec<BlockId>>,
     ) -> Vec<(BlockId, BlockId)> {
         enum Walk {
             Enter(BlockId),
@@ -175,7 +188,7 @@ impl CheckEliminator {
         }
 
         let mut folds = Vec::new();
-        let mut stack = vec![Walk::Enter(func.entry_block)];
+        let mut stack = vec![Walk::Enter(BlockId::ENTRY)];
         while let Some(item) = stack.pop() {
             match item {
                 Walk::Exit { range_mark, relation_mark } => {
@@ -600,15 +613,10 @@ impl CheckEliminator {
 /// the branch condition of its sole predecessor and whether it is true.
 fn dominating_edge_fact(
     func: &Function,
-    preds: &[Vec<BlockId>],
+    preds: &IndexVec<BlockId, Vec<BlockId>>,
     block: BlockId,
 ) -> Option<(ValueId, bool)> {
-    // The entry executes before any branch, so no edge fact holds on it even
-    // if malformed input gives it a predecessor.
-    if block == func.entry_block {
-        return None;
-    }
-    let preds = &preds[block.index()];
+    let preds = &preds[block];
     let (&first, rest) = preds.split_first()?;
     if rest.iter().any(|&pred| pred != first) {
         return None;
@@ -640,7 +648,7 @@ fn const_of(func: &Function, value: ValueId) -> Option<U256> {
 
 fn inst_kind(func: &Function, value: ValueId) -> Option<&InstKind> {
     match func.value(value) {
-        Value::Inst(inst_id) => Some(&func.instructions[*inst_id].kind),
+        Value::Inst(inst_id) => Some(&func.inst(*inst_id).kind),
         _ => None,
     }
 }

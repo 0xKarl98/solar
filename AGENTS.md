@@ -17,12 +17,14 @@ cargo llvm-cov nextest --workspace     # Test coverage
 cargo uitest                           # Run UI tests
 cargo uibless                          # Update UI test expectations
 cargo fmt --all                        # Format
-cargo clippy --workspace --all-targets # Lint
+cargo cl                               # Lint
 cargo run -- file.sol                  # Run compiler
 cargo run -- -Zhelp                    # Unstable flags help
 ```
 
 DO NOT USE `cargo test` DIRECTLY IF YOU CAN AVOID IT.
+
+NEVER RUN TESTS WITH `--all-features`. This enables "tracy" which has heavy overhead per-process, which the UI tests spawn lots of, increasing test times to minutes and 100% CPU for no reason.
 
 ## Architecture
 
@@ -42,17 +44,68 @@ Pipeline: Lexing -> Parsing -> Semantic Analysis -> MIR -> EVM backend -> byteco
   mem2reg/frame-slot promotion, inlining, CSE/GVN/PRE, SCCP, LICM, and loop
   analysis.
 - **EVM IR** is the lower, Machine-IR-like backend layer. It comes after
-  function calls have been lowered away and is intentionally untyped: values are
-  EVM stack words, not Solidity or MIR typed values. It models asm-like basic
-  blocks with opcode-like instructions, explicit physical stack operations
+  function calls and virtual values have been lowered away. It models asm-like
+  basic blocks with opcode-like instructions, explicit physical stack operations
   (`dupN`, `swapN`, `pop`), and explicit terminators such as jumps, returns,
-  reverts, and stops. Use it for target-specific block layout, cold/revert-path
-  handling, backend peepholes, stack scheduling, and final assembly preparation.
-- Stack scheduling belongs at EVM IR: materialize virtual stack-word operands
-  into `dupN`/`swapN`/`pop` there, then run backend passes over the scheduled
-  machine-like form before final assembly.
+  reverts, and stops. Use it for target-specific CFG simplification, terminal
+  block deduplication and tail merging, cold/revert-path handling, backend
+  peepholes, computation and constant outlining, block layout, and
+  address-sensitive code placement.
+- Stack scheduling belongs in the MIR-to-EVM lowering boundary. Keep MIR value
+  identities and virtual stack layouts in the scheduler's private representation,
+  materialize `dupN`/`swapN`/`pop`, and emit already-scheduled EVM IR directly.
+- Keep the assembler primitive. Lower block EVM IR once into a compact stream
+  containing only opcodes, label definitions/references, deferred pushes, and
+  immutable placeholders. The assembler resolves deferred values, computes the
+  least fixed point of label offsets and PUSH widths, and emits bytes. PUSH
+  widths cannot generally be selected in one forward pass because widening one
+  forward reference can move a later target across another width boundary.
+- Do not add CFG cleanup, peepholes, deduplication, outlining, layout, or other
+  optimization logic to the compact assembly stream. Add those transforms to
+  block EVM IR, where control-flow edges and block identity remain explicit.
 - Keep the layers separate: MIR should not grow EVM stack-layout details, and
   EVM IR should not rediscover high-level Solidity typing or call semantics.
+
+### MIR Phases
+
+MIR is a phased IR, like rustc's MIR: a `Module` carries a `MirPhase`, phases
+only move forward (the enum order is the lowering order), and the phase
+round-trips through the text format as `@module Name` and `@phase ...` (printed
+only when not the default). The phases, in order:
+
+- `built`: fresh from HIR lowering — one MIR function per Solidity function,
+  typed values, dispatch and ABI handling not yet materialized as MIR.
+- `optimized`: the canonical pass pipeline has run
+  (`run_pipeline` is the phase transition; ad-hoc
+  `-Zmir-pipeline` pass lists do not advance the phase).
+- `abi`: each external function is a self-decoding wrapper — it decodes
+  calldata into typed arguments and calls the original body as an internal
+  function; the body keeps its fused external termination. Produced by the
+  `lower-abi` pass.
+- `dispatch`: the selector switch is an ordinary MIR `entry` function routing to
+  the ABI wrappers through `tail_call` terminators (control transfers and does
+  not return, matching the wrappers' external termination). Produced by the
+  `lower-dispatch` pass, which requires the `abi` phase.
+- `memory-lowered`: semantic memory-object layouts and accesses have been
+  lowered through the selected memory-layout policy to physical pointer and
+  word operations. Produced by the `lower-memory-objects` pass.
+- `evm-shaped`: every call edge either returns or is an explicit `tail_call`
+  (arguments included), the shape the backend expects. Produced by the
+  `lower-evm-shaped` pass; argument-carrying tail calls are only formed for
+  callees the backend statically frames, so their arguments store at
+  compile-time frame addresses with no return address pushed.
+
+The `lower-abi`, `lower-dispatch`, `lower-memory-objects`, `lower-alloc`, and
+`lower-evm-shaped` passes are progressive MIR-to-MIR lowering, moving dispatch,
+ABI handling, and memory layout out of the backend. They run in the codegen
+pipeline and the backend only consumes the `evm-shaped` module, with the MIR
+`entry` as the runtime prologue and `tail_call` lowered to a jump. A module
+where a required lowering pass bails keeps its earlier phase and codegen
+reports it as unsupported. When extending them or adding the next phase, make
+the transition a named pass that advances the phase via
+`Module::advance_phase`, keep it conservative (bail rather than miscompile —
+`lower-abi` skips dynamic types), and pin it with `.mir` UI tests under
+`tests/ui/codegen/mir/`.
 
 ### Visitor Pattern
 
@@ -76,12 +129,31 @@ fn visit_expr(&mut self, expr: &'ast Expr) -> ControlFlow<Self::BreakValue> {
 - Auxiliary files go in an `auxiliary/` subdirectory next to the UI test that needs
   imports or secondary source files. Do not use `aux/`: Windows rejects it.
 
+When the same or similar source needs to be tested with different compiler flags,
+passes, optimization levels, EVM versions, or output modes, prefer one revisioned
+UI test using `//@ revisions:` and revision-scoped directives over multiple files
+with a common prefix. Keep separate files when the source text itself is the
+behavior under test or combining the cases would hide materially different
+programs or purposes.
+
 ### Codegen / MIR Pass Tests
 
-- Prefer UI tests for MIR/codegen behavior. Put MIR pass tests under
-  `tests/ui/codegen/mir/` and codegen lowering tests under `tests/ui/codegen/`.
+- Prefer UI tests for MIR/codegen behavior. Organize codegen tests by layer:
+  - Solidity-to-IR lowering tests go under `tests/ui/codegen/lowering/`.
+  - MIR optimization tests go under `tests/ui/codegen/mir/<pass-name>/`, using
+    the pass's command-line name for the directory.
+  - Progressive MIR lowering pass tests (`lower-abi`, `lower-dispatch`, and
+    `lower-evm-shaped`) go together under `tests/ui/codegen/mir/lowering/`.
+  - EVM IR optimization tests go under `tests/ui/codegen/evm-ir/<pass-name>/`,
+    using the `-Zevm-ir-pipeline` pass name for the directory.
+  - Pass-free round-trip fixtures, pipeline tests, and validation tests belong
+    in their existing `none/`, `pipeline/`, or `validation/` directories.
+- Keep each fixture's `.stdout` or `.stderr` expectation beside its source
+  file when moving or adding tests.
 - Do not add Rust unit tests that execute whole optimization passes; they make
   pass APIs harder to refactor. Use unit tests only for small pure helpers.
+- In Rust tests that assert generated EVM bytecode, disassemble it and snapshot
+  the opcode text; do not compare raw byte arrays or individual byte offsets.
 - Validate pass output with MIR snapshots or FileCheck-style UI expectations,
   then add runtime or differential tests when behavior can affect bytecode
   execution.
@@ -99,30 +171,70 @@ contract Test {
 }
 ```
 
-Annotations: `//~ ERROR:`, `//~ WARN:`, `//~ NOTE:`, `//~ HELP:`
-Use `^` or `v` to point to lines above/below.
+Annotations: `//~ ERROR:`, `//~ WARN:`, `//~ NOTE:`, `//~ HELP:`, `//~ ICE:`,
+and `//~ diagnostic_code`. Use `^` or `v` to point to lines above/below, `|`
+to add another annotation for the same line, and `?` for a diagnostic without a
+location in the test file.
+
+The UI runner infers the expected exit status from annotations. `ERROR`, `ICE` 
+annotations expect status 1; tests without them expect status 0.
+Do not add `check-pass` or `check-fail` to ordinary tests.
+Use an explicit status directive only when the inferred status is wrong
+for the test.
 
 Common file-level UI directives:
 
 - `//@ compile-flags: ...`: Pass extra compiler flags for this test.
-- `//@ error-in-other-file: ...`: Expect a diagnostic with this text in an
-  imported/auxiliary source.
+- `//@ check-pass`: Mark the test as expected to pass even if no inline
+  diagnostic annotation appears in the primary file.
 - `//@ check-fail`: Mark the test as expected to fail even if no inline
   diagnostic annotation appears in the primary file.
+- `//@ failure-status: N`: Override the inferred exit status, for example when
+  testing a nonstandard failure status.
 - `//@ ignore-host: windows`: Skip a test on a specific host.
 - `//@[name] compile-flags: ...`: Define revision-specific flags for tests with
   multiple revisions.
+- `//@ run-call: add 1, 2 => 3`: Deploy a fresh contract, ABI-encode and call the
+  named function, then compare its ABI-encoded return values. Omit `=>` when no
+  return data is expected. Raw calldata and return data may be written as hex.
+  Add settings after a semicolon, for example
+  `add 2; constructor=[40], gas=100000, value=3 => 45`. Settings are
+  comma-separated. `constructor=[...]` supplies ABI-encoded constructor
+  arguments, `gas` sets the call transaction's gas limit, and `value` sets its
+  value in wei. Numeric settings accept decimal and `0x`-prefixed integers.
+  Deployment and `setUp()` use the default gas limit and zero value.
+- `//@ run-call-fail: fail()`: Like `run-call`, but require the call to fail.
+  Add `=> 0x...` to check exact revert data. Both directives use the EVM version
+  selected by `--evm-version`. Calls to functions named `test*` run a
+  zero-argument `setUp()` first when the contract defines it.
 - `//@ filecheck: ...`: Run LLVM FileCheck against the generated `.stdout` file
   after the UI test. Arguments after `filecheck:` are passed directly to
   FileCheck, for example `--check-prefix=ABI` or
   `--implicit-check-not=UnusedSymbol`.
+
+Prefer `run-call` and `run-call-fail` for small runtime checks that fit one
+isolated entry-point call and an exact output or failure expectation. Each
+directive deploys a fresh contract, so calls never share state. Put more
+complex runtime tests under `tests/foundry/` and run them with
+`cargo tq foundry`. Use Foundry for multi-transaction sequences, persistent
+state, multiple actors or contracts, event assertions, cheatcodes, and complex
+setup.
 
 Use FileCheck when exact full-output snapshots are too brittle or when a test
 needs to assert selected output properties such as ordering, presence, or
 absence. Put `// CHECK:`, `// CHECK-LABEL:`, `// CHECK-NOT:`, and related
 directives in the test source. Keep checks specific enough to fail for the bug
 being covered, and prefer `CHECK-LABEL` to anchor checks to the relevant
-contract/module section when the output contains multiple sections.
+contract/module section when the output contains multiple sections. Avoid using
+custom `--check-prefix` and use the default `CHECK` if only one prefix is present
+in the file, e.g. no revisions.
+
+Follow the [FileCheck reference](https://llvm.org/docs/CommandGuide/FileCheck.html):
+
+- Put checks immediately above the function or block they cover.
+- Keep labels and patterns short; omit full signatures and unrelated IR.
+- Capture changing values with `[[NAME:regex]]` and reuse them as `[[NAME]]`.
+- Generally keep filechecks for one function in one comment block.
 
 ### Porting Tests from Solc
 
@@ -221,6 +333,7 @@ Default format (conventional commits): `type: description` (feat, fix, perf, cho
 - Put module documentation at the top of the module file with inner doc comments (`//! ...`), not on the `mod` item in the parent module.
 - NEVER put imports inside functions unless required for `#[cfg(...)]` gating. All imports go at the top of the file.
 - Group all `use` imports together. Keep `pub use` imports in a separate group. For local module re-exports, write `mod x;` before `pub use x;`; for re-exporting another module or external crate, use `use x;`, then a blank line, then `pub use y;`, then a blank line before local `mod my_mod; pub use my_mod::*;`.
+- Move ordinary test-only imports into the `#[cfg(test)] mod tests` module instead of gating them individually. Keep crate-level dependency anchors such as `#[cfg(test)] use cc as _;` at crate scope.
 - In `Cargo.toml`, generally group optional dependencies for a feature together. Put a comment immediately above the group containing only the feature name, for example `# jit`.
 - Prefer `let Some(x) = x else { return };` / `let Ok(x) = x else { return };` over `match x { Some(x) => x, _ => return }`.
 - Use `let ... else` only for a single early-exit guard. When multiple conditions or patterns gate the same block, prefer a combined `if let` / `let` chain instead of several sequential `let ... else` statements.
@@ -232,9 +345,73 @@ Default format (conventional commits): `type: description` (feat, fix, perf, cho
 
 ## Notes
 
-- **Symbol comparisons**: Use `sym::name` or `kw::Keyword` instead of `.as_str()` for performance. Add new symbols to `crates/macros/src/symbols.rs`.
-- **Arena allocation**: AST nodes use arenas for performance.
+- **Typed index collections**: Use `IndexVec<I, T>` for every collection indexed by an `I` index
+  type, including local variables; if code repeatedly indexes a collection with `x.index()`, it is
+  probably using the wrong collection type.
+- **Sparse index maps**: Audit every `IndexVec<I, T>` for default or sentinel entries, not only
+  `Option<T>` and its `None` sentinel. Empty collections, zero counts, maximum IDs, and other
+  distinguished values can also indicate sparse storage. Measure representative occupancy before
+  converting; a sentinel alone does not make storage sparse. Use `FxHashMap<I, T>` and omit the
+  sentinel only when it dominates enough to justify hashing instead of direct indexing.
+- **Index sets**: Never use `Vec<bool>`; a bitset is always the more compact representation. Prefer
+  fixed dense or mixed bitsets for compact, stable domains and growable bitsets when new indices
+  may be allocated while the set is live. Use hash sets for sparse sets, especially when there are
+  few entries or the domain is large or unbounded. Iterate set bits with the bitset's built-in
+  iterators; never scan `0..domain_size` and test membership one index at a time.
+- **Symbol comparisons**: Use `sym::name` or `kw::Keyword` instead of `.as_str()` for performance. Add new symbols to the `symbols! { ... }` list in `crates/interface/src/symbol.rs`.
+- **No inline interning of fixed strings**: Never call `Symbol::intern("...")` with a string literal. Add the name to the pre-interned `symbols!` set and use `sym::name`; `Symbol::intern` is only for strings built at runtime.
+- **Arena allocation**: AST nodes use arenas for performance. When needing to allocate on arena, prefer allocating and writing into it if possible, and if not try to use the specialized methods like `alloc_vec`, `alloc_smallvec`, `alloc_from_iter`, etc. See @crates/data-structures/src/bump_ext.rs.
 - **Benchmarks**: See @benches/README.md to benchmark when working on performance-critical code.
 - Do not describe Solar in the third person. This repository is the project:
   say "we", "this codebase", or "the compiler" instead of "Solar does",
   "Solar is", or "Solar supports".
+  - Exception: `docs/SOLC_DIVERGENCE.md` may say `solar` when explicitly
+    contrasting behavior with `solc`.
+
+## Codegen Benchmarking
+
+Rank codegen results in this order: `-Ogas` runtime gas and correctness,
+generated bytecode size in both `-Ogas` and `-Osize`, then compiler time and
+memory use. Treat compile time as a tie-breaker after output quality. Reject a
+candidate whose only win is faster compilation.
+
+Use two corpora for codegen work. The UI codegen files give a fast generated
+size signal. The vendored corpus in `testdata/codegen-runtime` is the source of
+truth for runtime checks and gas.
+
+Build the debug compiler in the current checkout, then run the in-repository
+benchmark before editing. Do not use release builds for routine local tests:
+
+```bash
+cargo build -p solar-compiler --bin solar
+python3 benches/runtime/benchmark.py \
+  --solc /path/to/pinned/solc --solar target/debug/solar \
+  --suite all --allow-failures \
+  --output target/codegen-bench/corpus-baseline.json
+```
+
+Record the baseline before editing. Rebuild and benchmark the candidate in the
+same checkout with distinct output paths. Do not create extra worktrees or
+isolated target directories for routine local comparisons. Compare the
+successful test IDs before aggregating sizes: expected diagnostic fixtures fail
+compilation, and a new failure must not make the candidate total look smaller.
+Compare per-file deltas as well because an aggregate win can hide a large
+regression in one contract.
+
+For the runtime corpus, use the `SOLC_VERSION` pinned in
+`.github/workflows/bench.yml`; the Solidity sources and their upstream commits
+are pinned in `testdata/codegen-runtime/README.md`. Run the command above as a
+quick size screen, then enable the hot gas workload with
+`--gas --gas-profile hot --start-anvil` before accepting an `-Ogas` candidate.
+Always write JSON with `--output`, retain the baseline JSON, and compare the
+same test IDs and gas-call labels. `--allow-failures` keeps an exploratory run
+going; it does not make compiler failures or runtime mismatches acceptable.
+Use the UI codegen corpus for the corresponding `-Osize` screen.
+
+When tuning a pipeline, remove or move one pass group at a time. Record the
+candidate name, exact ordering, UI gas/size reports, CI size report, and hot-gas
+report under `target/codegen-bench/`. Use `-Ztime-passes` on a representative
+large contract to see which repeated pass invocations still change IR, then
+confirm every removal against both corpora. Equal byte counts are not enough:
+compare serialized bytecode and keep the relevant IR snapshots canonical. A
+`changed=false` result on one contract is not evidence that a pass is redundant.

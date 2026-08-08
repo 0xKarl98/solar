@@ -32,50 +32,64 @@
 use crate::{
     analysis::{CfgInfo, DominatorTree},
     mir::{
-        BlockId, Function, Immediate, InstId, InstKind, Instruction, InstructionMetadata, MirType,
-        Terminator, Value, ValueId,
+        BlockId, Function, Immediate, InstId, InstKind, Instruction, InstructionMetadata,
+        MemoryObjectKind, MemoryObjectLayout, MirType, Module, Terminator, Value, ValueId,
         utils::{repair_reachability_phis, split_edge},
     },
-    pass::FunctionPass,
+    pass::{MirPass, run_function_pass},
 };
-use solar_data_structures::map::{FxHashMap, FxHashSet};
+use solar_data_structures::{
+    bit_set::{DenseBitSet, GrowableBitSet},
+    map::{FxHashMap, FxHashSet},
+};
 use std::cmp::Ordering;
+
+/// Function pass for pure expression PRE.
+pub(crate) struct Pre;
+
+impl MirPass for Pre {
+    fn name(&self) -> &'static str {
+        "pre"
+    }
+
+    fn run_pass(
+        &self,
+        _gcx: solar_sema::Gcx<'_>,
+        module: &mut Module,
+        analyses: &mut crate::pass::ModuleAnalyses,
+    ) -> bool {
+        run_function_pass(module, analyses, |func, _| {
+            PartialRedundancyEliminator::new().run(func).total() != 0
+        })
+    }
+}
 
 const MAX_INSERTIONS_PER_REWRITE: usize = 2;
 
 /// Statistics for pure expression PRE.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PreStats {
+struct PreStats {
     /// Number of join-block expressions replaced by PRE phis.
-    pub expressions_eliminated: usize,
+    expressions_eliminated: usize,
     /// Number of predecessor computations inserted.
-    pub expressions_inserted: usize,
+    expressions_inserted: usize,
+    /// Whether CFG backlinks or phi inputs were repaired.
+    reachability_repaired: bool,
 }
 
 impl PreStats {
     /// Returns the total number of MIR edits made by this pass.
-    pub const fn total(self) -> usize {
-        self.expressions_eliminated + self.expressions_inserted
+    const fn total(self) -> usize {
+        self.expressions_eliminated
+            + self.expressions_inserted
+            + self.reachability_repaired as usize
     }
 }
 
 /// Partial redundancy eliminator for pure expressions.
 #[derive(Debug, Default)]
-pub struct PartialRedundancyEliminator {
+struct PartialRedundancyEliminator {
     stats: PreStats,
-}
-
-/// Function pass for pure expression PRE.
-pub struct PrePass;
-
-impl FunctionPass for PrePass {
-    fn name(&self) -> &str {
-        "pre"
-    }
-
-    fn run_on_function(&mut self, func: &mut Function) -> bool {
-        PartialRedundancyEliminator::new().run(func).total() != 0
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -94,6 +108,7 @@ enum ExprKey {
     Or(OperandKey, OperandKey),
     Xor(OperandKey, OperandKey),
     Not(OperandKey),
+    Clz(OperandKey),
     Shl(OperandKey, OperandKey),
     Shr(OperandKey, OperandKey),
     Sar(OperandKey, OperandKey),
@@ -106,6 +121,9 @@ enum ExprKey {
     IsZero(OperandKey),
     Select(OperandKey, OperandKey, OperandKey),
     SignExtend(OperandKey, OperandKey),
+    MemoryObjectData(OperandKey, MemoryObjectKind),
+    MemoryObjectFieldAddr(OperandKey, MemoryObjectLayout, u64),
+    MemoryObjectElementAddr(OperandKey, MemoryObjectLayout, OperandKey),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -126,26 +144,19 @@ struct PreCandidate {
 
 impl PartialRedundancyEliminator {
     /// Creates a new PRE pass.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
-    /// Returns statistics from the most recent run.
-    pub const fn stats(&self) -> PreStats {
-        self.stats
-    }
-
     /// Runs PRE to a fixed point.
-    pub fn run(&mut self, func: &mut Function) -> PreStats {
+    fn run(&mut self, func: &mut Function) -> PreStats {
         self.stats = PreStats::default();
-        repair_reachability_phis(func);
 
-        let mut inst_results = func.inst_results();
         let mut inst_blocks = func.inst_blocks();
 
         let mut eliminated_keys = FxHashSet::default();
-        let mut inserted_insts = FxHashSet::default();
-        let rewrite_limit = func.instructions.len().saturating_mul(2).max(64);
+        let mut inserted_insts = GrowableBitSet::with_capacity(func.num_insts());
+        let rewrite_limit = func.num_insts().saturating_mul(2).max(64);
         let mut rewrites = 0usize;
 
         while rewrites < rewrite_limit {
@@ -155,7 +166,6 @@ impl PartialRedundancyEliminator {
             let batch = self.collect_candidates(
                 func,
                 cfg.dominators(),
-                &inst_results,
                 &inst_blocks,
                 &eliminated_keys,
                 &inserted_insts,
@@ -169,13 +179,12 @@ impl PartialRedundancyEliminator {
                 self.apply_candidate(
                     func,
                     candidate,
-                    &mut inst_results,
                     &mut inst_blocks,
                     &mut eliminated_keys,
                     &mut inserted_insts,
                 );
             }
-            repair_reachability_phis(func);
+            self.stats.reachability_repaired |= repair_reachability_phis(func);
         }
 
         self.stats
@@ -188,17 +197,16 @@ impl PartialRedundancyEliminator {
         &self,
         func: &Function,
         dominators: &DominatorTree,
-        inst_results: &FxHashMap<InstId, ValueId>,
         inst_blocks: &FxHashMap<InstId, BlockId>,
         eliminated_keys: &FxHashSet<(ExprKey, BlockId)>,
-        inserted_insts: &FxHashSet<InstId>,
+        inserted_insts: &GrowableBitSet<InstId>,
         limit: usize,
     ) -> Vec<PreCandidate> {
         let mut batch = Vec::new();
         // Candidates whose analysis would be invalidated by an earlier
         // candidate in this batch are deferred to the next scan.
-        let mut modified_blocks: FxHashSet<BlockId> = FxHashSet::default();
-        let mut eliminated_values: FxHashSet<ValueId> = FxHashSet::default();
+        let mut modified_blocks = DenseBitSet::new_empty(func.blocks.len());
+        let mut eliminated_values = DenseBitSet::new_empty(func.num_values());
 
         'targets: for target in func.blocks.indices() {
             let predecessors = func.unique_predecessors(target);
@@ -212,17 +220,17 @@ impl PartialRedundancyEliminator {
                 }
                 // Termination rule 1: never re-eliminate an instruction this
                 // run inserted.
-                if inserted_insts.contains(&inst) {
+                if inserted_insts.contains(inst) {
                     continue;
                 }
-                let instruction = &func.instructions[inst];
+                let instruction = func.inst(inst);
                 if !Self::is_pre_expression(&instruction.kind) {
                     continue;
                 }
                 let Some(result_ty) = instruction.result_ty else {
                     continue;
                 };
-                let Some(&result) = inst_results.get(&inst) else {
+                let Some(result) = func.inst_result_value(inst) else {
                     continue;
                 };
 
@@ -234,7 +242,6 @@ impl PartialRedundancyEliminator {
                     result_ty,
                     instruction.metadata.clone(),
                     &predecessors,
-                    inst_results,
                     inst_blocks,
                     dominators,
                     eliminated_keys,
@@ -246,7 +253,9 @@ impl PartialRedundancyEliminator {
                     continue;
                 }
                 modified_blocks.insert(candidate.target);
-                modified_blocks.extend(candidate.insertions.iter().map(|(block, _)| *block));
+                for &(block, _) in &candidate.insertions {
+                    modified_blocks.insert(block);
+                }
                 eliminated_values.insert(candidate.result);
                 batch.push(candidate);
             }
@@ -260,14 +269,14 @@ impl PartialRedundancyEliminator {
     /// references a value whose defining instruction the batch removes.
     fn interferes_with_batch(
         candidate: &PreCandidate,
-        modified_blocks: &FxHashSet<BlockId>,
-        eliminated_values: &FxHashSet<ValueId>,
+        modified_blocks: &DenseBitSet<BlockId>,
+        eliminated_values: &DenseBitSet<ValueId>,
     ) -> bool {
-        modified_blocks.contains(&candidate.target)
-            || candidate.insertions.iter().any(|(block, _)| modified_blocks.contains(block))
-            || candidate.incoming.iter().any(|(_, value)| eliminated_values.contains(value))
+        modified_blocks.contains(candidate.target)
+            || candidate.insertions.iter().any(|&(block, _)| modified_blocks.contains(block))
+            || candidate.incoming.iter().any(|&(_, value)| eliminated_values.contains(value))
             || candidate.insertions.iter().any(|(_, kind)| {
-                kind.operands().into_iter().any(|value| eliminated_values.contains(&value))
+                kind.operands().into_iter().any(|value| eliminated_values.contains(value))
             })
     }
 
@@ -281,12 +290,11 @@ impl PartialRedundancyEliminator {
         result_ty: MirType,
         metadata: InstructionMetadata,
         predecessors: &[BlockId],
-        inst_results: &FxHashMap<InstId, ValueId>,
         inst_blocks: &FxHashMap<InstId, BlockId>,
         dominators: &DominatorTree,
         eliminated_keys: &FxHashSet<(ExprKey, BlockId)>,
     ) -> Option<PreCandidate> {
-        let original = &func.instructions[inst].kind;
+        let original = &func.inst(inst).kind;
         let mut incoming = Vec::with_capacity(predecessors.len());
         let mut insertions = Vec::new();
         let mut available = 0usize;
@@ -298,9 +306,7 @@ impl PartialRedundancyEliminator {
                 return None;
             }
             let key = Self::make_expr_key(func, &translated)?;
-            if let Some(value) =
-                Self::available_value_at_end(func, dominators, pred, &key, inst_results)
-            {
+            if let Some(value) = Self::available_value_at_end(func, dominators, pred, &key) {
                 available += 1;
                 incoming.push((pred, value));
                 continue;
@@ -320,9 +326,7 @@ impl PartialRedundancyEliminator {
         // than before; paths through available predecessors compute it
         // strictly less often. The constant bounds code growth at joins with
         // many predecessors.
-        if insertions.len() > available
-            || insertions.len() > MAX_INSERTIONS_PER_REWRITE.max(available)
-        {
+        if insertions.len() > available || insertions.len() > MAX_INSERTIONS_PER_REWRITE {
             return None;
         }
 
@@ -333,15 +337,14 @@ impl PartialRedundancyEliminator {
         &mut self,
         func: &mut Function,
         candidate: PreCandidate,
-        inst_results: &mut FxHashMap<InstId, ValueId>,
         inst_blocks: &mut FxHashMap<InstId, BlockId>,
         eliminated_keys: &mut FxHashSet<(ExprKey, BlockId)>,
-        inserted_insts: &mut FxHashSet<InstId>,
+        inserted_insts: &mut GrowableBitSet<InstId>,
     ) {
         let PreCandidate { target, inst, result, result_ty, metadata, mut incoming, insertions } =
             candidate;
 
-        if let Some(key) = Self::make_expr_key(func, &func.instructions[inst].kind) {
+        if let Some(key) = Self::make_expr_key(func, &func.inst(inst).kind) {
             eliminated_keys.insert((key, target));
         }
 
@@ -359,15 +362,11 @@ impl PartialRedundancyEliminator {
                 }
                 _ => split_edge(func, pred, target),
             };
-            let new_inst = func.alloc_inst(Instruction {
-                kind,
-                result_ty: Some(result_ty),
-                metadata: metadata.clone(),
-            });
-            let value = func.alloc_value(Value::Inst(new_inst));
+            let mut instruction = Instruction::new(kind, Some(result_ty));
+            instruction.metadata = metadata.clone();
+            let (new_inst, value) = func.alloc_value_inst(instruction);
             func.blocks[block].instructions.push(new_inst);
             incoming.push((block, value));
-            inst_results.insert(new_inst, value);
             inst_blocks.insert(new_inst, block);
             inserted_insts.insert(new_inst);
             self.stats.expressions_inserted += 1;
@@ -386,18 +385,14 @@ impl PartialRedundancyEliminator {
                 first
             }
             _ => {
-                let phi_inst =
-                    func.alloc_inst(Instruction::new(InstKind::Phi(incoming), Some(result_ty)));
-                let phi_value = func.alloc_value(Value::Inst(phi_inst));
+                let (phi_inst, phi_value) = func
+                    .alloc_value_inst(Instruction::new(InstKind::Phi(incoming), Some(result_ty)));
                 let phi_count = func.blocks[target]
                     .instructions
                     .iter()
-                    .take_while(|&&inst_id| {
-                        matches!(func.instructions[inst_id].kind, InstKind::Phi(_))
-                    })
+                    .take_while(|&&inst_id| matches!(func.inst(inst_id).kind, InstKind::Phi(_)))
                     .count();
                 func.blocks[target].instructions.insert(phi_count, phi_inst);
-                inst_results.insert(phi_inst, phi_value);
                 inst_blocks.insert(phi_inst, target);
                 phi_value
             }
@@ -406,7 +401,6 @@ impl PartialRedundancyEliminator {
         let replacements = FxHashMap::from_iter([(result, replacement)]);
         func.replace_uses(&replacements);
         func.blocks[target].instructions.retain(|&inst_id| inst_id != inst);
-        inst_results.remove(&inst);
         inst_blocks.remove(&inst);
         self.stats.expressions_eliminated += 1;
     }
@@ -442,9 +436,9 @@ impl PartialRedundancyEliminator {
         match func.value(value) {
             Value::Inst(inst_id)
                 if inst_blocks.get(inst_id).copied() == Some(target)
-                    && matches!(func.instructions[*inst_id].kind, InstKind::Phi(_)) =>
+                    && matches!(func.inst(*inst_id).kind, InstKind::Phi(_)) =>
             {
-                let InstKind::Phi(incoming) = &func.instructions[*inst_id].kind else {
+                let InstKind::Phi(incoming) = &func.inst(*inst_id).kind else {
                     return None;
                 };
                 incoming.iter().find_map(|(incoming_pred, incoming_value)| {
@@ -475,7 +469,7 @@ impl PartialRedundancyEliminator {
         dominators: &DominatorTree,
     ) -> bool {
         match func.value(value) {
-            Value::Immediate(_) | Value::Arg { .. } | Value::Undef(_) | Value::Error(_) => true,
+            Value::Immediate(_) | Value::Arg(_) | Value::Undef(_) | Value::Error(_) => true,
             Value::Inst(inst) => inst_blocks
                 .get(inst)
                 .is_some_and(|def_block| dominators.dominates(*def_block, block)),
@@ -490,27 +484,21 @@ impl PartialRedundancyEliminator {
         dominators: &DominatorTree,
         block: BlockId,
         key: &ExprKey,
-        inst_results: &FxHashMap<InstId, ValueId>,
     ) -> Option<ValueId> {
         dominators
             .self_and_dominators(block)
             .into_iter()
-            .find_map(|block| Self::available_value_in_block(func, block, key, inst_results))
+            .find_map(|block| Self::available_value_in_block(func, block, key))
     }
 
-    fn available_value_in_block(
-        func: &Function,
-        block: BlockId,
-        key: &ExprKey,
-        inst_results: &FxHashMap<InstId, ValueId>,
-    ) -> Option<ValueId> {
+    fn available_value_in_block(func: &Function, block: BlockId, key: &ExprKey) -> Option<ValueId> {
         func.blocks[block].instructions.iter().rev().find_map(|&inst| {
-            let instruction = &func.instructions[inst];
+            let instruction = func.inst(inst);
             if !Self::is_pre_expression(&instruction.kind) {
                 return None;
             }
             let candidate_key = Self::make_expr_key(func, &instruction.kind)?;
-            (candidate_key == *key).then(|| inst_results.get(&inst).copied()).flatten()
+            (candidate_key == *key).then(|| func.inst_result_value(inst)).flatten()
         })
     }
 
@@ -531,6 +519,7 @@ impl PartialRedundancyEliminator {
                 | InstKind::Or(_, _)
                 | InstKind::Xor(_, _)
                 | InstKind::Not(_)
+                | InstKind::Clz(_)
                 | InstKind::Shl(_, _)
                 | InstKind::Shr(_, _)
                 | InstKind::Sar(_, _)
@@ -543,6 +532,9 @@ impl PartialRedundancyEliminator {
                 | InstKind::IsZero(_)
                 | InstKind::Select(_, _, _)
                 | InstKind::SignExtend(_, _)
+                | InstKind::MemoryObjectData(_, _)
+                | InstKind::MemoryObjectFieldAddr { .. }
+                | InstKind::MemoryObjectElementAddr { .. }
         )
     }
 
@@ -588,6 +580,7 @@ impl PartialRedundancyEliminator {
             InstKind::SMod(a, b) => Some(ExprKey::SMod(operand(*a), operand(*b))),
             InstKind::Exp(a, b) => Some(ExprKey::Exp(operand(*a), operand(*b))),
             InstKind::Not(a) => Some(ExprKey::Not(operand(*a))),
+            InstKind::Clz(a) => Some(ExprKey::Clz(operand(*a))),
             InstKind::Shl(a, b) => Some(ExprKey::Shl(operand(*a), operand(*b))),
             InstKind::Shr(a, b) => Some(ExprKey::Shr(operand(*a), operand(*b))),
             InstKind::Sar(a, b) => Some(ExprKey::Sar(operand(*a), operand(*b))),
@@ -601,6 +594,15 @@ impl PartialRedundancyEliminator {
                 Some(ExprKey::Select(operand(*a), operand(*b), operand(*c)))
             }
             InstKind::SignExtend(a, b) => Some(ExprKey::SignExtend(operand(*a), operand(*b))),
+            InstKind::MemoryObjectData(object, kind) => {
+                Some(ExprKey::MemoryObjectData(operand(*object), *kind))
+            }
+            InstKind::MemoryObjectFieldAddr { object, layout, field } => {
+                Some(ExprKey::MemoryObjectFieldAddr(operand(*object), *layout, *field))
+            }
+            InstKind::MemoryObjectElementAddr { object, layout, index } => {
+                Some(ExprKey::MemoryObjectElementAddr(operand(*object), *layout, operand(*index)))
+            }
             _ => None,
         }
     }
@@ -630,18 +632,12 @@ impl PartialRedundancyEliminator {
             Immediate::Bool(_) => 0,
             Immediate::UInt(_, _) => 1,
             Immediate::Int(_, _) => 2,
-            Immediate::Address(_) => 3,
-            Immediate::FixedBytes(_, _) => 4,
         };
         rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
             (Immediate::Bool(a), Immediate::Bool(b)) => a.cmp(b),
             (Immediate::UInt(a_value, a_bits), Immediate::UInt(b_value, b_bits))
             | (Immediate::Int(a_value, a_bits), Immediate::Int(b_value, b_bits)) => {
                 a_bits.cmp(b_bits).then_with(|| a_value.cmp(b_value))
-            }
-            (Immediate::Address(a), Immediate::Address(b)) => a.cmp(b),
-            (Immediate::FixedBytes(a_value, a_len), Immediate::FixedBytes(b_value, b_len)) => {
-                a_len.cmp(b_len).then_with(|| a_value.cmp(b_value))
             }
             _ => Ordering::Equal,
         })

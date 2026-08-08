@@ -1,0 +1,25 @@
+//@compile-flags: -Zmir-pipeline=lower-slices
+//@filecheck:
+// A returndata slice `(0, returndatasize)` is a first-class slice like calldata
+// and memory. `lower-slices` folds its `slice_ptr`/`slice_len` projections back
+// to the constructor operands and erases the `make_returndata_slice`, leaving a
+// plain `returndatacopy` behind. The slice itself never reaches the word-based
+// backend.
+@module ReturndataSlice
+
+// CHECK-LABEL: {{^[ +].*}}fn @copy_returndata{{[( ]}}
+// CHECK: {{^[ +].*}}[[LENGTH:v[0-9]+]] = returndatasize
+// CHECK: + returndatacopy {{v[0-9]+}}, 0, [[LENGTH]]
+fn @copy_returndata() -> memptr {
+  bb0:
+    v0 = returndatasize
+    v1 = make_returndata_slice 0, v0
+    v2 = slice_ptr v1
+    v3 = slice_len v1
+    v4 = add v3, 32
+    v5 = alloc memorybytes, exact, uninitialized, infallible, v4
+    set_memory_object_len memorybytes, v5, v3
+    v6 = memory_object_data memorybytes, v5
+    returndatacopy v6, v2, v3
+    ret v5
+}

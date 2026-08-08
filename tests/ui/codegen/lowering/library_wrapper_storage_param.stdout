@@ -1,0 +1,112 @@
+// === ROOT/tests/ui/codegen/lowering/library_wrapper_storage_param.sol:DataTypes (runtime) ===
+// === ROOT/tests/ui/codegen/lowering/library_wrapper_storage_param.sol:L (runtime) ===
+@module runtime
+bb0:
+  push 224
+  push 64
+  mstore
+  callvalue
+  push bb4
+  jumpi
+  calldatasize
+  iszero
+  push bb4
+  jumpi
+  push 0
+  calldataload
+  push 224
+  shr
+  dup1
+  push 0xdef537e0
+  eq
+  push bb5
+  jumpi
+  jump bb4
+bb4 [cold]:
+  push 0
+  dup1
+  revert
+bb11 [cold]:
+  push 0x4e487b71
+  push 224
+  shl
+  push 0
+  mstore
+  push 17
+  push 4
+  mstore
+  push 36
+  push 0
+  revert
+bb5:
+  calldatasize
+  push 4
+  swap1
+  sub
+  push 64
+  sgt
+  push bb4
+  jumpi
+  push 2
+  push 4
+  calldataload
+  add
+  dup1
+  push 160
+  mstore
+  dup1
+  sload
+  push 36
+  calldataload
+  dup2
+  add
+  dup1
+  push 192
+  mstore
+  lt
+  swap1
+  pop
+  push bb11
+  jumpi
+  push 192
+  mload
+  push 160
+  mload
+  sstore
+  push 160
+  mload
+  sload
+  push 4
+  calldataload
+  sload
+  dup2
+  add
+  dup1
+  push 160
+  mstore
+  lt
+  push bb11
+  jumpi
+  push 1
+  push 4
+  calldataload
+  add
+  sload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb11
+  jumpi
+  push 192
+  mload
+  push 128
+  mstore
+  push 32
+  push 128
+  return

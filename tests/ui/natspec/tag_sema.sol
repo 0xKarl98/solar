@@ -53,10 +53,9 @@ contract DuplicateAuthor {}
 contract DuplicateTitle {}
 
 contract DuplicateParamBase {
+    // Duplicate `@param` tags are accepted, matching solc.
     /// @param x First documentation
-    //~^ NOTE: previously documented here
     /// @param x Second documentation
-    //~^ ERROR: duplicate documentation for parameter 'x'
     function foo(uint x) public {}
 }
 
@@ -102,6 +101,24 @@ contract InvalidParamName {
     /// @param y Invalid parameter name
     //~^ ERROR: tag `@param` references non-existent parameter 'y'
     function foo(uint x) public {}
+}
+
+contract SelfInheritdoc {
+    /// @inheritdoc SelfInheritdoc
+    //~^ ERROR: tag `@inheritdoc` references contract "SelfInheritdoc", which is not a base of this contract
+    function foo() public {}
+}
+
+contract InheritdocGrandparent {
+    function inherited() public virtual {}
+}
+
+contract InheritdocIntermediate is InheritdocGrandparent {}
+
+contract InvalidIntermediateInheritdoc is InheritdocIntermediate {
+    /// @inheritdoc InheritdocIntermediate
+    //~^ ERROR: tag `@inheritdoc` references contract "InheritdocIntermediate", but the contract does not contain a matching item that can be inherited
+    function inherited() public override {}
 }
 
 contract StructParamDocs {

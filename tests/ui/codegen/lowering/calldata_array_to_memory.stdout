@@ -1,0 +1,596 @@
+// === ROOT/tests/ui/codegen/lowering/calldata_array_to_memory.sol:C (runtime) ===
+@module runtime
+bb0:
+  push 384
+  push 64
+  mstore
+  callvalue
+  push bb7
+  jumpi
+  calldatasize
+  iszero
+  push bb7
+  jumpi
+  push 0
+  calldataload
+  push 224
+  shr
+  dup1
+  push 0x2be02e45
+  eq
+  push bb22
+  jumpi
+  dup1
+  push 0x3ce9e381
+  eq
+  push bb27
+  jumpi
+  dup1
+  push 0x7da1365e
+  eq
+  push bb8
+  jumpi
+  dup1
+  push 0x874b8e9d
+  eq
+  push bb9
+  jumpi
+  jump bb7
+bb7 [cold]:
+  push 0
+  dup1
+  revert
+bb40 [cold]:
+  push 0x4e487b71
+  push 224
+  shl
+  push 0
+  mstore
+  push 17
+  jump bb41
+bb41 [cold]:
+  push 4
+  mstore
+  push 36
+  push 0
+  revert
+bb39 [cold]:
+  push 0x4e487b71
+  push 224
+  shl
+  push 0
+  mstore
+  push 65
+  jump bb41
+bb8:
+  push 0
+  sload
+  jump bb42
+bb42:
+  push 128
+  mstore
+  push 32
+  push 128
+  return
+bb9:
+  calldatasize
+  push 4
+  swap1
+  sub
+  push 32
+  sgt
+  push bb7
+  jumpi
+  push 4
+  push 4
+  calldataload
+  add
+  calldataload
+  dup1
+  push 256
+  mstore
+  push 36
+  push 4
+  calldataload
+  add
+  dup1
+  push 288
+  mstore
+  dup2
+  push 251
+  shr
+  push bb39
+  jumpi
+  dup2
+  push 5
+  shl
+  push 32
+  dup2
+  add
+  push 64
+  mload
+  dup1
+  push 224
+  mstore
+  swap1
+  dup2
+  add
+  push 64
+  mstore
+  dup4
+  dup1
+  push 256
+  mstore
+  dup2
+  mstore
+  swap3
+  pop
+  push 32
+  dup4
+  add
+  dup2
+  dup4
+  dup1
+  push 288
+  mstore
+  dup3
+  calldatacopy
+  pop
+  pop
+  pop
+  push 0
+  push 128
+  mstore
+  push 0
+  push 160
+  mstore
+  pop
+  push 0
+  jump bb14
+bb14:
+  push 224
+  mload
+  mload
+  gt
+  push bb16
+  jumpi
+  push 128
+  mload
+  dup1
+  push 320
+  mstore
+  push 0
+  sstore
+  push 320
+  mload
+  jump bb42
+bb16:
+  push 160
+  mload
+  dup1
+  push 192
+  mstore
+  push 224
+  mload
+  mload
+  dup2
+  lt
+  iszero
+  push bb20
+  jumpi
+  push 32
+  push 224
+  mload
+  add
+  swap1
+  push 32
+  mul
+  add
+  mload
+  push 128
+  mload
+  swap1
+  dup2
+  add
+  dup1
+  push 192
+  mstore
+  lt
+  push bb40
+  jumpi
+  push 192
+  mload
+  push 128
+  mstore
+  push 160
+  mload
+  push 1
+  dup2
+  add
+  dup1
+  push 192
+  mstore
+  lt
+  push bb40
+  jumpi
+  push 192
+  mload
+  push 160
+  mstore
+  push 192
+  mload
+  jump bb14
+bb22:
+  calldatasize
+  push 4
+  swap1
+  sub
+  push 32
+  sgt
+  push bb7
+  jumpi
+  push 64
+  mload
+  dup1
+  push 160
+  mstore
+  push 32
+  dup2
+  add
+  push 64
+  mstore
+  push 0
+  dup2
+  mstore
+  dup1
+  push 160
+  mstore
+  push 128
+  mstore
+  push 4
+  push 4
+  calldataload
+  add
+  calldataload
+  dup1
+  push 192
+  mstore
+  push 36
+  push 4
+  calldataload
+  add
+  dup1
+  push 224
+  mstore
+  dup2
+  push 251
+  shr
+  push bb39
+  jumpi
+  dup2
+  push 5
+  shl
+  push 32
+  dup2
+  add
+  push 64
+  mload
+  dup1
+  push 160
+  mstore
+  swap1
+  dup2
+  add
+  push 64
+  mstore
+  dup4
+  dup1
+  push 192
+  mstore
+  dup2
+  mstore
+  swap3
+  pop
+  push 32
+  dup4
+  add
+  dup2
+  dup4
+  dup1
+  push 224
+  mstore
+  dup3
+  calldatacopy
+  pop
+  pop
+  pop
+  dup1
+  push 160
+  mstore
+  push 128
+  mstore
+  push 160
+  mload
+  mload
+  jump bb42
+bb27:
+  calldatasize
+  push 4
+  swap1
+  sub
+  push 96
+  sgt
+  push bb7
+  jumpi
+  push 64
+  mload
+  dup1
+  push 160
+  mstore
+  push 96
+  dup2
+  add
+  push 64
+  mstore
+  push 4
+  calldataload
+  dup2
+  mstore
+  push 4
+  push 36
+  calldataload
+  add
+  calldataload
+  dup1
+  push 192
+  mstore
+  push 36
+  push 36
+  calldataload
+  add
+  dup1
+  push 224
+  mstore
+  dup2
+  push 251
+  shr
+  swap3
+  pop
+  pop
+  pop
+  push bb39
+  jumpi
+  push 192
+  mload
+  push 5
+  shl
+  push 32
+  dup2
+  add
+  push 64
+  mload
+  dup1
+  push 288
+  mstore
+  swap1
+  dup2
+  add
+  push 64
+  mstore
+  push 192
+  mload
+  dup2
+  mstore
+  push 32
+  dup2
+  add
+  dup3
+  push 224
+  mload
+  dup3
+  calldatacopy
+  pop
+  swap1
+  pop
+  push 32
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  dup2
+  dup1
+  push 288
+  mstore
+  dup2
+  mstore
+  swap1
+  pop
+  push 4
+  push 68
+  calldataload
+  add
+  calldataload
+  dup1
+  push 256
+  mstore
+  push 31
+  dup2
+  add
+  dup1
+  push 224
+  mstore
+  lt
+  swap1
+  pop
+  push bb39
+  jumpi
+  push 31
+  not
+  push 224
+  mload
+  and
+  dup1
+  iszero
+  push 32
+  swap1
+  dup3
+  dup3
+  sub
+  mul
+  swap1
+  pop
+  add
+  dup1
+  push 224
+  mstore
+  push 32
+  dup2
+  add
+  dup1
+  push 320
+  mstore
+  lt
+  push bb39
+  jumpi
+  push 64
+  mload
+  dup1
+  push 288
+  mstore
+  push 320
+  mload
+  dup2
+  add
+  push 64
+  mstore
+  push 256
+  mload
+  dup2
+  mstore
+  push 32
+  dup2
+  add
+  push 32
+  push 224
+  mload
+  sub
+  dup2
+  add
+  push 0
+  swap1
+  mstore
+  push 36
+  push 68
+  calldataload
+  add
+  push 256
+  mload
+  dup2
+  dup4
+  calldatacopy
+  pop
+  pop
+  push 64
+  push 160
+  mload
+  add
+  dup1
+  push 224
+  mstore
+  dup2
+  dup1
+  push 288
+  mstore
+  dup2
+  mstore
+  swap1
+  pop
+  push 160
+  mload
+  mload
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  mload
+  mload
+  push 10
+  dup2
+  mul
+  dup1
+  push 192
+  mstore
+  push 10
+  dup2
+  div
+  swap1
+  swap2
+  eq
+  swap3
+  pop
+  pop
+  pop
+  iszero
+  push bb40
+  jumpi
+  push 192
+  mload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb40
+  jumpi
+  push 224
+  mload
+  mload
+  mload
+  push 100
+  dup2
+  mul
+  dup1
+  push 160
+  mstore
+  push 100
+  dup2
+  div
+  swap1
+  swap2
+  eq
+  swap1
+  pop
+  iszero
+  push bb40
+  jumpi
+  push 160
+  mload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb40
+  jumpi
+  push 160
+  mload
+  jump bb42
+bb20 [cold]:
+  push 0x4e487b71
+  push 224
+  shl
+  push 0
+  mstore
+  push 50
+  jump bb41

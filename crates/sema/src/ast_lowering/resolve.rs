@@ -416,7 +416,12 @@ impl<'gcx> ResolveContext<'gcx> {
                         }
                     }
                     let args = self.lower_call_args(&modifier.arguments);
-                    modifiers.push(hir::Modifier { span: modifier.span(), id, args });
+                    modifiers.push(hir::Modifier {
+                        span: modifier.span(),
+                        name_span: modifier.name.last().span,
+                        id,
+                        args,
+                    });
                 }
                 self.arena.alloc_smallvec(modifiers)
             };
@@ -581,6 +586,7 @@ impl<'gcx> ResolveContext<'gcx> {
             std::iter::zip(&*ast_contract.bases, self.hir.contract(c_id).bases).map(
                 |(ast_base, &base_id)| hir::Modifier {
                     span: ast_base.span(),
+                    name_span: ast_base.name.last().span,
                     id: base_id.into(),
                     args: self.lower_call_args(&ast_base.arguments),
                 },
@@ -1550,7 +1556,7 @@ impl<'gcx> ResolveContext<'gcx> {
                 self.arena.alloc(hir::Expr {
                     id: self.next_id(),
                     kind: hir::ExprKind::Ident(res),
-                    span: path.last().span,
+                    span: path.span(),
                 }),
                 self.lower_call_args(args),
                 None,
@@ -2037,6 +2043,22 @@ impl<'gcx> SymbolResolver<'gcx> {
         }
     }
 
+    pub(crate) fn source_path_resolutions(
+        &self,
+        segments: &[Ident],
+        source: hir::SourceId,
+        contract: Option<hir::ContractId>,
+    ) -> Option<Vec<Vec<Res>>> {
+        let mut scopes = SymbolResolverScopes::new();
+        scopes.init(source, contract);
+        let mut resolutions = Vec::with_capacity(segments.len());
+        self.resolve_paths_with(ast::PathSlice::from_slice(segments), &scopes, |decls| {
+            resolutions.push(decls.iter().map(|decl| decl.res).collect());
+        })
+        .ok()?;
+        Some(resolutions)
+    }
+
     fn resolve_path_as<T: TryFrom<Res>>(
         &self,
         path: &ast::PathSlice,
@@ -2073,11 +2095,21 @@ impl<'gcx> SymbolResolver<'gcx> {
         path: &ast::PathSlice,
         scopes: &'a SymbolResolverScopes,
     ) -> Result<&'a [Declaration], ResolverError> {
+        self.resolve_paths_with(path, scopes, |_| {})
+    }
+
+    fn resolve_paths_with<'a>(
+        &'a self,
+        path: &ast::PathSlice,
+        scopes: &'a SymbolResolverScopes,
+        mut on_segment: impl FnMut(&[Declaration]),
+    ) -> Result<&'a [Declaration], ResolverError> {
         let mut segments = path.segments().iter();
         let name = *segments.next().unwrap();
         let mut decls = self
             .resolve_name_raw(name, scopes)
             .ok_or_else(|| ResolverError::new(name, ResolverErrorKind::Unresolved))?;
+        on_segment(decls);
         for (prev_i, &segment) in segments.enumerate() {
             let [decl] = decls else {
                 return Err(ResolverError::from_path(
@@ -2095,6 +2127,7 @@ impl<'gcx> SymbolResolver<'gcx> {
             decls = scope.resolve(segment).ok_or_else(|| {
                 ResolverError::from_path(path, prev_i + 1, ResolverErrorKind::Unresolved)
             })?;
+            on_segment(decls);
         }
         Ok(decls)
     }

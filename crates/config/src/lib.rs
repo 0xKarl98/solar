@@ -5,8 +5,8 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+use alloy_primitives::Address;
 use std::{fmt, num::NonZeroUsize, sync::OnceLock};
-use strum::EnumIs;
 
 #[macro_use]
 mod macros;
@@ -67,7 +67,7 @@ impl CompilerStage {
 }
 
 str_enum! {
-    /// Source code language.
+    /// Compiler input language.
     #[derive(Default)]
     #[derive(strum::EnumIs)]
     #[strum(serialize_all = "lowercase")]
@@ -76,6 +76,15 @@ str_enum! {
         #[default]
         Solidity,
         Yul,
+        Mir,
+        EvmIr,
+    }
+}
+
+impl Language {
+    /// Returns whether this language is parsed as source code.
+    pub const fn is_source(self) -> bool {
+        matches!(self, Self::Solidity | Self::Yul)
     }
 }
 
@@ -108,6 +117,9 @@ str_enum! {
 }
 
 impl EvmVersion {
+    pub fn can_overcharge_gas_for_call(self) -> bool {
+        self >= Self::TangerineWhistle
+    }
     pub fn supports_returndata(self) -> bool {
         self >= Self::Byzantium
     }
@@ -144,6 +156,9 @@ impl EvmVersion {
     pub fn has_mcopy(self) -> bool {
         self >= Self::Cancun
     }
+    pub fn has_clz(self) -> bool {
+        self >= Self::Osaka
+    }
 }
 
 str_enum! {
@@ -162,6 +177,20 @@ str_enum! {
     }
 }
 
+impl OptimizationMode {
+    /// Returns whether codegen should favor bytecode size over runtime gas (`-O size`).
+    #[inline]
+    pub const fn is_size(self) -> bool {
+        matches!(self, Self::Size)
+    }
+
+    /// Returns whether codegen should favor runtime gas over bytecode size (`-O gas`).
+    #[inline]
+    pub const fn is_gas(self) -> bool {
+        matches!(self, Self::Gas)
+    }
+}
+
 str_enum! {
     /// Type of output for the compiler to emit.
     #[strum(serialize_all = "kebab-case")]
@@ -175,43 +204,60 @@ str_enum! {
         BinRuntime,
         /// Function signature hashes.
         Hashes,
-        /// Textual MIR (mid-level IR) for inspection and FileCheck-style tests.
-        Mir,
     }
 }
 
 impl CompilerOutput {
-    /// Returns `true` for outputs produced by the codegen backend (which lowers
-    /// to MIR), i.e. `bin`, `bin-runtime`, and `mir`.
+    /// Returns `true` for outputs produced by the codegen backend.
     pub fn is_codegen(self) -> bool {
-        matches!(self, Self::Bin | Self::BinRuntime | Self::Mir)
+        matches!(self, Self::Bin | Self::BinRuntime)
     }
 }
 
-/// `-Zdump=kind[=paths...]`.
+/// `-Zdump=kind[,kind...][=paths...]`.
 #[derive(Clone, Debug)]
 pub struct Dump {
-    pub kind: DumpKind,
+    pub kinds: Vec<DumpKind>,
     pub paths: Option<Vec<String>>,
+}
+
+impl Dump {
+    /// Returns whether any requested dump requires the codegen pipeline.
+    pub fn needs_codegen(&self) -> bool {
+        self.kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                DumpKind::Mir
+                    | DumpKind::MirCfg
+                    | DumpKind::EvmIr
+                    | DumpKind::EvmIrRuntime
+                    | DumpKind::DisasmDeploy
+                    | DumpKind::DisasmRuntime
+            )
+        })
+    }
 }
 
 impl std::str::FromStr for Dump {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (kind, paths) = if let Some((kind, paths)) = s.split_once('=') {
+        let (kinds, paths) = if let Some((kinds, paths)) = s.split_once('=') {
             let paths = paths.split(',').map(ToString::to_string).collect();
-            (kind, Some(paths))
+            (kinds, Some(paths))
         } else {
             (s, None)
         };
-        Ok(Self { kind: kind.parse::<DumpKind>().map_err(|e| e.to_string())?, paths })
+        let kinds = kinds
+            .split(',')
+            .map(|kind| kind.parse::<DumpKind>().map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { kinds, paths })
     }
 }
 
 str_enum! {
-    /// What kind of output to dump. See [`Dump`].
-    #[derive(EnumIs)]
+    /// A kind of output to dump. See [`Dump`].
     #[strum(serialize_all = "kebab-case")]
     #[non_exhaustive]
     pub enum DumpKind {
@@ -219,6 +265,18 @@ str_enum! {
         Ast,
         /// Print the HIR.
         Hir,
+        /// Print textual MIR.
+        Mir,
+        /// Print MIR CFGs in DOT format.
+        MirCfg,
+        /// Print creation EVM IR.
+        EvmIr,
+        /// Print runtime EVM IR.
+        EvmIrRuntime,
+        /// Print deployment bytecode disassembly.
+        DisasmDeploy,
+        /// Print runtime bytecode disassembly.
+        DisasmRuntime,
     }
 }
 
@@ -296,6 +354,61 @@ impl fmt::Display for ImportRemapping {
 impl fmt::Debug for ImportRemapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ImportRemapping({self})")
+    }
+}
+
+/// A single library address for linking: `[path.sol:]Name=0xADDRESS`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LibraryAddress {
+    /// The source path, or `None` when the address applies to any source.
+    pub source: Option<String>,
+    /// The library name.
+    pub name: String,
+    /// The library's deployed address.
+    pub address: Address,
+}
+
+impl std::str::FromStr for LibraryAddress {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let Some((name, addr)) = s.split_once('=') else {
+            return Err("missing '='");
+        };
+        let name = name.trim();
+        let (source, name) = if let Some((source, name)) = name.rsplit_once(':') {
+            (Some(source.trim()), name.trim())
+        } else {
+            (None, name)
+        };
+        if name.is_empty() {
+            return Err("empty library name");
+        }
+        let addr = addr.trim();
+        if !addr.starts_with("0x") {
+            return Err("library address must be prefixed with `0x`");
+        }
+        let address = addr.parse().map_err(|_| "invalid library address")?;
+        Ok(Self {
+            source: source.filter(|source| !source.is_empty()).map(str::to_owned),
+            name: name.into(),
+            address,
+        })
+    }
+}
+
+impl fmt::Display for LibraryAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(source) = &self.source {
+            write!(f, "{source}:")?;
+        }
+        write!(f, "{}={:#x}", self.name, self.address)
+    }
+}
+
+impl fmt::Debug for LibraryAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LibraryAddress({self})")
     }
 }
 

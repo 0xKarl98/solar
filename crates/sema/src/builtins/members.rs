@@ -49,7 +49,9 @@ pub(crate) fn native_members<'gcx>(gcx: Gcx<'gcx>, ty: Ty<'gcx>) -> MemberList<'
         TyKind::Module(id) => gcx.symbol_resolver.source_scopes[id]
             .iter()
             .flat_map(|(name, decls)| {
-                decls.iter().map(move |decl| Member::new(name, gcx.type_of_res(decl.res)))
+                decls
+                    .iter()
+                    .map(move |decl| Member::with_res(name, gcx.type_of_res(decl.res), decl.res))
             })
             .collect(),
         TyKind::BuiltinModule(builtin) => builtin
@@ -189,27 +191,41 @@ fn reference<'gcx>(
             fields
                 .iter()
                 .zip(tys)
-                .map(|(&f, &ty)| Member::new(gcx.item_name(f).name, ty.with_loc_if_ref(gcx, loc)))
+                .map(|(&f, &ty)| {
+                    Member::with_res(
+                        gcx.item_name(f).name,
+                        ty.with_loc_if_ref(gcx, loc),
+                        hir::ItemId::Variable(f),
+                    )
+                })
                 .collect()
         }
         (
             TyKind::DynArray(_) | TyKind::Elementary(ElementaryType::Bytes),
             DataLocation::Storage,
         ) => {
-            let inner = if let TyKind::DynArray(inner) = inner.kind {
-                inner.with_loc_if_ref(gcx, loc)
+            let element = if let TyKind::DynArray(element) = inner.kind {
+                element
             } else {
                 gcx.types.fixed_bytes(1)
             };
+            // `push()` returns a reference to the new storage slot, but
+            // `push(x)` takes its argument location-less, like a mapping key:
+            // the value is copied into storage, so any data location converts,
+            // matching solc's direct-storage-reference conversion rule.
             vec![
                 Member::of_builtin(gcx, Builtin::ArrayLength),
                 Member::with_attached_builtin(
                     Builtin::ArrayPush0,
-                    gcx.mk_builtin_fn(&[this], SM::NonPayable, &[inner]),
+                    gcx.mk_builtin_fn(
+                        &[this],
+                        SM::NonPayable,
+                        &[element.with_loc_if_ref(gcx, loc)],
+                    ),
                 ),
                 Member::with_attached_builtin(
                     Builtin::ArrayPush,
-                    gcx.mk_builtin_fn(&[this, inner], SM::NonPayable, &[]),
+                    gcx.mk_builtin_fn(&[this, element], SM::NonPayable, &[]),
                 ),
                 Member::with_attached_builtin(
                     Builtin::ArrayPop,
@@ -230,9 +246,19 @@ fn type_type<'gcx>(gcx: Gcx<'gcx>, ty: Ty<'gcx>) -> MemberListOwned<'gcx> {
     match ty.kind {
         TyKind::Contract(id) => contract_type(gcx, id, None),
         TyKind::Super(id) => super_type(gcx, id),
-        TyKind::Enum(id) => {
-            gcx.hir.enumm(id).variants.iter().map(|v| Member::new(v.name, ty)).collect()
-        }
+        TyKind::Enum(id) => gcx
+            .hir
+            .enumm(id)
+            .variants
+            .iter()
+            .map(|&variant| {
+                Member::with_res(
+                    gcx.hir.variable(variant).name.unwrap().name,
+                    ty,
+                    hir::ItemId::Variable(variant),
+                )
+            })
+            .collect(),
         TyKind::Udvt(inner, _id) => {
             vec![
                 Member::with_builtin(

@@ -1,0 +1,131 @@
+{
+  "contracts": {
+    "ROOT/tests/ui/codegen/lowering/emit_abi_bin.sol:C": {
+      "abi": [
+        {
+          "type": "constructor",
+          "inputs": [
+            {
+              "name": "value",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable"
+        },
+        {
+          "type": "function",
+          "name": "x",
+          "inputs": [],
+          "outputs": [
+            {
+              "name": "",
+              "type": "uint256",
+              "internalType": "uint256"
+            }
+          ],
+          "stateMutability": "view"
+        }
+      ]
+    }
+  },
+  "version": "VERSION"
+}
+// === ROOT/tests/ui/codegen/lowering/emit_abi_bin.sol:C (creation) ===
+// === deployment ===
+@module deployment
+bb0:
+  push 80
+  codesize
+  sub
+  dup1
+  push 80
+  push 192
+  codecopy
+  push 192
+  add
+  push 31
+  add
+  push 31
+  not
+  and
+  push 64
+  mstore
+  push 192
+  mload
+  push 0
+  sstore
+  push 43
+  dup1
+  push 37
+  push 0
+  codecopy
+  push 0
+  return
+
+// === runtime ===
+@module runtime
+bb0:
+  push 160
+  push 64
+  mstore
+  callvalue
+  push bb4
+  jumpi
+  calldatasize
+  iszero
+  push bb4
+  jumpi
+  push 0
+  calldataload
+  push 224
+  shr
+  dup1
+  push 0xc55699c
+  sub
+  push bb4
+  jumpi
+  push 0
+  sload
+  push 128
+  mstore
+  push 32
+  push 128
+  return
+bb4 [cold]:
+  push 0
+  dup1
+  revert
+// === ROOT/tests/ui/codegen/lowering/emit_abi_bin.sol:C (runtime) ===
+@module runtime
+bb0:
+  push 160
+  push 64
+  mstore
+  callvalue
+  push bb4
+  jumpi
+  calldatasize
+  iszero
+  push bb4
+  jumpi
+  push 0
+  calldataload
+  push 224
+  shr
+  dup1
+  push 0xc55699c
+  sub
+  push bb4
+  jumpi
+  push 0
+  sload
+  push 128
+  mstore
+  push 32
+  push 128
+  return
+bb4 [cold]:
+  push 0
+  dup1
+  revert

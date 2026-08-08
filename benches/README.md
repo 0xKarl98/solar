@@ -15,7 +15,7 @@ uv --project benches/analyze run benches/analyze/main.py benches/README.md < ben
 cargo bench -p solar-bench --bench gungraun
 ```
 
-Currently this takes around 30 minutes to complete: `sources (12) * parsers (5) * lexers (2) * 15s`.
+Currently this takes around 30 minutes to complete: `sources (15) * parsers (5) * lexers (2) * 15s`.
 
 This crate is excluded from the main workspace to avoid compiling it (and its dependencies) when
 invoking other commands such as `cargo test`.
@@ -23,6 +23,34 @@ invoking other commands such as `cargo test`.
 ## Results
 
 You can view the Solar-only results on [codspeed.io](https://codspeed.io/paradigmxyz/solar).
+The codegen runtime workflow also publishes `common.json` using the vendored common benchmark
+result schema in [`schema/`](schema/), with wall-time metrics for each suite's compiler and runtime
+work.
+
+The [benchmark workflow](../.github/workflows/bench.yml) runs automatically for pull requests and
+updates to `main`. CodSpeed simulates the single-file and whole-project benchmarks, including
+codegen for selected projects. The workflow can also be dispatched for all benchmark families or
+one selected family: codegen runtime comparisons, CodSpeed, or Gungraun instruction counts.
+Dispatch inputs can select another Solar Git ref as the Gungraun baseline and override the pinned
+solc release.
+
+The codegen runtime job compiles a vendored corpus with both compilers, deploys both artifacts to
+Anvil, executes ordered stateful workloads, and requires normalized return values and cold-path
+observations to match. The corpus contains four micro contracts, including the shared
+`testdata/Counter.sol`, nine minimal import closures from real repositories, and three large
+contracts extracted from the pinned OpenZeppelin and Solady project inputs. Its sources and
+upstream commits are documented in
+[`testdata/codegen-runtime/`](../testdata/codegen-runtime/README.md).
+The runtime harness and its tests are in [`runtime/`](runtime/).
+
+For example, this command benchmarks the `my-branch` candidate with Gungraun, compares it against
+`main`, and skips the codegen runtime and CodSpeed jobs:
+
+```bash
+gh workflow run bench.yml --ref my-branch \
+  -f benchmark=gungraun \
+  -f comparison_ref=main
+```
 
 The following results were achieved on:
 - Target: `x86_64-unknown-linux-gnu`

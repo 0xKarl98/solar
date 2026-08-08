@@ -11,7 +11,10 @@ extern crate tracing;
 
 use indexmap as _;
 use rayon::prelude::*;
-use solar_interface::{Result, Session, config::CompilerStage};
+use solar_interface::{
+    Result, Session,
+    config::{CompilerStage, DumpKind},
+};
 use std::ops::ControlFlow;
 
 // Convenience re-exports.
@@ -41,7 +44,7 @@ pub mod hir;
 pub use hir::Hir;
 
 pub mod ty;
-pub use ty::{Gcx, Ty};
+pub use ty::{Gcx, NatSpecView, Ty};
 
 mod typeck;
 
@@ -58,8 +61,12 @@ pub(crate) fn lower(compiler: &mut CompilerRef<'_>) -> Result<ControlFlow<()>> {
         return Ok(ControlFlow::Break(()));
     }
 
+    if !sess.opts.language.is_source() {
+        return Ok(gcx.advance_stage(CompilerStage::Lowering));
+    }
+
     if let Some(dump) = &sess.opts.unstable.dump
-        && dump.kind.is_ast()
+        && dump.kinds.contains(&DumpKind::Ast)
     {
         dump_ast(sess, &gcx.sources, dump.paths.as_deref())?;
     }
@@ -103,8 +110,12 @@ fn analysis(gcx: Gcx<'_>) -> Result<ControlFlow<()>> {
         return Ok(ControlFlow::Break(()));
     }
 
+    if !gcx.sess.opts.language.is_source() {
+        return Ok(ControlFlow::Continue(()));
+    }
+
     if let Some(dump) = &gcx.sess.opts.unstable.dump
-        && dump.kind.is_hir()
+        && dump.kinds.contains(&DumpKind::Hir)
     {
         dump_hir(gcx, dump.paths.as_deref())?;
     }

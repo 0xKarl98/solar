@@ -2,7 +2,7 @@
 
 use crate::{
     ColorChoice, CompilerOutput, CompilerStage, Dump, ErrorFormat, EvmVersion, HumanEmitterKind,
-    ImportRemapping, Language, OptimizationMode, Threads,
+    ImportRemapping, Language, LibraryAddress, OptimizationMode, Threads,
 };
 use std::{num::NonZeroUsize, path::PathBuf};
 
@@ -79,7 +79,7 @@ pub struct CompileOpts {
         )
     )]
     pub allow_paths: Vec<PathBuf>,
-    /// Source code language. Only Solidity is currently implemented.
+    /// Compiler input language.
     #[cfg_attr(
         feature = "clap",
         arg(help_heading = "Input options", long, value_enum, default_value_t, hide = true)
@@ -98,6 +98,18 @@ pub struct CompileOpts {
     /// MIR optimization objective.
     #[cfg_attr(feature = "clap", arg(short = 'O', long = "optimize", value_enum, default_value_t))]
     pub optimization: OptimizationMode,
+
+    /// Library addresses for linking, as `LibraryName=0xADDRESS`.
+    ///
+    /// An optional `path.sol:` prefix restricts the address to that source. A
+    /// `public`/`external` library function whose library has a linked address
+    /// is called through `DELEGATECALL` at that address instead of being
+    /// inlined into the caller.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long = "libraries", value_name = "NAME=ADDRESS", value_delimiter = ',')
+    )]
+    pub libraries: Vec<LibraryAddress>,
 
     /// Directory to write output files.
     #[cfg_attr(feature = "clap", arg(long, value_hint = ValueHint::DirPath))]
@@ -165,7 +177,10 @@ pub struct CompileOpts {
     ///
     /// See `-Zhelp` for more details.
     #[doc(hidden)]
-    #[cfg_attr(feature = "clap", arg(id = "unstable-features", value_name = "FLAG", short = 'Z'))]
+    #[cfg_attr(
+        feature = "clap",
+        arg(id = "unstable-features", value_name = "FLAG", short = 'Z', global = true)
+    )]
     pub _unstable: Vec<String>,
 
     /// Parsed unstable flags.
@@ -179,12 +194,6 @@ pub struct CompileOpts {
 }
 
 impl CompileOpts {
-    /// Returns whether MIR optimization passes should run during codegen.
-    #[inline]
-    pub const fn optimize_mir(&self) -> bool {
-        !matches!(self.optimization, OptimizationMode::None)
-    }
-
     /// Returns the number of threads to use.
     #[inline]
     pub fn threads(&self) -> NonZeroUsize {
@@ -317,10 +326,18 @@ pub struct UnstableOpts {
     #[cfg_attr(feature = "clap", arg(long))]
     pub no_resolve_imports: bool,
 
+    /// Recovers incomplete input into a partial AST.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub recover_incomplete_input: bool,
+
     /// Print additional information about the compiler's internal state.
     ///
-    /// Valid kinds are `ast` and `hir`.
-    #[cfg_attr(feature = "clap", arg(long, require_equals = true, value_name = "KIND[=PATHS...]"))]
+    /// Valid kinds are `ast`, `hir`, `mir`, `mir-cfg`, `evm-ir`, `evm-ir-runtime`,
+    /// `disasm-deploy`, and `disasm-runtime`.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, require_equals = true, value_name = "KIND[,KIND...][=PATHS...]")
+    )]
     pub dump: Option<Dump>,
 
     /// Print AST stats.
@@ -347,21 +364,40 @@ pub struct UnstableOpts {
     #[cfg_attr(feature = "clap", arg(long))]
     pub print_natspec: bool,
 
-    /// Type check the program. WIP.
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub typeck: bool,
+    /// Comma-separated MIR pass pipeline. Use `default` for the compiler's canonical pipeline and
+    /// `none` for no passes.
+    #[cfg_attr(feature = "clap", arg(long, require_equals = true, value_name = "PASS[,PASS...]"))]
+    pub mir_pipeline: Option<String>,
 
-    /// Print MIR after every MIR optimization pass during codegen.
+    /// Comma-separated EVM IR pass pipeline. Use `default` for the compiler's canonical pipeline
+    /// and `none` for no passes.
+    #[cfg_attr(feature = "clap", arg(long, require_equals = true, value_name = "PASS[,PASS...]"))]
+    pub evm_ir_pipeline: Option<String>,
+
+    /// Print MIR or EVM IR after every optimization pass.
     #[cfg_attr(feature = "clap", arg(long))]
-    pub mir_print_after_each: bool,
+    pub print_after_each: bool,
+
+    /// Print a before-and-after diff for each pass explicitly selected by an IR pipeline.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub pass_diff: bool,
+
+    /// Print the time spent in each MIR and EVM IR pass.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub time_passes: bool,
 
     /// Enable the experimental EVM code generator (MIR lowering and backend).
     ///
-    /// Off by default: MIR and bytecode output is only produced when this is
-    /// set. Codegen is a work in progress and not yet part of the compiler's
-    /// stable, solc-compatible behavior.
+    /// Off by default: MIR, EVM IR, disassembly, and bytecode output are only
+    /// produced when this is set. Codegen is a work in progress and not yet part
+    /// of the compiler's stable, solc-compatible behavior.
     #[cfg_attr(feature = "clap", arg(long))]
     pub codegen: bool,
+
+    /// Lower all contract functions instead of only reachable ones. This is intended for
+    /// benchmarks and compiler debugging.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub codegen_all_functions: bool,
 
     // ----------------------------------------
     // Please add new options above this point!

@@ -1,0 +1,38 @@
+//@compile-flags: -Zmir-pipeline=lower-abi-encode
+//@filecheck:
+@module LowerAbiEncode
+
+// CHECK-LABEL: {{^[ +].*}}fn @static{{[( ]}}
+// CHECK: + [[MEMORY:v[0-9]+]] = alloc raw
+// CHECK: + mstore [[MEMORY]], 0x12345678
+// CHECK: + {{v[0-9]+}} = make_memory_slice [[MEMORY]], 36
+fn @static(arg0: u256) -> memoryslice {
+  bb0:
+    v0 = abi_encode [word], selector 0x1234567800000000000000000000000000000000000000000000000000000000, args arg0
+    ret v0
+}
+
+// CHECK-LABEL: {{^[ +].*}}fn @dynamic{{[( ]}}
+// CHECK: + [[LENGTH:v[0-9]+]] = slice_len arg0
+// CHECK: + [[POINTER:v[0-9]+]] = slice_ptr arg0
+// CHECK: + calldatacopy {{v[0-9]+}}, [[POINTER]], [[LENGTH]]
+fn @dynamic(arg0: calldataslice) -> memoryslice {
+  bb0:
+    v0 = abi_encode [calldata_bytes], args arg0
+    ret v0
+}
+
+fn @returndata_bytes() -> memoryslice {
+  bb0:
+    v0 = returndatasize
+    v1 = make_returndata_slice 0, v0
+    v2 = abi_encode [returndata_bytes], args v1
+    ret v2
+}
+
+fn @returndata_words(arg0: u256) -> memoryslice {
+  bb0:
+    v0 = make_returndata_slice 0, arg0
+    v1 = abi_encode [returndata_array<word>], args v0
+    ret v1
+}

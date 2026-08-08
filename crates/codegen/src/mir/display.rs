@@ -3,36 +3,44 @@
 //! Includes DOT format CFG generation for visualization.
 
 use super::{
-    BasicBlock, BlockId, EffectKind, Function, InstId, InstKind, Instruction, MemoryRegion,
-    StorageAlias, Terminator, Value, ValueId,
+    BasicBlock, BlockId, EffectKind, Function, FunctionId, InstId, InstKind, Instruction,
+    MemoryRegion, Module, StorageAlias, Terminator, Value, ValueId,
 };
-use smallvec::SmallVec;
-use solar_data_structures::fmt::{self, FmtIteratorExt};
+use arrayvec::ArrayVec;
+use solar_data_structures::{
+    fmt::{self, FmtIteratorExt},
+    map::{FxHashMap, FxHashSet},
+};
 use solar_sema::hir;
 
 /// Displays a DOT format CFG for a function.
-pub(crate) fn display_function_dot(func: &Function) -> impl fmt::Display + '_ {
-    fn display_dot_node(func: &Function, block_id: BlockId) -> impl fmt::Display + '_ {
+pub(crate) fn display_function_dot<'a>(
+    func: &'a Function,
+    module: Option<&'a Module>,
+) -> impl fmt::Display + 'a {
+    fn display_dot_node<'a>(
+        func: &'a Function,
+        module: Option<&'a Module>,
+        block_id: BlockId,
+    ) -> impl fmt::Display + 'a {
         fmt::from_fn(move |f| {
             let block_idx = block_id.index();
-            let is_entry = block_id == func.entry_block;
-            let color = if is_entry { ", fillcolor=\"#e0ffe0\", style=filled" } else { "" };
 
             write!(f, "    bb{block_idx} [label=\"")?;
-            write_dot_block_label(f, func, block_id)?;
-            writeln!(f, "\"{color}];")
+            write_dot_block_label(f, func, module, block_id)?;
+            writeln!(f, "\"];")
         })
     }
 
     fn write_dot_block_label(
         f: &mut fmt::Formatter<'_>,
         func: &Function,
+        module: Option<&Module>,
         block_id: BlockId,
     ) -> fmt::Result {
         let block = &func.blocks[block_id];
         let block_idx = block_id.index();
-        let entry_marker = if block_id == func.entry_block { " (entry)" } else { "" };
-        write!(f, "bb{block_idx}{entry_marker}:\\l")?;
+        write!(f, "bb{block_idx}:\\l")?;
 
         write!(
             f,
@@ -40,31 +48,36 @@ pub(crate) fn display_function_dot(func: &Function) -> impl fmt::Display + '_ {
             block.instructions.iter().format_with("", |f, inst_id| write!(
                 f,
                 "{}",
-                display_dot_instruction(func, *inst_id)
+                display_dot_instruction(func, module, *inst_id)
             ))
         )?;
 
         if let Some(term) = &block.terminator {
-            write!(f, "  {}\\l", display_terminator(term, func))?;
+            write!(f, "  {}\\l", display_terminator(term, func, module))?;
         }
 
         Ok(())
     }
 
-    fn display_dot_instruction(func: &Function, inst_id: InstId) -> impl fmt::Display + '_ {
+    fn display_dot_instruction<'a>(
+        func: &'a Function,
+        module: Option<&'a Module>,
+        inst_id: InstId,
+    ) -> impl fmt::Display + 'a {
         fmt::from_fn(move |f| {
-            let inst = &func.instructions[inst_id];
+            let inst = func.inst(inst_id);
 
             write!(f, "  ")?;
             if inst.result_ty.is_some() {
                 write!(f, "v{} = ", inst_result_index(func, inst_id))?;
             }
-            write!(f, "{}\\l", display_inst_kind(&inst.kind, func))
+            write!(f, "{}\\l", display_inst_kind(&inst.kind, func, module))
         })
     }
 
     fn display_dot_edges<'a>(
         func: &'a Function,
+        module: Option<&'a Module>,
         block_id: BlockId,
         block: &'a BasicBlock,
     ) -> impl fmt::Display + 'a {
@@ -112,6 +125,15 @@ pub(crate) fn display_function_dot(func: &Function) -> impl fmt::Display + '_ {
                         })
                     )
                 }
+                Terminator::TailCall { function, .. } => {
+                    writeln!(
+                        f,
+                        "    bb{} -> fn{} [style=dashed, label=\"tail_call {}\"];",
+                        block_idx,
+                        function.index(),
+                        display_function_ref(*function, module)
+                    )
+                }
                 Terminator::Return { .. }
                 | Terminator::Revert { .. }
                 | Terminator::ReturnData { .. }
@@ -134,7 +156,7 @@ pub(crate) fn display_function_dot(func: &Function) -> impl fmt::Display + '_ {
             func.blocks.iter_enumerated().format_with("", |f, (block_id, _)| write!(
                 f,
                 "{}",
-                display_dot_node(func, block_id)
+                display_dot_node(func, module, block_id)
             ))
         )?;
 
@@ -144,7 +166,7 @@ pub(crate) fn display_function_dot(func: &Function) -> impl fmt::Display + '_ {
             f,
             "{}",
             func.blocks.iter_enumerated().format_with("", |f, (block_id, block)| {
-                write!(f, "{}", display_dot_edges(func, block_id, block))
+                write!(f, "{}", display_dot_edges(func, module, block_id, block))
             })
         )?;
 
@@ -159,22 +181,25 @@ pub(crate) fn display_function_dot(func: &Function) -> impl fmt::Display + '_ {
 /// fn @name(arg0: uint256, arg1: bool) -> uint256 {
 ///   bb0:
 ///     v0 = add arg0, 1
-///     br arg1, bb1, bb2
+///     jumpi arg1, bb1, bb2
 ///   bb1:
 ///     ret v0
 ///   bb2:
 ///     ret arg0
 /// }
 /// ```
-pub(crate) fn display_function_text(func: &Function) -> impl fmt::Display + '_ {
+pub(crate) fn display_function_text<'a>(
+    func: &'a Function,
+    module: Option<&'a Module>,
+) -> impl fmt::Display + 'a {
     fn display_text_block<'a>(
         func: &'a Function,
+        module: Option<&'a Module>,
         block_id: BlockId,
         block: &'a BasicBlock,
     ) -> impl fmt::Display + 'a {
         fmt::from_fn(move |f| {
-            let entry_marker = if block_id == func.entry_block { " (entry)" } else { "" };
-            writeln!(f, "  bb{}{}:", block_id.index(), entry_marker)?;
+            writeln!(f, "  bb{}:", block_id.index())?;
 
             write!(
                 f,
@@ -182,26 +207,35 @@ pub(crate) fn display_function_text(func: &Function) -> impl fmt::Display + '_ {
                 block.instructions.iter().format_with("", |f, inst_id| write!(
                     f,
                     "{}",
-                    display_text_instruction(func, *inst_id)
+                    display_text_instruction(func, module, *inst_id)
                 ))
             )?;
 
             if let Some(term) = &block.terminator {
-                writeln!(f, "    {}", display_terminator(term, func))?;
+                writeln!(f, "    {}", display_terminator(term, func, module))?;
             }
             Ok(())
         })
     }
 
-    fn display_text_instruction(func: &Function, inst_id: InstId) -> impl fmt::Display + '_ {
+    fn display_text_instruction<'a>(
+        func: &'a Function,
+        module: Option<&'a Module>,
+        inst_id: InstId,
+    ) -> impl fmt::Display + 'a {
         fmt::from_fn(move |f| {
-            let inst = &func.instructions[inst_id];
+            let inst = func.inst(inst_id);
 
             write!(f, "    ")?;
             if inst.result_ty.is_some() {
                 write!(f, "v{} = ", inst_result_index(func, inst_id))?;
             }
-            writeln!(f, "{}{}", display_inst_kind(&inst.kind, func), display_metadata(inst, func))
+            writeln!(
+                f,
+                "{}{}",
+                display_inst_kind(&inst.kind, func, module),
+                display_metadata(inst, func)
+            )
         })
     }
 
@@ -211,10 +245,11 @@ pub(crate) fn display_function_text(func: &Function) -> impl fmt::Display + '_ {
         write!(
             f,
             "{}",
-            func.params
-                .iter()
-                .enumerate()
-                .format_with(", ", |f, (i, ty)| write!(f, "arg{i}: {ty}"))
+            func.params.iter_enumerated().format_with(", ", |f, (i, ty)| write!(
+                f,
+                "arg{}: {ty}",
+                i.index()
+            ))
         )?;
         write!(f, ")")?;
         if function_prints_return_values(func) && !func.returns.is_empty() {
@@ -225,13 +260,14 @@ pub(crate) fn display_function_text(func: &Function) -> impl fmt::Display + '_ {
                 write!(f, "({})", func.returns.iter().format(", "))?;
             }
         }
+        write!(f, "{}", display_function_attributes(func))?;
         writeln!(f, " {{")?;
 
         write!(
             f,
             "{}",
             func.blocks.iter_enumerated().format_with("", |f, (block_id, block)| {
-                write!(f, "{}", display_text_block(func, block_id, block))
+                write!(f, "{}", display_text_block(func, module, block_id, block))
             })
         )?;
 
@@ -239,20 +275,51 @@ pub(crate) fn display_function_text(func: &Function) -> impl fmt::Display + '_ {
     })
 }
 
+fn display_function_attributes(func: &Function) -> impl fmt::Display + '_ {
+    fmt::from_fn(move |f| {
+        let mut first = true;
+        if func.attributes.is_dispatch_entry {
+            write_function_attribute(f, &mut first, "entry")?;
+        }
+        if let Some(layout) = &func.abi_returns {
+            write_function_attribute(f, &mut first, format_args!("abi_returns={layout}"))?;
+        }
+        if !first {
+            f.write_str("]")?;
+        }
+        Ok(())
+    })
+}
+
+fn write_function_attribute(
+    f: &mut fmt::Formatter<'_>,
+    first: &mut bool,
+    attribute: impl fmt::Display,
+) -> fmt::Result {
+    if *first {
+        f.write_str(" [")?;
+        *first = false;
+    } else {
+        f.write_str(", ")?;
+    }
+    attribute.fmt(f)
+}
+
 fn function_prints_return_values(func: &Function) -> bool {
     func.blocks.iter().any(|block| matches!(block.terminator, Some(Terminator::Return { .. })))
 }
 
 fn inst_result_index(func: &Function, inst_id: InstId) -> usize {
-    func.instructions
-        .iter_enumerated()
-        .filter(|(_, inst)| inst.result_ty.is_some())
-        .position(|(id, _)| id == inst_id)
+    func.inst_result_index(inst_id)
         .expect("Value::Inst should point to a value-producing instruction")
 }
 
 /// Formats an instruction kind for display.
-fn display_inst_kind<'a>(kind: &'a InstKind, func: &'a Function) -> impl fmt::Display + 'a {
+fn display_inst_kind<'a>(
+    kind: &'a InstKind,
+    func: &'a Function,
+    module: Option<&'a Module>,
+) -> impl fmt::Display + 'a {
     fn display_inst_operands(
         f: &mut fmt::Formatter<'_>,
         kind: &InstKind,
@@ -271,9 +338,85 @@ fn display_inst_kind<'a>(kind: &'a InstKind, func: &'a Function) -> impl fmt::Di
     }
 
     fmt::from_fn(move |f| match kind {
-        InstKind::LoadImmutable(offset) => write!(f, "loadimmutable {offset}"),
+        InstKind::StoreImmutable(id, value) => {
+            write!(f, "storeimmutable {}", display_immutable_ref(*id, module))?;
+            write!(f, ", {}", display_val(*value, func))
+        }
+        InstKind::LoadImmutable(id) => {
+            write!(f, "loadimmutable {}", display_immutable_ref(*id, module))
+        }
+        InstKind::Alloc { size, kind, semantics } => {
+            let kind = match kind {
+                crate::mir::AllocationKind::Raw => "raw".to_string(),
+                crate::mir::AllocationKind::Object(layout) => layout.to_string(),
+            };
+            let alignment = match semantics.alignment {
+                crate::mir::AllocationAlignment::Exact => "exact",
+                crate::mir::AllocationAlignment::Word => "word",
+            };
+            let initialization = match semantics.initialization {
+                crate::mir::AllocationInitialization::Uninitialized => "uninitialized",
+                crate::mir::AllocationInitialization::Zeroed => "zeroed",
+            };
+            let failure = match semantics.failure {
+                crate::mir::AllocationFailure::Infallible => "infallible",
+                crate::mir::AllocationFailure::Panic => "panic",
+            };
+            write!(
+                f,
+                "alloc {kind}, {alignment}, {initialization}, {failure}, {}",
+                display_val(*size, func)
+            )
+        }
+        InstKind::MemoryObjectFieldAddr { object, layout, field } => {
+            write!(f, "memory_object_field_addr {layout}, {}, {field}", display_val(*object, func))
+        }
+        InstKind::MemoryObjectElementAddr { object, layout, index } => write!(
+            f,
+            "memory_object_element_addr {layout}, {}, {}",
+            display_val(*object, func),
+            display_val(*index, func)
+        ),
+        InstKind::MemoryObjectLen(object, kind) => {
+            write!(f, "memory_object_len {kind}, {}", display_val(*object, func))
+        }
+        InstKind::SetMemoryObjectLen(object, len, kind) => write!(
+            f,
+            "set_memory_object_len {kind}, {}, {}",
+            display_val(*object, func),
+            display_val(*len, func)
+        ),
+        InstKind::MemoryObjectData(object, kind) => {
+            write!(f, "memory_object_data {kind}, {}", display_val(*object, func))
+        }
+        InstKind::AbiEncode { selector, args, layout } => {
+            write!(f, "abi_encode {layout}")?;
+            if let Some(selector) = selector {
+                write!(f, ", selector {}", display_val(*selector, func))?;
+            }
+            if !args.is_empty() {
+                write!(f, ", args ")?;
+                write!(f, "{}", args.iter().map(|arg| display_val(*arg, func)).format(", "))?;
+            }
+            Ok(())
+        }
+        InstKind::StorageToMemory { storage, memory, layout } => write!(
+            f,
+            "storage_to_memory {layout}, {}, {}",
+            display_val(*storage, func),
+            display_val(*memory, func)
+        ),
+        InstKind::MemoryToStorage { memory, storage, layout } => write!(
+            f,
+            "memory_to_storage {layout}, {}, {}",
+            display_val(*memory, func),
+            display_val(*storage, func)
+        ),
+        InstKind::ClearStorage { storage, layout } => {
+            write!(f, "clear_storage {layout}, {}", display_val(*storage, func))
+        }
         InstKind::InternalCall { function, args, returns } => {
-            write!(f, "internal_call fn{}, {returns}", function.index())?;
+            write!(f, "internal_call {}, {returns}", display_function_ref(*function, module))?;
             if !args.is_empty() {
                 write!(f, ", {}", args.iter().map(|arg| display_val(*arg, func)).format(", "))?;
             }
@@ -297,13 +440,70 @@ fn display_inst_kind<'a>(kind: &'a InstKind, func: &'a Function) -> impl fmt::Di
     })
 }
 
-/// Format a value reference.
+pub(super) fn display_immutable_ref(
+    id: super::ImmutableId,
+    module: Option<&Module>,
+) -> impl fmt::Display + '_ {
+    fmt::from_fn(move |f| {
+        if let Some(name) = module.and_then(|module| immutable_display_name(module, id)) {
+            write!(f, "{name}")
+        } else {
+            write!(f, "{}", id.index())
+        }
+    })
+}
+
+fn immutable_display_name(module: &Module, id: super::ImmutableId) -> Option<String> {
+    let immutable = module.get_immutable(id)?;
+    let mut counts = FxHashMap::default();
+    let mut reserved = FxHashSet::default();
+    for (_, immutable) in module.iter_immutables() {
+        *counts.entry(immutable.name.name).or_insert(0usize) += 1;
+        reserved.insert(immutable.name.to_string());
+    }
+    if counts[&immutable.name.name] == 1 {
+        return Some(immutable.name.to_string());
+    }
+
+    let mut allocated = FxHashSet::default();
+    for (other_id, other) in module.iter_immutables() {
+        if counts[&other.name.name] == 1 {
+            continue;
+        }
+
+        let mut name = format!("{}{}", other.name, other_id.index());
+        while reserved.contains(&name) || allocated.contains(&name) {
+            name.push('_');
+        }
+        if other_id == id {
+            return Some(name);
+        }
+        allocated.insert(name);
+    }
+    None
+}
+
+/// Formats a function reference using its exact textual declaration name.
+/// Falls back to `fnN` when a single function is printed without its module.
+fn display_function_ref(function: FunctionId, module: Option<&Module>) -> impl fmt::Display + '_ {
+    fmt::from_fn(move |f| {
+        let funcs = module.map(|module| &module.functions);
+        if let Some(funcs) = funcs
+            && let Some(callee) = funcs.get(function)
+        {
+            write!(f, "@{}", callee.name)
+        } else {
+            write!(f, "fn{}", function.index())
+        }
+    })
+}
+
 fn display_val(vid: ValueId, func: &Function) -> impl fmt::Display + '_ {
-    fmt::from_fn(move |f| match &func.values[vid] {
+    fmt::from_fn(move |f| match func.value(vid) {
         Value::Immediate(imm) if let Some(u256) = imm.as_u256() => {
             write!(f, "{}", display_u256(u256))
         }
-        Value::Arg { index, .. } => write!(f, "arg{index}"),
+        Value::Arg(index) => write!(f, "arg{}", index.index()),
         Value::Inst(inst_id) => write!(f, "v{}", inst_result_index(func, *inst_id)),
         Value::Error(_) => write!(f, "err"),
         _ => write!(f, "v{}", vid.index()),
@@ -329,6 +529,7 @@ fn display_metadata<'a>(inst: &'a Instruction, func: &'a Function) -> impl fmt::
         Hir(hir::ExprId),
         Span { lo: u32, hi: u32 },
         Unchecked,
+        DeferredAlloc,
         LoopDepth(u16),
         Effect(EffectKind),
     }
@@ -342,6 +543,7 @@ fn display_metadata<'a>(inst: &'a Instruction, func: &'a Function) -> impl fmt::
             MetadataField::Hir(hir_expr) => write!(f, "hir={}", hir_expr.index()),
             MetadataField::Span { lo, hi } => write!(f, "span={lo}..{hi}"),
             MetadataField::Unchecked => write!(f, "unchecked"),
+            MetadataField::DeferredAlloc => write!(f, "deferred_alloc"),
             MetadataField::LoopDepth(loop_depth) => write!(f, "loop_depth={loop_depth}"),
             MetadataField::Effect(effect) => write!(f, "effect={}", effect.name()),
         })
@@ -359,7 +561,7 @@ fn display_metadata<'a>(inst: &'a Instruction, func: &'a Function) -> impl fmt::
 
     fmt::from_fn(move |f| {
         let metadata = &inst.metadata;
-        let mut fields = SmallVec::<[MetadataField<'_>; 8]>::new();
+        let mut fields = ArrayVec::<MetadataField<'_>, 8>::new();
 
         if let Some(storage) = metadata.storage_alias() {
             fields.push(MetadataField::Storage(storage, func));
@@ -377,6 +579,9 @@ fn display_metadata<'a>(inst: &'a Instruction, func: &'a Function) -> impl fmt::
         }
         if metadata.unchecked() {
             fields.push(MetadataField::Unchecked);
+        }
+        if metadata.deferred_alloc() {
+            fields.push(MetadataField::DeferredAlloc);
         }
         if metadata.loop_depth != 0 {
             fields.push(MetadataField::LoopDepth(metadata.loop_depth));
@@ -396,12 +601,16 @@ fn display_metadata<'a>(inst: &'a Instruction, func: &'a Function) -> impl fmt::
 }
 
 /// Format a terminator for display, rendering operands via [`display_val`].
-fn display_terminator<'a>(term: &'a Terminator, func: &'a Function) -> impl fmt::Display + 'a {
+fn display_terminator<'a>(
+    term: &'a Terminator,
+    func: &'a Function,
+    module: Option<&'a Module>,
+) -> impl fmt::Display + 'a {
     fmt::from_fn(move |f| match term {
         Terminator::Jump(target) => write!(f, "jump bb{}", target.index()),
         Terminator::Branch { condition, then_block, else_block } => write!(
             f,
-            "br {}, bb{}, bb{}",
+            "jumpi {}, bb{}, bb{}",
             display_val(*condition, func),
             then_block.index(),
             else_block.index()
@@ -435,164 +644,16 @@ fn display_terminator<'a>(term: &'a Terminator, func: &'a Function) -> impl fmt:
             write!(f, "returndata {}, {}", display_val(*offset, func), display_val(*size, func))
         }
         Terminator::Stop => write!(f, "stop"),
+        Terminator::TailCall { function, args } => {
+            write!(f, "tail_call {}", display_function_ref(*function, module))?;
+            for arg in args {
+                write!(f, ", {}", display_val(*arg, func))?;
+            }
+            Ok(())
+        }
         Terminator::SelfDestruct { recipient } => {
             write!(f, "selfdestruct {}", display_val(*recipient, func))
         }
         Terminator::Invalid => write!(f, "invalid"),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::mir::{Function, FunctionBuilder, MirType};
-    use snapbox::{IntoData as _, assert_data_eq, str};
-    use solar_interface::{ColorChoice, Ident, Session, sym};
-
-    fn make_func() -> Function {
-        Function::new(Ident::with_dummy_span(sym::display_test))
-    }
-
-    /// Runs `f` inside a fresh test session so the symbol interner is available.
-    fn with_session<F: FnOnce() + Send>(f: F) {
-        let sess = Session::builder().with_buffer_emitter(ColorChoice::Never).build();
-        sess.enter(f);
-    }
-
-    #[test]
-    fn text_linear_function() {
-        with_session(|| {
-            let mut func = make_func();
-            {
-                let mut b = FunctionBuilder::new(&mut func);
-                let x = b.add_param(MirType::uint256());
-                b.add_return(MirType::uint256());
-                let one = b.imm_u64(1);
-                let sum = b.add(x, one);
-                b.ret([sum]);
-            }
-            let text = func.to_text().to_string();
-            assert_data_eq!(
-                text,
-                str![[r#"
-fn @display_test(arg0: u256) -> u256 {
-  bb0 (entry):
-    v0 = add arg0, 1
-    ret v0
-}
-
-"#]]
-            );
-            let dot = func.to_dot().to_string();
-            assert_data_eq!(
-                dot,
-                str![[r##"
-digraph "display_test" {
-    node [shape=box, fontname="Courier", fontsize=10];
-    edge [fontname="Courier", fontsize=9];
-
-    bb0 [label="bb0 (entry):\l  v0 = add arg0, 1\l  ret v0\l", fillcolor="#e0ffe0", style=filled];
-
-}
-
-"##]]
-                .raw()
-            );
-        });
-    }
-
-    #[test]
-    fn text_diamond_cfg() {
-        with_session(|| {
-            let mut func = make_func();
-            {
-                let mut b = FunctionBuilder::new(&mut func);
-                let x = b.add_param(MirType::uint256());
-                let cond = b.add_param(MirType::Bool);
-                let then_bb = b.create_block();
-                let else_bb = b.create_block();
-                b.branch(cond, then_bb, else_bb);
-                b.switch_to_block(then_bb);
-                b.ret([x]);
-                b.switch_to_block(else_bb);
-                b.ret([x]);
-            }
-            let text = func.to_text().to_string();
-            assert_data_eq!(
-                text,
-                str![[r#"
-fn @display_test(arg0: u256, arg1: bool) {
-  bb0 (entry):
-    br arg1, bb1, bb2
-  bb1:
-    ret arg0
-  bb2:
-    ret arg0
-}
-
-"#]]
-            );
-            let dot = func.to_dot().to_string();
-            assert_data_eq!(
-                dot,
-                str![[r##"
-digraph "display_test" {
-    node [shape=box, fontname="Courier", fontsize=10];
-    edge [fontname="Courier", fontsize=9];
-
-    bb0 [label="bb0 (entry):\l  br arg1, bb1, bb2\l", fillcolor="#e0ffe0", style=filled];
-    bb1 [label="bb1:\l  ret arg0\l"];
-    bb2 [label="bb2:\l  ret arg0\l"];
-
-    bb0 -> bb1 [label="arg1 == true", color="green"];
-    bb0 -> bb2 [label="false", color="red"];
-}
-
-"##]]
-                .raw()
-            );
-        });
-    }
-
-    #[test]
-    fn text_storage_ops() {
-        with_session(|| {
-            let mut func = make_func();
-            {
-                let mut b = FunctionBuilder::new(&mut func);
-                let slot = b.add_param(MirType::uint256());
-                let val = b.add_param(MirType::uint256());
-                b.sstore(slot, val);
-                let loaded = b.sload(slot);
-                b.ret([loaded]);
-            }
-            let text = func.to_text().to_string();
-            assert_data_eq!(
-                text,
-                str![[r#"
-fn @display_test(arg0: u256, arg1: u256) {
-  bb0 (entry):
-    sstore arg0, arg1 !metadata(storage=symbolic(arg0))
-    v0 = sload arg0 !metadata(storage=symbolic(arg0))
-    ret v0
-}
-
-"#]]
-            );
-            let dot = func.to_dot().to_string();
-            assert_data_eq!(
-                dot,
-                str![[r##"
-digraph "display_test" {
-    node [shape=box, fontname="Courier", fontsize=10];
-    edge [fontname="Courier", fontsize=9];
-
-    bb0 [label="bb0 (entry):\l  sstore arg0, arg1\l  v0 = sload arg0\l  ret v0\l", fillcolor="#e0ffe0", style=filled];
-
-}
-
-"##]]
-                .raw()
-            );
-        });
-    }
 }

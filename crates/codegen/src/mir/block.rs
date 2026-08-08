@@ -6,32 +6,26 @@ use std::fmt;
 
 /// A basic block in the MIR.
 #[derive(Clone, Debug)]
-pub struct BasicBlock {
+pub(crate) struct BasicBlock {
     /// The instructions in this block (excluding the terminator).
-    pub instructions: Vec<InstId>,
+    pub(crate) instructions: Vec<InstId>,
     /// The terminator instruction.
-    pub terminator: Option<Terminator>,
+    pub(crate) terminator: Option<Terminator>,
     /// Predecessor blocks.
-    pub predecessors: SmallVec<[BlockId; 4]>,
+    pub(crate) predecessors: SmallVec<[BlockId; 4]>,
 }
 
 impl BasicBlock {
     /// Creates a new empty basic block.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { instructions: Vec::new(), terminator: None, predecessors: SmallVec::new() }
     }
 
     /// Returns true if this block has a terminator.
     #[must_use]
-    pub const fn is_terminated(&self) -> bool {
+    pub(crate) const fn is_terminated(&self) -> bool {
         self.terminator.is_some()
-    }
-
-    /// Returns the terminator, if present.
-    #[must_use]
-    pub const fn terminator(&self) -> Option<&Terminator> {
-        self.terminator.as_ref()
     }
 }
 
@@ -43,7 +37,7 @@ impl Default for BasicBlock {
 
 /// A block terminator instruction.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Terminator {
+pub(crate) enum Terminator {
     /// Unconditional jump to another block.
     Jump(BlockId),
     /// Conditional branch.
@@ -91,6 +85,18 @@ pub enum Terminator {
         /// The address to send remaining funds to.
         recipient: ValueId,
     },
+    /// Transfer control to another function without returning.
+    ///
+    /// Unlike an internal call, control never comes back to the current
+    /// function: the callee's own terminators end the execution (or transfer
+    /// it further). The dispatch phase uses this to route `entry` switch cases
+    /// to the ABI wrappers, which terminate externally with `RETURN`/`REVERT`.
+    TailCall {
+        /// The function to transfer control to.
+        function: super::FunctionId,
+        /// The arguments, matching the callee's parameters.
+        args: SmallVec<[ValueId; 2]>,
+    },
     /// Invalid operation (unreachable code).
     Invalid,
 }
@@ -98,7 +104,7 @@ pub enum Terminator {
 impl Terminator {
     /// Returns the successor blocks of this terminator.
     #[must_use]
-    pub fn successors(&self) -> SmallVec<[BlockId; 2]> {
+    pub(crate) fn successors(&self) -> SmallVec<[BlockId; 2]> {
         match self {
             Self::Jump(target) => smallvec::smallvec![*target],
             Self::Branch { then_block, else_block, .. } => {
@@ -117,22 +123,24 @@ impl Terminator {
             | Self::ReturnData { .. }
             | Self::Stop
             | Self::SelfDestruct { .. }
+            | Self::TailCall { .. }
             | Self::Invalid => SmallVec::new(),
         }
     }
 
     /// Returns the mnemonic for this terminator.
     #[must_use]
-    pub const fn mnemonic(&self) -> &'static str {
+    pub(crate) const fn mnemonic(&self) -> &'static str {
         match self {
             Self::Jump(_) => "jump",
-            Self::Branch { .. } => "branch",
+            Self::Branch { .. } => "jumpi",
             Self::Switch { .. } => "switch",
             Self::Return { .. } => "return",
             Self::Revert { .. } => "revert",
             Self::ReturnData { .. } => "returndata",
             Self::Stop => "stop",
             Self::SelfDestruct { .. } => "selfdestruct",
+            Self::TailCall { .. } => "tail_call",
             Self::Invalid => "invalid",
         }
     }
@@ -140,7 +148,7 @@ impl Terminator {
     /// Returns the [`ValueId`] operands of this terminator (the values it reads).
     /// Block targets are NOT included; use [`Self::successors`] for those.
     #[must_use]
-    pub fn operands(&self) -> SmallVec<[ValueId; 4]> {
+    pub(crate) fn operands(&self) -> SmallVec<[ValueId; 4]> {
         let mut out = SmallVec::new();
         match self {
             Self::Jump(_) => {}
@@ -158,6 +166,7 @@ impl Terminator {
             }
             Self::Stop | Self::Invalid => {}
             Self::SelfDestruct { recipient } => out.push(*recipient),
+            Self::TailCall { args, .. } => out.extend(args.iter().copied()),
         }
         out
     }
@@ -170,7 +179,7 @@ impl fmt::Display for Terminator {
             Self::Branch { condition, then_block, else_block } => {
                 write!(
                     f,
-                    "branch v{}, bb{}, bb{}",
+                    "jumpi v{}, bb{}, bb{}",
                     condition.index(),
                     then_block.index(),
                     else_block.index()
@@ -202,6 +211,13 @@ impl fmt::Display for Terminator {
             Self::Stop => write!(f, "stop"),
             Self::SelfDestruct { recipient } => {
                 write!(f, "selfdestruct v{}", recipient.index())
+            }
+            Self::TailCall { function, args } => {
+                write!(f, "tail_call fn{}", function.index())?;
+                for arg in args {
+                    write!(f, ", v{}", arg.index())?;
+                }
+                Ok(())
             }
             Self::Invalid => write!(f, "invalid"),
         }

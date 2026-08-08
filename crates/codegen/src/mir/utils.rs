@@ -3,7 +3,88 @@
 use crate::mir::{BasicBlock, BlockId, Function, InstKind, Terminator, ValueId};
 use alloy_primitives::U256;
 use smallvec::smallvec;
-use solar_data_structures::map::FxHashMap;
+use solar_data_structures::{
+    index::{IndexVec, index_vec},
+    map::FxHashMap,
+};
+
+pub(crate) fn remap_block_order(
+    func: &mut Function,
+    order: &[BlockId],
+) -> IndexVec<BlockId, BlockId> {
+    debug_assert_eq!(order.len(), func.blocks.len());
+    let remap = remap_blocks(func, order);
+    debug_assert!(!remap.contains(&BlockId::MAX));
+    remap
+}
+
+pub(crate) fn retain_blocks(func: &mut Function, order: &[BlockId]) {
+    debug_assert!(order.len() <= func.blocks.len());
+    remap_blocks(func, order);
+}
+
+fn remap_blocks(func: &mut Function, order: &[BlockId]) -> IndexVec<BlockId, BlockId> {
+    let mut remap = index_vec![BlockId::MAX; func.blocks.len()];
+    let mut old_blocks =
+        std::mem::take(&mut func.blocks).into_iter().map(Some).collect::<IndexVec<BlockId, _>>();
+    let mut blocks = IndexVec::with_capacity(order.len());
+    for &old_block in order {
+        let block = old_blocks[old_block].take().expect("duplicate block in order");
+        let new_block = blocks.push(block);
+        remap[old_block] = new_block;
+    }
+    func.blocks = blocks;
+
+    let mut retained_instructions = Vec::new();
+    for block in &mut func.blocks {
+        block.predecessors.retain(|predecessor| remap[*predecessor] != BlockId::MAX);
+        for predecessor in &mut block.predecessors {
+            *predecessor = remap[*predecessor];
+        }
+        if let Some(terminator) = &mut block.terminator {
+            remap_terminator_blocks(terminator, &remap);
+        }
+        retained_instructions.extend_from_slice(&block.instructions);
+    }
+    for inst_id in retained_instructions {
+        let inst = func.inst_mut(inst_id);
+        if let InstKind::Phi(incoming) = &mut inst.kind {
+            incoming.retain(|(block, _)| remap[*block] != BlockId::MAX);
+            for (block, _) in incoming {
+                *block = remap[*block];
+            }
+        }
+    }
+    remap
+}
+
+fn remap_terminator_blocks(terminator: &mut Terminator, remap: &IndexVec<BlockId, BlockId>) {
+    let remap_block = |block: &mut BlockId| {
+        let remapped = remap[*block];
+        assert_ne!(remapped, BlockId::MAX, "terminator target must be retained");
+        *block = remapped;
+    };
+    match terminator {
+        Terminator::Jump(target) => remap_block(target),
+        Terminator::Branch { then_block, else_block, .. } => {
+            remap_block(then_block);
+            remap_block(else_block);
+        }
+        Terminator::Switch { default, cases, .. } => {
+            remap_block(default);
+            for (_, target) in cases {
+                remap_block(target);
+            }
+        }
+        Terminator::Return { .. }
+        | Terminator::Revert { .. }
+        | Terminator::ReturnData { .. }
+        | Terminator::Stop
+        | Terminator::SelfDestruct { .. }
+        | Terminator::TailCall { .. }
+        | Terminator::Invalid => {}
+    }
+}
 
 /// Which state-access instructions should receive storage-alias metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,11 +107,7 @@ pub(crate) enum StorageAliasScope {
 ///
 /// Self-loops (`pred == succ`) are supported: the new block takes over the
 /// backedge and `succ`'s phis are rekeyed from `pred` to the new block.
-///
-/// `succ` cannot be the entry block, which has no predecessors by definition.
 pub(crate) fn split_edge(func: &mut Function, pred: BlockId, succ: BlockId) -> BlockId {
-    debug_assert_ne!(succ, func.entry_block, "the entry block has no predecessor edges to split");
-
     let new_block = func.blocks.push(BasicBlock {
         instructions: Vec::new(),
         terminator: Some(Terminator::Jump(succ)),
@@ -73,8 +150,10 @@ pub(crate) fn split_edge(func: &mut Function, pred: BlockId, succ: BlockId) -> B
     predecessors.retain(|&mut block| block != pred);
 
     // Rekey `succ`'s phi incoming entries from `pred` to the new block.
-    for &inst_id in &func.blocks[succ].instructions {
-        if let InstKind::Phi(incoming) = &mut func.instructions[inst_id].kind {
+    let instruction_count = func.blocks[succ].instructions.len();
+    for index in 0..instruction_count {
+        let inst_id = func.blocks[succ].instructions[index];
+        if let InstKind::Phi(incoming) = &mut func.inst_mut(inst_id).kind {
             for (block, _) in incoming.iter_mut() {
                 if *block == pred {
                     *block = new_block;
@@ -87,35 +166,31 @@ pub(crate) fn split_edge(func: &mut Function, pred: BlockId, succ: BlockId) -> B
 }
 
 /// Rebuilds CFG edge lists from terminators and drops phi inputs from blocks
-/// that are no longer predecessors. Returns true if any phi input was dropped.
+/// that are no longer predecessors. Returns true if either changed.
+#[must_use]
 pub(crate) fn repair_reachability_phis(func: &mut Function) -> bool {
-    let mut edges = Vec::new();
+    let mut predecessors = index_vec![smallvec![]; func.blocks.len()];
     for (block, bb) in func.blocks.iter_enumerated() {
         if let Some(term) = &bb.terminator {
-            edges.push((block, term.successors()));
-        }
-    }
-
-    for block in func.blocks.iter_mut() {
-        block.predecessors.clear();
-    }
-
-    for (block, successors) in edges {
-        for succ in successors {
-            func.blocks[succ].predecessors.push(block);
+            for succ in term.successors() {
+                predecessors[succ].push(block);
+            }
         }
     }
 
     let mut changed = false;
-    for block_id in func.blocks.indices() {
-        let predecessors = func.blocks[block_id].predecessors.clone();
-        for &inst_id in &func.blocks[block_id].instructions {
-            if let InstKind::Phi(incoming) = &mut func.instructions[inst_id].kind {
+    for (block_id, block_predecessors) in predecessors.into_iter_enumerated() {
+        changed |= func.blocks[block_id].predecessors != block_predecessors;
+        let instruction_count = func.blocks[block_id].instructions.len();
+        for index in 0..instruction_count {
+            let inst_id = func.blocks[block_id].instructions[index];
+            if let InstKind::Phi(incoming) = &mut func.inst_mut(inst_id).kind {
                 let len_before = incoming.len();
-                incoming.retain(|(pred, _)| predecessors.contains(pred));
+                incoming.retain(|(pred, _)| block_predecessors.contains(pred));
                 changed |= incoming.len() != len_before;
             }
         }
+        func.blocks[block_id].predecessors = block_predecessors;
     }
     changed
 }
@@ -175,17 +250,6 @@ pub(crate) fn u256_to_u64(value: U256) -> Option<u64> {
     value.try_into().ok()
 }
 
-/// Returns true if two possibly-overflowing byte ranges overlap.
-pub(crate) fn ranges_overlap(a_start: u64, a_size: u64, b_start: u64, b_size: u64) -> bool {
-    let Some(a_end) = a_start.checked_add(a_size) else {
-        return true;
-    };
-    let Some(b_end) = b_start.checked_add(b_size) else {
-        return true;
-    };
-    a_start < b_end && b_start < a_end
-}
-
 /// Returns true for instructions whose operands derive memory metadata.
 pub(crate) fn is_memory_inst(kind: &InstKind) -> bool {
     matches!(
@@ -193,12 +257,14 @@ pub(crate) fn is_memory_inst(kind: &InstKind) -> bool {
         InstKind::MLoad(_)
             | InstKind::MStore(_, _)
             | InstKind::MStore8(_, _)
+            | InstKind::MemoryZero(_, _)
             | InstKind::MCopy(_, _, _)
             | InstKind::CalldataCopy(_, _, _)
             | InstKind::CodeCopy(_, _, _)
             | InstKind::ReturnDataCopy(_, _, _)
             | InstKind::ExtCodeCopy(_, _, _, _)
             | InstKind::Keccak256(_, _)
+            | InstKind::MappingSlotMemory(_, _)
     )
 }
 
@@ -244,6 +310,11 @@ fn replace_terminator_operands(
         Terminator::Return { values } => {
             for value in values {
                 replace(value);
+            }
+        }
+        Terminator::TailCall { args, .. } => {
+            for arg in args {
+                replace(arg);
             }
         }
         Terminator::Revert { offset, size } | Terminator::ReturnData { offset, size } => {

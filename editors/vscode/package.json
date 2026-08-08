@@ -81,7 +81,36 @@
         "solarLsp.formatOnSave": {
           "type": "boolean",
           "default": true,
-          "description": "Format files on save using forge fmt"
+          "description": "Format files on save using Solar LSP"
+        },
+        "solarLsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "messages",
+            "verbose"
+          ],
+          "default": "messages",
+          "description": "Server execution trace detail. Set the Solar LSP output channel log level to Trace to enable tracing."
+        },
+        "solarLsp.codeLens.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Solidity CodeLens annotations"
+        },
+        "solarLsp.codeLens.selectors": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show function selector CodeLens annotations"
+        },
+        "solarLsp.codeLens.references": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show reference count CodeLens annotations"
+        },
+        "solarLsp.codeLens.inheritance": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show contract inheritance CodeLens annotations"
         },
         "solarLsp.flychecks": {
           "type": [
@@ -136,6 +165,16 @@
         "command": "solarLsp.formatDocument",
         "title": "Format Document",
         "category": "Solar"
+      },
+      {
+        "command": "solar.clearCache",
+        "title": "Clear Analysis Cache",
+        "category": "Solar"
+      },
+      {
+        "command": "solar.reindex",
+        "title": "Reindex Workspace",
+        "category": "Solar"
       }
     ]
   },
@@ -147,9 +186,9 @@
   "devDependencies": {
     "@types/vscode": "^1.125.0",
     "@types/node": "26.x",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "dependencies": {
-    "vscode-languageclient": "^10.0.1"
+    "vscode-languageclient": "^10.1.0"
   }
 }

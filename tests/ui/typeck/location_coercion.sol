@@ -1,5 +1,3 @@
-//@ compile-flags: -Ztypeck
-
 // Tests for data location coercion rules.
 // See: https://docs.soliditylang.org/en/latest/types.html#data-location-and-assignment-behaviour
 
@@ -9,6 +7,8 @@ contract C {
     }
 
     uint256[] storageArr;
+    string storageString = "initial";
+    S storageStruct;
     S[] structArr;
     S[2] fixedStructArr;
     S[][] nestedStructArr;
@@ -88,6 +88,18 @@ contract C {
     function storageToMemory() internal view returns (uint256[] memory) {
         uint256[] memory a = storageArr;
         return a;
+    }
+
+    function literalToStorage() internal {
+        storageString = "updated";
+    }
+
+    function memoryStructToStorage(S memory value) internal {
+        storageStruct = value;
+    }
+
+    function memoryStructToStoragePointer(S memory value) internal {
+        S storage pointer = value; //~ ERROR: mismatched types
     }
 
     // === Disallowed conversions ===

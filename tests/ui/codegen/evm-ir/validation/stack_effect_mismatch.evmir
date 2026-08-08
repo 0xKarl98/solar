@@ -1,0 +1,6 @@
+//~? ERROR: EVM IR verification failed: block 0: `push` has stack effect 0->0, expected 0->1
+@module module
+
+bb0:
+  push 1 !meta(stack=0->0)
+  stop

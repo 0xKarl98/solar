@@ -16,63 +16,71 @@
 
 use crate::{
     mir::{
-        BlockId, Function, InstKind, Terminator, Value, ValueId, utils::repair_reachability_phis,
+        BlockId, Function, InstKind, Module, Terminator, Value, ValueId,
+        utils::repair_reachability_phis,
     },
-    pass::FunctionPass,
+    pass::{MirPass, run_function_pass},
 };
-use solar_data_structures::map::{FxHashMap, FxHashSet};
+use solar_data_structures::{bit_set::DenseBitSet, map::FxHashMap};
+
+/// Function pass for jump threading.
+pub(crate) struct JumpThreading;
+
+impl MirPass for JumpThreading {
+    fn name(&self) -> &'static str {
+        "jump-threading"
+    }
+
+    fn run_pass(
+        &self,
+        _gcx: solar_sema::Gcx<'_>,
+        module: &mut Module,
+        analyses: &mut crate::pass::ModuleAnalyses,
+    ) -> bool {
+        run_function_pass(module, analyses, |func, _| {
+            JumpThreader::new().run_to_fixpoint(func).total_threaded() != 0
+        })
+    }
+}
 
 /// Statistics from jump threading optimization.
 #[derive(Debug, Default, Clone)]
-pub struct JumpThreadingStats {
+struct JumpThreadingStats {
     /// Number of unconditional jumps threaded.
-    pub jumps_threaded: usize,
+    jumps_threaded: usize,
     /// Number of conditional branch targets threaded.
-    pub branches_threaded: usize,
+    branches_threaded: usize,
     /// Number of switch case targets threaded.
-    pub switches_threaded: usize,
+    switches_threaded: usize,
     /// Estimated gas saved (8 gas per eliminated jump).
-    pub gas_saved: usize,
+    gas_saved: usize,
 }
 
 impl JumpThreadingStats {
     /// Returns the total number of threading operations performed.
     #[must_use]
-    pub fn total_threaded(&self) -> usize {
+    fn total_threaded(&self) -> usize {
         self.jumps_threaded + self.branches_threaded + self.switches_threaded
     }
 }
 
 /// Jump threading optimization pass.
 #[derive(Debug, Default)]
-pub struct JumpThreader {
+struct JumpThreader {
     /// Statistics from the last run.
-    pub stats: JumpThreadingStats,
-}
-
-/// Function pass for jump threading.
-pub struct JumpThreadingPass;
-
-impl FunctionPass for JumpThreadingPass {
-    fn name(&self) -> &str {
-        "jump-threading"
-    }
-
-    fn run_on_function(&mut self, func: &mut Function) -> bool {
-        JumpThreader::new().run_to_fixpoint(func).total_threaded() != 0
-    }
+    stats: JumpThreadingStats,
 }
 
 impl JumpThreader {
     /// Creates a new jump threader.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     /// Runs jump threading on a function.
-    /// Returns the number of threading operations performed.
-    pub fn run(&mut self, func: &mut Function) -> usize {
+    /// Returns the number of MIR mutations performed.
+    fn run(&mut self, func: &mut Function) -> usize {
         self.stats = JumpThreadingStats::default();
         let mut changed = 0;
 
@@ -81,7 +89,7 @@ impl JumpThreader {
 
         if !forwarders.is_empty() {
             // Resolve the final target for each forwarder (following chains)
-            let final_targets = self.resolve_final_targets(&forwarders);
+            let final_targets = self.resolve_final_targets(&forwarders, func.blocks.len());
 
             // Update all terminators to use final targets
             self.thread_jumps(func, &final_targets);
@@ -96,13 +104,13 @@ impl JumpThreader {
 
         // Update predecessor/successor information
         self.update_cfg_edges(func);
-        repair_reachability_phis(func);
+        changed += usize::from(repair_reachability_phis(func));
 
         changed
     }
 
     /// Runs jump threading iteratively until no more changes.
-    pub fn run_to_fixpoint(&mut self, func: &mut Function) -> JumpThreadingStats {
+    fn run_to_fixpoint(&mut self, func: &mut Function) -> JumpThreadingStats {
         let mut total_stats = JumpThreadingStats::default();
         loop {
             let changed = self.run(func);
@@ -122,8 +130,7 @@ impl JumpThreader {
         let mut forwarders = FxHashMap::default();
 
         for (block_id, block) in func.blocks.iter_enumerated() {
-            // Skip the entry block
-            if block_id == func.entry_block {
+            if block.predecessors.is_empty() {
                 continue;
             }
 
@@ -149,11 +156,12 @@ impl JumpThreader {
     fn resolve_final_targets(
         &self,
         forwarders: &FxHashMap<BlockId, BlockId>,
+        block_count: usize,
     ) -> FxHashMap<BlockId, BlockId> {
         let mut final_targets = FxHashMap::default();
 
         for &block_id in forwarders.keys() {
-            let final_target = self.follow_chain(block_id, forwarders);
+            let final_target = self.follow_chain(block_id, forwarders, block_count);
             if final_target != block_id {
                 final_targets.insert(block_id, final_target);
             }
@@ -163,8 +171,13 @@ impl JumpThreader {
     }
 
     /// Follows a chain of forwarders to find the final non-forwarder target.
-    fn follow_chain(&self, start: BlockId, forwarders: &FxHashMap<BlockId, BlockId>) -> BlockId {
-        let mut visited = FxHashSet::default();
+    fn follow_chain(
+        &self,
+        start: BlockId,
+        forwarders: &FxHashMap<BlockId, BlockId>,
+        block_count: usize,
+    ) -> BlockId {
+        let mut visited = DenseBitSet::new_empty(block_count);
         let mut current = start;
 
         while let Some(&next) = forwarders.get(&current) {
@@ -247,6 +260,7 @@ impl JumpThreader {
             | Terminator::ReturnData { .. }
             | Terminator::Stop
             | Terminator::SelfDestruct { .. }
+            | Terminator::TailCall { .. }
             | Terminator::Invalid => {}
         }
     }
@@ -269,11 +283,12 @@ impl JumpThreader {
         for (other_block, block) in func.blocks.iter_enumerated() {
             if other_block != block_id {
                 for &inst_id in &block.instructions {
-                    if func.instructions[inst_id]
+                    if func
+                        .inst(inst_id)
                         .kind
                         .operands()
                         .iter()
-                        .any(|operand| phi_results.contains(operand))
+                        .any(|&operand| phi_results.contains(operand))
                     {
                         return true;
                     }
@@ -284,7 +299,7 @@ impl JumpThreader {
                 continue;
             }
             if let Some(term) = &block.terminator
-                && term.operands().iter().any(|operand| phi_results.contains(operand))
+                && term.operands().iter().any(|&operand| phi_results.contains(operand))
             {
                 return true;
             }
@@ -382,7 +397,7 @@ impl JumpThreader {
         if !func.blocks[block_id].instructions.contains(inst_id) {
             return None;
         }
-        let InstKind::Phi(incoming) = &func.instructions[*inst_id].kind else {
+        let InstKind::Phi(incoming) = &func.inst(*inst_id).kind else {
             return None;
         };
         incoming.iter().find_map(|(incoming_block, incoming_value)| {
@@ -447,6 +462,7 @@ impl JumpThreader {
             | Terminator::ReturnData { .. }
             | Terminator::Stop
             | Terminator::SelfDestruct { .. }
+            | Terminator::TailCall { .. }
             | Terminator::Invalid => false,
         }
     }

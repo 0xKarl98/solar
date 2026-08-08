@@ -1,10 +1,13 @@
 //! ABI packed encoding lowering helpers.
 
 use super::Lowerer;
-use crate::mir::{FunctionBuilder, Value, ValueId};
+use crate::{
+    memory::EvmMemoryLayout,
+    mir::{FunctionBuilder, MemoryObjectKind, Value, ValueId},
+};
 use alloy_primitives::U256;
 use solar_ast::{ElementaryType, LitKind};
-use solar_interface::{Symbol, sym};
+use solar_interface::{Symbol, diagnostics::ErrorGuaranteed, sym};
 use solar_sema::{
     builtins::Builtin,
     hir::{self, CallArgs, ExprKind},
@@ -21,26 +24,96 @@ enum PackedAbiArg {
     DynamicBytes(ValueId),
 }
 
+impl PackedAbiArg {
+    fn max_static_write(args: &[Self]) -> Option<usize> {
+        let mut offset = 0usize;
+        let mut max_write = 0usize;
+        let mut i = 0usize;
+
+        while i < args.len() {
+            if let Some((consumed, len)) = Self::static_word_run(&args[i..]) {
+                max_write = max_write.max(offset + 32);
+                offset += len;
+                i += consumed;
+                continue;
+            }
+
+            match &args[i] {
+                Self::Bytes(bytes) => {
+                    for chunk in bytes.chunks(32) {
+                        max_write = max_write.max(offset + 32);
+                        offset += chunk.len();
+                    }
+                }
+                Self::Value { size, .. } => {
+                    max_write = max_write.max(offset + 32);
+                    offset += *size;
+                }
+                Self::DynamicBytes(_) => return None,
+            }
+            i += 1;
+        }
+
+        Some(max_write)
+    }
+
+    fn static_word_run(args: &[Self]) -> Option<(usize, usize)> {
+        let mut len = 0usize;
+        let mut consumed = 0usize;
+        let mut has_value = false;
+
+        for arg in args {
+            match arg {
+                Self::Bytes(bytes) => {
+                    if bytes.is_empty() {
+                        consumed += 1;
+                        continue;
+                    }
+                    if len + bytes.len() > 32 {
+                        break;
+                    }
+                    len += bytes.len();
+                    consumed += 1;
+                }
+                Self::Value { size, left_aligned: false, .. } if *size < 32 => {
+                    if *size == 0 {
+                        consumed += 1;
+                        continue;
+                    }
+                    if len + *size > 32 {
+                        break;
+                    }
+                    len += *size;
+                    consumed += 1;
+                    has_value = true;
+                }
+                _ => break,
+            }
+        }
+
+        (consumed >= 2 && len != 0 && has_value).then_some((consumed, len))
+    }
+}
+
 impl<'gcx> Lowerer<'gcx> {
     /// Lowers abi.encodePacked with proper tight packing.
     /// Returns bytes memory (pointer to length + data).
     pub(super) fn lower_abi_encode_packed(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        args: &CallArgs<'_>,
-    ) -> ValueId {
+        args: &[hir::Expr<'_>],
+    ) -> Result<ValueId, ErrorGuaranteed> {
         // Arguments are fully lowered before the buffer is touched: nested
         // calls in arguments may allocate memory of their own. The writes
         // below allocate nothing, so filling the buffer past the unbumped
         // free memory pointer and reserving it afterwards is safe.
-        let packed_args = self.collect_packed_abi_args(builder, args);
+        let packed_args = self.collect_packed_abi_args(builder, args)?;
 
-        let free_mem_ptr_slot = builder.imm_u64(0x40);
-        let ptr = builder.mload(free_mem_ptr_slot);
+        let ptr = builder.fmp_object(crate::mir::MemoryObjectLayout::Bytes);
 
         // Data starts at ptr+32 (leaving room for the length word).
         let thirty_two = builder.imm_u64(32);
-        let data_start = builder.add(ptr, thirty_two);
+        let data_start = builder.memory_object_data(ptr, MemoryObjectKind::Bytes);
         let (end, static_len) = self.write_packed_abi_args(builder, data_start, &packed_args);
 
         // Finalize the allocation: length word + data padded to a word
@@ -56,12 +129,12 @@ impl<'gcx> Lowerer<'gcx> {
                 (length, builder.add(aligned, thirty_two))
             }
         };
-        builder.mstore(ptr, length);
+        builder.set_memory_object_len(ptr, length, MemoryObjectKind::Bytes);
         let new_free_ptr = builder.add(ptr, total_size);
-        builder.mstore(free_mem_ptr_slot, new_free_ptr);
+        builder.set_fmp(new_free_ptr);
 
         // Return pointer to the bytes value
-        ptr
+        Ok(ptr)
     }
 
     /// Lowers `keccak256(abi.encodePacked(...))` without materializing a temporary bytes object:
@@ -69,16 +142,16 @@ impl<'gcx> Lowerer<'gcx> {
     pub(super) fn lower_keccak_abi_encode_packed(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        args: &CallArgs<'_>,
-    ) -> ValueId {
-        let packed_args = self.collect_packed_abi_args(builder, args);
+        args: &[hir::Expr<'_>],
+    ) -> Result<ValueId, ErrorGuaranteed> {
+        let packed_args = self.collect_packed_abi_args(builder, args)?;
 
-        let data_start = if Self::static_packed_max_write(&packed_args).is_some_and(|end| end <= 64)
+        let data_start = if PackedAbiArg::max_static_write(&packed_args)
+            .is_some_and(|end| end <= EvmMemoryLayout::FMP_SLOT as usize)
         {
             builder.imm_u64(0)
         } else {
-            let free_mem_ptr_slot = builder.imm_u64(0x40);
-            builder.mload(free_mem_ptr_slot)
+            builder.fmp()
         };
         let (end, static_len) = self.write_packed_abi_args(builder, data_start, &packed_args);
 
@@ -86,17 +159,25 @@ impl<'gcx> Lowerer<'gcx> {
             Some(len) => builder.imm_u64(len),
             None => builder.sub(end, data_start),
         };
-        builder.keccak256(data_start, size)
+        Ok(builder.keccak256(data_start, size))
     }
 
     fn collect_packed_abi_args(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
-        args: &CallArgs<'_>,
-    ) -> Vec<PackedAbiArg> {
+        args: &[hir::Expr<'_>],
+    ) -> Result<Vec<PackedAbiArg>, ErrorGuaranteed> {
         let mut packed_args = Vec::with_capacity(args.len());
 
-        for arg in args.exprs() {
+        for arg in args {
+            let Some(ty) = self.get_expr_type(arg) else {
+                return Err(self
+                    .gcx
+                    .dcx()
+                    .err("codegen cannot determine this packed ABI argument's type")
+                    .span(arg.span)
+                    .emit());
+            };
             if let ExprKind::Lit(lit) = &arg.kind
                 && let LitKind::Str(_, bytes, _) = &lit.kind
             {
@@ -105,36 +186,39 @@ impl<'gcx> Lowerer<'gcx> {
                 continue;
             }
 
+            // Calldata `bytes`/`string` (a parameter, `msg.data`, a
+            // `base[low:high]` slice, or a chained slice): copy into a
+            // `[len][data]` memory buffer and pack its data like any other
+            // dynamic bytes value. A calldata-struct member was already
+            // rebuilt as a memory object, so reuse it directly.
             if self.expr_is_calldata_dynamic_bytes(arg) {
-                self.gcx
-                    .dcx()
-                    .err(
-                        "codegen does not support packed encoding of calldata `bytes`/`string` yet",
-                    )
-                    .span(arg.span)
-                    .emit();
-                continue;
-            }
-
-            // `bytes`/`string` values: their data is packed without padding.
-            if let Some(ty) = self.get_expr_type(arg)
-                && matches!(
-                    ty.peel_refs().kind,
-                    TyKind::Elementary(ElementaryType::Bytes | ElementaryType::String)
-                )
-            {
-                let ptr = self.lower_expr(builder, arg);
+                let value = self.lower_value_expr(builder, arg);
+                let ptr = if Self::value_is_calldata_slice(builder, value) {
+                    self.materialize_calldata_bytes(builder, value)
+                } else {
+                    value
+                };
                 packed_args.push(PackedAbiArg::DynamicBytes(ptr));
                 continue;
             }
 
-            let size = self.get_packed_size_from_expr(arg);
+            // `bytes`/`string` values: their data is packed without padding.
+            if matches!(
+                ty.peel_refs().kind,
+                TyKind::Elementary(ElementaryType::Bytes | ElementaryType::String)
+            ) {
+                let ptr = self.lower_value_expr(builder, arg);
+                packed_args.push(PackedAbiArg::DynamicBytes(ptr));
+                continue;
+            }
+
+            let size = self.get_packed_size_from_expr(arg, ty);
             let left_aligned = self.expr_is_fixed_bytes(arg);
-            let value = self.lower_expr(builder, arg);
+            let value = self.lower_value_expr(builder, arg);
             packed_args.push(PackedAbiArg::Value { value, size, left_aligned });
         }
 
-        packed_args
+        Ok(packed_args)
     }
 
     pub(super) fn expr_is_fixed_bytes(&self, expr: &hir::Expr<'_>) -> bool {
@@ -148,6 +232,24 @@ impl<'gcx> Lowerer<'gcx> {
             TyKind::Elementary(ElementaryType::FixedBytes(n)) => Some(n.bytes()),
             _ => None,
         }
+    }
+
+    /// Lowers an `abi.encodeWithSelector` selector argument as a left-aligned
+    /// selector word. Sema can type a bare number literal as an integer, whose
+    /// lowering is right-aligned; `bytes4`-typed values are already aligned by
+    /// their producers.
+    pub(super) fn lower_selector_word(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        expr: &hir::Expr<'_>,
+    ) -> ValueId {
+        if let ExprKind::Lit(lit) = &expr.kind
+            && let LitKind::Number(n) = &lit.kind
+            && self.fixed_bytes_width_of_expr(expr).is_none()
+        {
+            return builder.imm_u256(*n << 224);
+        }
+        self.lower_value_expr(builder, expr)
     }
 
     pub(super) fn expr_is_calldata_dynamic_bytes(&self, expr: &hir::Expr<'_>) -> bool {
@@ -243,10 +345,9 @@ impl<'gcx> Lowerer<'gcx> {
                 }
                 &PackedAbiArg::DynamicBytes(ptr) => {
                     let dest = self.offset_ptr(builder, base, offset);
-                    let len = builder.mload(ptr);
-                    let word = builder.imm_u64(32);
-                    let src = builder.add(ptr, word);
-                    self.mcopy(builder, dest, src, len, None);
+                    let len = builder.memory_object_len(ptr, MemoryObjectKind::Bytes);
+                    let src = builder.memory_object_data(ptr, MemoryObjectKind::Bytes);
+                    builder.mcopy(dest, src, len);
                     base = builder.add(dest, len);
                     offset = 0;
                     is_static = false;
@@ -330,75 +431,6 @@ impl<'gcx> Lowerer<'gcx> {
         Some((consumed, len as u64))
     }
 
-    fn static_packed_max_write(args: &[PackedAbiArg]) -> Option<usize> {
-        let mut offset = 0usize;
-        let mut max_write = 0usize;
-        let mut i = 0usize;
-
-        while i < args.len() {
-            if let Some((consumed, len)) = Self::static_packed_word_run(&args[i..]) {
-                max_write = max_write.max(offset + 32);
-                offset += len;
-                i += consumed;
-                continue;
-            }
-
-            match &args[i] {
-                PackedAbiArg::Bytes(bytes) => {
-                    for chunk in bytes.chunks(32) {
-                        max_write = max_write.max(offset + 32);
-                        offset += chunk.len();
-                    }
-                }
-                PackedAbiArg::Value { size, .. } => {
-                    max_write = max_write.max(offset + 32);
-                    offset += *size;
-                }
-                PackedAbiArg::DynamicBytes(_) => return None,
-            }
-            i += 1;
-        }
-
-        Some(max_write)
-    }
-
-    fn static_packed_word_run(args: &[PackedAbiArg]) -> Option<(usize, usize)> {
-        let mut len = 0usize;
-        let mut consumed = 0usize;
-        let mut has_value = false;
-
-        for arg in args {
-            match arg {
-                PackedAbiArg::Bytes(bytes) => {
-                    if bytes.is_empty() {
-                        consumed += 1;
-                        continue;
-                    }
-                    if len + bytes.len() > 32 {
-                        break;
-                    }
-                    len += bytes.len();
-                    consumed += 1;
-                }
-                PackedAbiArg::Value { size, left_aligned: false, .. } if *size < 32 => {
-                    if *size == 0 {
-                        consumed += 1;
-                        continue;
-                    }
-                    if len + *size > 32 {
-                        break;
-                    }
-                    len += *size;
-                    consumed += 1;
-                    has_value = true;
-                }
-                _ => break,
-            }
-        }
-
-        (consumed >= 2 && len != 0 && has_value).then_some((consumed, len))
-    }
-
     pub(super) fn abi_encode_packed_call_args<'a>(
         &self,
         expr: &'a hir::Expr<'a>,
@@ -425,13 +457,13 @@ impl<'gcx> Lowerer<'gcx> {
         let ExprKind::Member(base, member) = &callee.kind else {
             return None;
         };
-        matches!(self.ident_builtin(base), Some(Builtin::Abi))
+        (self.gcx.resolved_builtin(base) == Some(Builtin::Abi))
             .then_some(args)
             .filter(|_| member.name == name)
     }
 
     /// Gets the packed size in bytes for an expression (used by abi.encodePacked).
-    fn get_packed_size_from_expr(&self, expr: &hir::Expr<'_>) -> usize {
+    fn get_packed_size_from_expr(&self, expr: &hir::Expr<'_>, ty: Ty<'gcx>) -> usize {
         if let ExprKind::Lit(lit) = &expr.kind {
             return match &lit.kind {
                 LitKind::Str(_, bytes, _) => bytes.as_byte_str().len(),
@@ -441,7 +473,7 @@ impl<'gcx> Lowerer<'gcx> {
             };
         }
 
-        self.get_expr_type(expr).map(|ty| self.get_packed_size_from_ty(ty)).unwrap_or(32)
+        self.get_packed_size_from_ty(ty)
     }
 
     /// Gets the packed size from a sema type.

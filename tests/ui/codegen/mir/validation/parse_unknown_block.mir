@@ -1,0 +1,8 @@
+//@compile-flags: -Zmir-pipeline=none
+
+@module UnknownBlock
+
+fn @f() {
+  bb0:
+    jump bb9 //~ ERROR: unknown block `bb9`
+}

@@ -6,45 +6,33 @@ use crate::{
 use alloy_primitives::{B256, U256};
 use rayon::prelude::*;
 use solar_ast::{DataLocation, StateMutability, Visibility};
-use solar_data_structures::{
-    Never,
-    map::{FxHashSet, FxIndexMap},
-    parallel,
-};
+use solar_data_structures::{Never, bit_set::GrowableBitSet, map::FxIndexMap, parallel};
 use solar_interface::{Span, diagnostics::ErrorGuaranteed, error_code};
 use std::ops::ControlFlow;
 
 mod checker;
 pub(crate) mod override_checker;
 mod udvt;
+mod view_pure_checker;
 
 pub(crate) fn check(gcx: Gcx<'_>) {
-    let mut typeck_results = None;
+    let mut typeck_results = TypeckResults::default();
     parallel!(gcx.sess, gcx.hir.par_contract_ids().for_each(|id| check_contract(gcx, id)), {
-        if gcx.sess.opts.unstable.typeck
-            || gcx.sess.opts.unstable.codegen
-            || gcx.sess.opts.emit.iter().any(|e| e.is_codegen())
-        {
-            typeck_results = Some(
-                gcx.hir
-                    .par_source_ids()
-                    .map(|id| {
-                        check_source(gcx, id);
-                        // TODO: Parallelize more.
-                        checker::check(gcx, id)
-                    })
-                    .reduce(TypeckResults::default, |mut a, b| {
-                        merge_typeck_results(gcx, &mut a, b);
-                        a
-                    }),
-            );
-        } else {
-            gcx.hir.par_source_ids().for_each(|id| check_source(gcx, id));
-        }
+        typeck_results = gcx
+            .hir
+            .par_source_ids()
+            .map(|id| {
+                check_source(gcx, id);
+                // TODO: Parallelize more.
+                checker::check(gcx, id)
+            })
+            .reduce(TypeckResults::default, |mut a, b| {
+                merge_typeck_results(gcx, &mut a, b);
+                a
+            });
     },);
-    if let Some(typeck_results) = typeck_results {
-        gcx.set_typeck_results(typeck_results);
-    }
+    gcx.set_typeck_results(typeck_results);
+    view_pure_checker::check(gcx);
 }
 
 fn check_contract(gcx: Gcx<'_>, id: hir::ContractId) {
@@ -85,6 +73,16 @@ fn merge_typeck_results<'gcx>(
         }
     }
 
+    for (id, res) in new_results.resolved_exprs {
+        if let Some(prev_res) = results.resolved_exprs.insert(id, res) {
+            gcx.dcx()
+                .bug(format!(
+                    "expression {id:?} already has resolution {prev_res:?}; tried to register {res:?}",
+                ))
+                .emit();
+        }
+    }
+
     for (id, res) in new_results.resolved_callees {
         if let Some(prev_res) = results.resolved_callees.insert(id, res) {
             gcx.dcx()
@@ -95,17 +93,13 @@ fn merge_typeck_results<'gcx>(
         }
     }
 
-    for (id, member) in new_results.resolved_members {
-        if let Some(prev_member) = results.resolved_members.insert(id, member) {
-            gcx.dcx()
-                .bug(format!(
-                    "expression {id:?} already has resolved member {prev_member:?}; tried to register {member:?}",
-                ))
-                .emit();
-        }
+    for id in new_results.unsupported_udvt_operators.iter() {
+        results.unsupported_udvt_operators.insert(id);
     }
 
-    results.unsupported_udvt_operators.extend(new_results.unsupported_udvt_operators);
+    for (id, function) in new_results.user_operators {
+        results.user_operators.insert(id, function);
+    }
 }
 
 fn check_using_directive<'gcx>(gcx: Gcx<'gcx>, using: &'gcx hir::UsingDirective<'gcx>) {
@@ -296,14 +290,14 @@ fn check_duplicate_definitions(gcx: Gcx<'_>, scope: &Declarations) {
         true
     };
 
-    let mut reported = FxHashSet::default();
+    let mut reported = GrowableBitSet::new_empty();
     for (_name, decls) in scope.iter() {
         if decls.len() <= 1 {
             continue;
         }
         reported.clear();
         for (i, &decl) in decls.iter().enumerate() {
-            if reported.contains(&i) {
+            if reported.contains(i) {
                 continue;
             }
 
@@ -423,19 +417,44 @@ fn check_receive_function(gcx: Gcx<'_>, contract_id: hir::ContractId) {
 /// Reference: <https://github.com/argotorg/solidity/blob/03e2739809769ae0c8d236a883aadc900da60536/libsolidity/analysis/ContractLevelChecker.cpp#L556C1-L570C2>
 fn check_storage_size_upper_bound(gcx: Gcx<'_>, contract_id: hir::ContractId) {
     let span = gcx.hir.contract(contract_id).name.span;
-    let total_size = match storage_size_upper_bound(gcx, contract_id) {
-        Ok(Some(total_size)) => total_size,
-        Ok(None) => {
-            gcx.dcx().emit_err(span, "contract requires too much storage");
-            return;
+    let mut storage_size = None;
+    let mut transient_storage_size = None;
+    for location in [DataLocation::Storage, DataLocation::Transient] {
+        let total_size = match storage_size_upper_bound(gcx, contract_id, location) {
+            Ok(Some(total_size)) => total_size,
+            Ok(None) => {
+                let message = if location == DataLocation::Storage {
+                    "contract requires too much storage"
+                } else {
+                    "contract requires too much transient storage"
+                };
+                gcx.dcx().emit_err(span, message);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        match location {
+            DataLocation::Storage => storage_size = Some(total_size),
+            DataLocation::Transient => transient_storage_size = Some(total_size),
+            DataLocation::Memory | DataLocation::Calldata => unreachable!(),
         }
-        Err(_) => return,
-    };
+    }
 
-    if gcx.sess.opts.unstable.print_max_storage_sizes {
+    if gcx.sess.opts.unstable.print_max_storage_sizes
+        && let (Some(storage_size), Some(transient_storage_size)) =
+            (storage_size, transient_storage_size)
+    {
         let full_contract_name = gcx.contract_fully_qualified_name(contract_id);
         gcx.dcx()
-            .note(format!("{full_contract_name} requires a maximum of {total_size} storage slots"))
+            .note(format!(
+                "{full_contract_name} requires a maximum of {storage_size} storage slots"
+            ))
+            .span(span)
+            .emit();
+        gcx.dcx()
+            .note(format!(
+                "{full_contract_name} requires a maximum of {transient_storage_size} transient storage slots"
+            ))
             .span(span)
             .emit();
     }
@@ -444,12 +463,15 @@ fn check_storage_size_upper_bound(gcx: Gcx<'_>, contract_id: hir::ContractId) {
 fn storage_size_upper_bound(
     gcx: Gcx<'_>,
     contract_id: hir::ContractId,
+    location: DataLocation,
 ) -> Result<Option<U256>, ErrorGuaranteed> {
     let mut total_size = U256::ZERO;
     for item_id in gcx.hir.contract_item_ids(contract_id) {
-        // Skip constant and immutable variables
+        // Skip constant and immutable variables and variables from the other storage space.
         if let hir::Item::Variable(var) = gcx.hir.item(item_id)
             && !(var.is_constant() || var.is_immutable())
+            && (var.data_location == Some(DataLocation::Transient))
+                == (location == DataLocation::Transient)
         {
             let ty = gcx.type_of_item(item_id);
             let Some(size) = ty_storage_size_upper_bound(ty, gcx)? else { return Ok(None) };
@@ -578,11 +600,9 @@ impl<'gcx> Visit<'gcx> for BreakContinueChecker<'gcx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Compiler, hir::ExprKind};
-    use solar_interface::{
-        Session,
-        config::{CompileOpts, UnstableOpts},
-    };
+    use crate::{Compiler, builtins::Builtin, hir::ExprKind};
+    use solar_data_structures::Never;
+    use solar_interface::{Session, config::CompileOpts};
     use std::path::PathBuf;
 
     const SOURCE: &str = r#"
@@ -596,6 +616,53 @@ contract C {
 contract D {
     function g(uint256 x) public pure returns (uint256) {
         return x * 2;
+    }
+}
+"#;
+    const QUERY_SOURCE: &str = r#"
+library L {
+    function attached(address, uint256) internal pure {}
+}
+
+using L for address;
+
+struct Callbacks {
+    function(uint256) internal callback;
+}
+
+contract C {
+    function query(
+        function(uint256) internal callback,
+        address target,
+        Callbacks memory callbacks
+    ) internal {
+        ((target)).attached(1);
+        callback(2);
+        callbacks.callback(3);
+        require(true);
+    }
+}
+"#;
+    const AMBIGUOUS_CALL_SOURCE: &str = r#"
+contract C {
+    function overloaded(uint256) internal {}
+    function overloaded(int256) internal {}
+
+    function query() internal {
+        overloaded(1);
+    }
+}
+"#;
+    const PUBLIC_STATE_VARIABLE_SOURCE: &str = r#"
+contract C {
+    uint256 public number;
+
+    function setNumber(uint256 newNumber) public {
+        number = newNumber;
+    }
+
+    function increment() public {
+        number++;
     }
 }
 "#;
@@ -620,14 +687,46 @@ contract D {
         }
     }
 
-    fn binary_expr_types(typeck: bool) -> Vec<Option<String>> {
-        let sess = Session::builder()
-            .opts(CompileOpts {
-                unstable: UnstableOpts { typeck, ..Default::default() },
-                ..Default::default()
-            })
-            .with_test_emitter()
-            .build();
+    struct CallExprs<'hir> {
+        hir: &'hir hir::Hir<'hir>,
+        calls: Vec<&'hir hir::Expr<'hir>>,
+    }
+
+    impl<'hir> Visit<'hir> for CallExprs<'hir> {
+        type BreakValue = Never;
+
+        fn hir(&self) -> &'hir hir::Hir<'hir> {
+            self.hir
+        }
+
+        fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
+            if matches!(expr.kind, ExprKind::Call(..)) {
+                self.calls.push(expr);
+            }
+            self.walk_expr(expr)
+        }
+    }
+
+    struct Exprs<'hir> {
+        hir: &'hir hir::Hir<'hir>,
+        exprs: Vec<&'hir hir::Expr<'hir>>,
+    }
+
+    impl<'hir> Visit<'hir> for Exprs<'hir> {
+        type BreakValue = Never;
+
+        fn hir(&self) -> &'hir hir::Hir<'hir> {
+            self.hir
+        }
+
+        fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
+            self.exprs.push(expr);
+            self.walk_expr(expr)
+        }
+    }
+
+    fn binary_expr_types() -> Vec<Option<String>> {
+        let sess = Session::builder().opts(CompileOpts::default()).with_test_emitter().build();
         let mut compiler = Compiler::new(sess);
 
         compiler.enter_mut(|c| {
@@ -663,12 +762,136 @@ contract D {
     }
 
     #[test]
-    fn expression_types_are_available_after_typeck() {
-        assert_eq!(binary_expr_types(true), [Some("uint256".to_string()), Some("uint256".into())]);
+    fn expression_types_are_available_by_default() {
+        assert_eq!(binary_expr_types(), [Some("uint256".to_string()), Some("uint256".into())]);
     }
 
     #[test]
-    fn expression_types_are_empty_without_typeck() {
-        assert_eq!(binary_expr_types(false), [None, None]);
+    fn lint_query_helpers_preserve_call_semantics() {
+        let sess = Session::builder().opts(CompileOpts::default()).with_test_emitter().build();
+        let mut compiler = Compiler::new(sess);
+
+        compiler.enter_mut(|c| {
+            let mut pcx = c.parse();
+            let file = c
+                .sess()
+                .source_map()
+                .new_source_file(PathBuf::from("query.sol"), QUERY_SOURCE)
+                .unwrap();
+            pcx.add_file(file);
+            pcx.parse();
+
+            assert_eq!(c.lower_asts(), Ok(ControlFlow::Continue(())));
+            assert_eq!(c.analysis(), Ok(ControlFlow::Continue(())));
+        });
+
+        compiler.enter(|c| {
+            let gcx = c.gcx();
+            let mut visitor = CallExprs { hir: &gcx.hir, calls: Vec::new() };
+            let source = gcx.hir.source_ids().next().unwrap();
+            assert_eq!(visitor.visit_nested_source(source), ControlFlow::Continue(()));
+            let [attached_call, variable_call, field_call, builtin_call] = visitor.calls.as_slice()
+            else {
+                panic!("expected four calls, got {}", visitor.calls.len())
+            };
+
+            let attached = gcx.resolved_call(attached_call).unwrap();
+            assert!(attached.attached);
+            assert!(attached.res.as_function().is_some());
+
+            let variable = gcx.resolved_call(variable_call).unwrap();
+            assert!(!variable.attached);
+            assert!(variable.res.as_variable().is_some());
+
+            let field = gcx.resolved_call(field_call).unwrap();
+            assert!(!field.attached);
+            let field_id = field.res.as_variable().unwrap();
+            assert!(matches!(gcx.hir.variable(field_id).parent, Some(hir::ItemId::Struct(_))));
+
+            let builtin = gcx.resolved_call(builtin_call).unwrap();
+            assert!(!builtin.attached);
+            assert_eq!(builtin.res.as_builtin(), Some(Builtin::Require));
+
+            let ExprKind::Call(attached_callee, ..) = attached_call.kind else { unreachable!() };
+            let ExprKind::Member(receiver, _) = attached_callee.kind else { unreachable!() };
+            assert_ne!(receiver.id, receiver.peel_parens().id);
+            assert!(gcx.type_of_expr(receiver.id).is_some_and(|ty| ty.is_address()));
+            assert!(gcx.types.address_payable.is_address());
+            assert!(!gcx.types.bool.is_address());
+            assert!(gcx.resolved_call(receiver).is_none());
+        });
+    }
+
+    #[test]
+    fn resolved_call_preserves_failed_overload_resolution() {
+        let sess = Session::builder().opts(CompileOpts::default()).with_test_emitter().build();
+        let mut compiler = Compiler::new(sess);
+
+        compiler.enter_mut(|c| {
+            let mut pcx = c.parse();
+            let file = c
+                .sess()
+                .source_map()
+                .new_source_file(PathBuf::from("ambiguous.sol"), AMBIGUOUS_CALL_SOURCE)
+                .unwrap();
+            pcx.add_file(file);
+            pcx.parse();
+
+            assert_eq!(c.lower_asts(), Ok(ControlFlow::Continue(())));
+            assert_eq!(c.analysis(), Ok(ControlFlow::Continue(())));
+        });
+
+        compiler.enter(|c| {
+            let gcx = c.gcx();
+            let mut visitor = CallExprs { hir: &gcx.hir, calls: Vec::new() };
+            let source = gcx.hir.source_ids().next().unwrap();
+            assert_eq!(visitor.visit_nested_source(source), ControlFlow::Continue(()));
+            let [call] = visitor.calls.as_slice() else {
+                panic!("expected one call, got {}", visitor.calls.len())
+            };
+            let ExprKind::Call(callee, ..) = call.kind else { unreachable!() };
+            assert!(gcx.resolved_callee(callee.id).is_some_and(|resolved| resolved.res.is_err()));
+            assert!(gcx.resolved_call(call).is_some_and(|resolved| resolved.res.is_err()));
+        });
+    }
+
+    #[test]
+    fn resolved_expr_uses_typechecked_value_overload() {
+        let sess = Session::builder().opts(CompileOpts::default()).with_test_emitter().build();
+        let mut compiler = Compiler::new(sess);
+
+        compiler.enter_mut(|c| {
+            let mut pcx = c.parse();
+            let file = c
+                .sess()
+                .source_map()
+                .new_source_file(PathBuf::from("state-variable.sol"), PUBLIC_STATE_VARIABLE_SOURCE)
+                .unwrap();
+            pcx.add_file(file);
+            pcx.parse();
+
+            assert_eq!(c.lower_asts(), Ok(ControlFlow::Continue(())));
+            assert_eq!(c.analysis(), Ok(ControlFlow::Continue(())));
+        });
+
+        compiler.enter(|c| {
+            let gcx = c.gcx();
+            let mut visitor = Exprs { hir: &gcx.hir, exprs: Vec::new() };
+            let source = gcx.hir.source_ids().next().unwrap();
+            assert_eq!(visitor.visit_nested_source(source), ControlFlow::Continue(()));
+
+            let source_map = gcx.sess.source_map();
+            let number_resolutions = visitor
+                .exprs
+                .into_iter()
+                .filter(|expr| source_map.span_to_snippet(expr.span).as_deref() == Ok("number"))
+                .map(|expr| gcx.resolved_variable(expr))
+                .collect::<Vec<_>>();
+            let [Some(assignment), Some(increment)] = number_resolutions.as_slice() else {
+                panic!("expected two resolved references, got {number_resolutions:?}")
+            };
+            assert_eq!(assignment, increment);
+            assert!(gcx.hir.variable(*assignment).getter.is_some());
+        });
     }
 }

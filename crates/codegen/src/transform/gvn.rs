@@ -46,11 +46,35 @@
 use crate::{
     analysis::CfgInfo,
     mir::{
-        BlockId, Function, Immediate, InstId, InstKind, MirType, Value, ValueId, utils as mir_utils,
+        BlockId, Function, Immediate, InstId, InstKind, MemoryObjectKind, MemoryObjectLayout,
+        MirType, Module, Value, ValueId, utils as mir_utils,
     },
-    pass::FunctionPass,
+    pass::{MirPass, run_function_pass},
 };
-use solar_data_structures::map::{FxHashMap, FxHashSet};
+use solar_data_structures::{bit_set::DenseBitSet, index::IndexVec, map::FxHashMap};
+use std::rc::Rc;
+
+/// Function pass for congruence-class global value numbering.
+pub(crate) struct Gvn;
+
+impl MirPass for Gvn {
+    fn name(&self) -> &'static str {
+        "gvn"
+    }
+
+    fn run_pass(
+        &self,
+        _gcx: solar_sema::Gcx<'_>,
+        module: &mut Module,
+        analyses: &mut crate::pass::ModuleAnalyses,
+    ) -> bool {
+        run_function_pass(module, analyses, |func, analyses| {
+            let mut numberer = GlobalValueNumberer::new();
+            numberer.cfg = Some(Rc::clone(&analyses.cfg));
+            numberer.run(func) != 0
+        })
+    }
+}
 
 /// Hard cap on value-numbering sweeps per round.
 const MAX_VN_SWEEPS: usize = 10;
@@ -62,22 +86,12 @@ type ClassId = ValueId;
 
 /// Congruence-class global value numbering pass.
 #[derive(Debug, Default)]
-pub struct GlobalValueNumberer {
+struct GlobalValueNumberer {
+    /// Shared CFG snapshot; GVN rounds only replace values, so one snapshot
+    /// serves every round.
+    cfg: Option<Rc<CfgInfo>>,
     /// Number of instructions folded onto a congruent leader.
-    pub eliminated_count: usize,
-}
-
-/// Function pass for congruence-class global value numbering.
-pub struct GvnPass;
-
-impl FunctionPass for GvnPass {
-    fn name(&self) -> &str {
-        "gvn"
-    }
-
-    fn run_on_function(&mut self, func: &mut Function) -> bool {
-        GlobalValueNumberer::new().run(func) != 0
-    }
+    eliminated_count: usize,
 }
 
 /// A hash-consing key for one instruction: its expression over operand
@@ -106,6 +120,7 @@ enum ExprKind {
     Or(ClassId, ClassId),
     Xor(ClassId, ClassId),
     Not(ClassId),
+    Clz(ClassId),
     Shl(ClassId, ClassId),
     Shr(ClassId, ClassId),
     Sar(ClassId, ClassId),
@@ -121,27 +136,31 @@ enum ExprKind {
     CalldataLoad(ClassId),
     BlockHash(ClassId),
     BlobHash(ClassId),
-    LoadImmutable(u32),
+    MakeSlice(ClassId, ClassId, crate::mir::SliceLocation),
+    SlicePtr(ClassId),
+    SliceLen(ClassId),
+    MemoryObjectData(ClassId, MemoryObjectKind),
+    MemoryObjectFieldAddr(ClassId, MemoryObjectLayout, u64),
+    MemoryObjectElementAddr(ClassId, MemoryObjectLayout, ClassId),
     Phi(BlockId, Vec<(BlockId, ClassId)>),
 }
 
 struct ReplaceCtx<'a> {
-    vn: &'a [ClassId],
+    vn: &'a IndexVec<ValueId, ClassId>,
     cfg: &'a CfgInfo,
-    inst_results: &'a FxHashMap<InstId, ValueId>,
     replacements: &'a mut FxHashMap<ValueId, ValueId>,
-    dead: &'a mut FxHashSet<InstId>,
+    dead: &'a mut DenseBitSet<InstId>,
 }
 
 impl GlobalValueNumberer {
     /// Creates a new GVN pass.
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     /// Runs GVN on a function to a fixed point of number-then-replace rounds.
     /// Returns the number of instructions eliminated.
-    pub fn run(&mut self, func: &mut Function) -> usize {
+    fn run(&mut self, func: &mut Function) -> usize {
         self.eliminated_count = 0;
         for _ in 0..MAX_ROUNDS {
             if !self.run_round(func) {
@@ -153,38 +172,32 @@ impl GlobalValueNumberer {
 
     /// Runs one numbering and replacement round. Returns true if MIR changed.
     fn run_round(&mut self, func: &mut Function) -> bool {
-        let cfg = CfgInfo::new(func);
-        let inst_results = func.inst_results();
-        let Some(vn) = Self::compute_value_numbers(func, cfg.rpo(), &inst_results) else {
+        let cfg = self.cfg.as_ref().map_or_else(|| Rc::new(CfgInfo::new(func)), Rc::clone);
+        let Some((vn, available_values)) = Self::compute_value_numbers(func, cfg.rpo()) else {
             return false;
         };
 
         // Immediates, arguments, and undefs are available everywhere, so their
         // classes start with a leader. This folds phi-of-same over constants.
         let mut leaders: FxHashMap<ClassId, ValueId> = FxHashMap::default();
-        for (value_id, value) in func.values.iter_enumerated() {
-            if !matches!(value, Value::Inst(_)) && vn[value_id.index()] == value_id {
+        for value_id in available_values.iter() {
+            if vn[value_id] == value_id {
                 leaders.insert(value_id, value_id);
             }
         }
 
         let mut replacements = FxHashMap::default();
-        let mut dead = FxHashSet::default();
-        let mut ctx = ReplaceCtx {
-            vn: &vn,
-            cfg: &cfg,
-            inst_results: &inst_results,
-            replacements: &mut replacements,
-            dead: &mut dead,
-        };
-        self.replace_in_block(func, func.entry_block, &mut leaders, &mut ctx);
+        let mut dead = DenseBitSet::new_empty(func.num_insts());
+        let mut ctx =
+            ReplaceCtx { vn: &vn, cfg: &cfg, replacements: &mut replacements, dead: &mut dead };
+        self.replace_in_block(func, BlockId::ENTRY, &mut leaders, &mut ctx);
 
         if replacements.is_empty() {
             return false;
         }
         Self::apply_replacements_to_all_blocks(func, &replacements);
         for block in func.blocks.iter_mut() {
-            block.instructions.retain(|id| !dead.contains(id));
+            block.instructions.retain(|&id| !dead.contains(id));
         }
         true
     }
@@ -196,21 +209,31 @@ impl GlobalValueNumberer {
     fn compute_value_numbers(
         func: &Function,
         rpo: &[BlockId],
-        inst_results: &FxHashMap<InstId, ValueId>,
-    ) -> Option<Vec<ClassId>> {
-        let mut vn: Vec<ClassId> = func.values.indices().collect();
+    ) -> Option<(IndexVec<ValueId, ClassId>, DenseBitSet<ValueId>)> {
+        let mut vn = IndexVec::with_capacity(func.num_values());
+        for _ in 0..func.num_values() {
+            let value_id = vn.next_idx();
+            vn.push(value_id);
+        }
+        let mut available_values = DenseBitSet::new_empty(func.num_values());
         let mut immediate_reps: FxHashMap<Immediate, ValueId> = FxHashMap::default();
-        let mut arg_reps: FxHashMap<u32, ValueId> = FxHashMap::default();
-        for (value_id, value) in func.values.iter_enumerated() {
-            match value {
-                Value::Immediate(imm) => {
-                    vn[value_id.index()] = *immediate_reps.entry(imm.clone()).or_insert(value_id);
-                }
-                Value::Arg { index, .. } => {
-                    vn[value_id.index()] = *arg_reps.entry(*index).or_insert(value_id);
-                }
-                Value::Inst(_) | Value::Undef(_) | Value::Error(_) => {}
+        let mut arg_reps = FxHashMap::default();
+        let mut initialize = |value_id| match func.value(value_id) {
+            Value::Immediate(imm) => {
+                available_values.insert(value_id);
+                vn[value_id] = *immediate_reps.entry(imm.clone()).or_insert(value_id);
             }
+            Value::Arg(index) => {
+                available_values.insert(value_id);
+                vn[value_id] = *arg_reps.entry(*index).or_insert(value_id);
+            }
+            Value::Undef(_) | Value::Error(_) => {
+                available_values.insert(value_id);
+            }
+            Value::Inst(_) => {}
+        };
+        for value in func.live_values() {
+            initialize(value);
         }
 
         for _ in 0..MAX_VN_SWEEPS {
@@ -218,22 +241,22 @@ impl GlobalValueNumberer {
             let mut changed = false;
             for &block_id in rpo {
                 for &inst_id in &func.blocks[block_id].instructions {
-                    let Some(&result) = inst_results.get(&inst_id) else { continue };
-                    let inst = &func.instructions[inst_id];
+                    let Some(result) = func.inst_result_value(inst_id) else { continue };
+                    let inst = func.inst(inst_id);
                     let Some(ty) = inst.result_ty else { continue };
                     let Some(class) =
                         Self::instruction_class(block_id, &inst.kind, ty, result, &vn, &mut table)
                     else {
                         continue;
                     };
-                    if vn[result.index()] != class {
-                        vn[result.index()] = class;
+                    if vn[result] != class {
+                        vn[result] = class;
                         changed = true;
                     }
                 }
             }
             if !changed {
-                return Some(vn);
+                return Some((vn, available_values));
             }
         }
         None
@@ -250,14 +273,14 @@ impl GlobalValueNumberer {
         kind: &InstKind,
         ty: MirType,
         result: ValueId,
-        vn: &[ClassId],
+        vn: &IndexVec<ValueId, ClassId>,
         table: &mut FxHashMap<ExprKey, ClassId>,
     ) -> Option<ClassId> {
         if let InstKind::Phi(incoming) = kind {
             let Some((&(_, first), rest)) = incoming.split_first() else { return Some(result) };
             // Phi-of-same: a phi over one class is that class.
-            if rest.iter().all(|&(_, value)| vn[value.index()] == vn[first.index()]) {
-                return Some(vn[first.index()]);
+            if rest.iter().all(|&(_, value)| vn[value] == vn[first]) {
+                return Some(vn[first]);
             }
             let Some(incoming) = Self::phi_key_incoming(incoming, vn) else { return Some(result) };
             let key = ExprKey { kind: ExprKind::Phi(block_id, incoming), ty };
@@ -271,10 +294,10 @@ impl GlobalValueNumberer {
     /// sorted by predecessor with exact duplicates removed.
     fn phi_key_incoming(
         incoming: &[(BlockId, ValueId)],
-        vn: &[ClassId],
+        vn: &IndexVec<ValueId, ClassId>,
     ) -> Option<Vec<(BlockId, ClassId)>> {
         let mut entries: Vec<(BlockId, ClassId)> =
-            incoming.iter().map(|&(pred, value)| (pred, vn[value.index()])).collect();
+            incoming.iter().map(|&(pred, value)| (pred, vn[value])).collect();
         entries.sort_by_key(|&(pred, class)| (pred.index(), class.index()));
         entries.dedup();
         // A predecessor listed with two distinct classes has no well-defined
@@ -287,8 +310,8 @@ impl GlobalValueNumberer {
 
     /// Builds the expression shape over operand classes for pure word ops.
     /// Returns `None` for every other instruction.
-    fn expr_kind(kind: &InstKind, vn: &[ClassId]) -> Option<ExprKind> {
-        let class = |value: ValueId| vn[value.index()];
+    fn expr_kind(kind: &InstKind, vn: &IndexVec<ValueId, ClassId>) -> Option<ExprKind> {
+        let class = |value: ValueId| vn[value];
         let sorted = |a: ValueId, b: ValueId| {
             let (a, b) = (class(a), class(b));
             if b.index() < a.index() { (b, a) } else { (a, b) }
@@ -345,16 +368,30 @@ impl GlobalValueNumberer {
             InstKind::SGt(a, b) => ExprKind::SLt(class(b), class(a)),
             InstKind::IsZero(a) => ExprKind::IsZero(class(a)),
             InstKind::Not(a) => ExprKind::Not(class(a)),
+            InstKind::Clz(a) => ExprKind::Clz(class(a)),
             InstKind::Select(condition, then_value, else_value) => {
                 ExprKind::Select(class(condition), class(then_value), class(else_value))
             }
             InstKind::CalldataLoad(a) => ExprKind::CalldataLoad(class(a)),
             InstKind::BlockHash(a) => ExprKind::BlockHash(class(a)),
             InstKind::BlobHash(a) => ExprKind::BlobHash(class(a)),
-            // Immutable reads are constant once the runtime code is patched.
-            InstKind::LoadImmutable(offset) => ExprKind::LoadImmutable(offset),
+            InstKind::MakeSlice { ptr, len, location } => {
+                ExprKind::MakeSlice(class(ptr), class(len), location)
+            }
+            InstKind::SlicePtr(slice) => ExprKind::SlicePtr(class(slice)),
+            InstKind::SliceLen(slice) => ExprKind::SliceLen(class(slice)),
+            InstKind::MemoryObjectData(object, kind) => {
+                ExprKind::MemoryObjectData(class(object), kind)
+            }
+            InstKind::MemoryObjectFieldAddr { object, layout, field } => {
+                ExprKind::MemoryObjectFieldAddr(class(object), layout, field)
+            }
+            InstKind::MemoryObjectElementAddr { object, layout, index } => {
+                ExprKind::MemoryObjectElementAddr(class(object), layout, class(index))
+            }
             // Everything else (memory, storage, environment reads, calls,
-            // gas/msize/returndatasize, keccak) never merges in this pass.
+            // gas/msize/returndatasize, keccak, immutable reads) never merges
+            // in this pass. CSE handles reads that require clobber tracking.
             _ => return None,
         })
     }
@@ -370,12 +407,12 @@ impl GlobalValueNumberer {
         ctx: &mut ReplaceCtx<'_>,
     ) {
         for &inst_id in &func.blocks[block_id].instructions {
-            let Some(&result) = ctx.inst_results.get(&inst_id) else { continue };
-            let kind = &func.instructions[inst_id].kind;
+            let Some(result) = func.inst_result_value(inst_id) else { continue };
+            let kind = &func.inst(inst_id).kind;
             if !matches!(kind, InstKind::Phi(_)) && Self::expr_kind(kind, ctx.vn).is_none() {
                 continue;
             }
-            let class = ctx.vn[result.index()];
+            let class = ctx.vn[result];
             if let Some(&leader) = leaders.get(&class) {
                 if leader != result {
                     ctx.replacements.insert(result, leader);
@@ -413,9 +450,10 @@ impl GlobalValueNumberer {
         block_id: BlockId,
         replacements: &FxHashMap<ValueId, ValueId>,
     ) {
-        let inst_ids: Vec<InstId> = func.blocks[block_id].instructions.clone();
-        for inst_id in inst_ids {
-            let inst = &mut func.instructions[inst_id];
+        let instruction_count = func.blocks[block_id].instructions.len();
+        for index in 0..instruction_count {
+            let inst_id = func.blocks[block_id].instructions[index];
+            let inst = func.inst_mut(inst_id);
             if mir_utils::replace_inst_uses_canonicalized(&mut inst.kind, replacements) != 0 {
                 if mir_utils::is_memory_inst(&inst.kind) {
                     inst.metadata.set_memory_region(None);

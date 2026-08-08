@@ -19,7 +19,7 @@ use solar_data_structures::map::FxHashMap;
 
 /// One affine induction-variable term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AffineTerm {
+pub(crate) struct AffineTerm {
     /// Loop induction variable.
     pub value: ValueId,
     /// Signed scale applied to the induction variable.
@@ -28,11 +28,11 @@ pub struct AffineTerm {
 
 /// An affine expression in one loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AffineExpr {
+pub(crate) struct AffineExpr {
     /// Optional loop-invariant base value.
     pub base: Option<ValueId>,
     /// Signed constant offset.
-    pub constant: i128,
+    pub(crate) constant: i128,
     /// Induction-variable terms.
     pub terms: SmallVec<[AffineTerm; 2]>,
 }
@@ -102,24 +102,38 @@ impl AffineExpr {
 
 /// Affine expressions recognized for one loop.
 #[derive(Clone, Debug, Default)]
-pub struct ScalarEvolution {
+pub(crate) struct ScalarEvolution {
     expressions: FxHashMap<ValueId, AffineExpr>,
 }
 
 impl ScalarEvolution {
     /// Computes affine expressions for values used by `loop_data`.
     #[must_use]
-    pub fn analyze(func: &Function, loop_data: &Loop) -> Self {
+    pub(crate) fn analyze(func: &Function, loop_data: &Loop) -> Self {
         let mut analysis = Self::default();
-        for value in func.values.indices() {
-            let _ = analysis.affine_expr(func, loop_data, value);
+        for block_id in &loop_data.blocks {
+            let block = &func.blocks[block_id];
+            for &inst_id in &block.instructions {
+                let inst = func.inst(inst_id);
+                for operand in inst.kind.operands() {
+                    let _ = analysis.affine_expr(func, loop_data, operand);
+                }
+                if let Some(result) = func.inst_result_value(inst_id) {
+                    let _ = analysis.affine_expr(func, loop_data, result);
+                }
+            }
+            if let Some(terminator) = &block.terminator {
+                for operand in terminator.operands() {
+                    let _ = analysis.affine_expr(func, loop_data, operand);
+                }
+            }
         }
         analysis
     }
 
     /// Returns the affine expression for a value, if recognized.
     #[must_use]
-    pub fn get(&self, value: ValueId) -> Option<&AffineExpr> {
+    pub(crate) fn get(&self, value: ValueId) -> Option<&AffineExpr> {
         self.expressions.get(&value)
     }
 
@@ -135,7 +149,7 @@ impl ScalarEvolution {
 
         let expr = match func.value(value) {
             Value::Immediate(imm) => AffineExpr::constant(u256_to_i128(imm.as_u256()?)?),
-            Value::Arg { .. } => AffineExpr::base(value),
+            Value::Arg(_) => AffineExpr::base(value),
             Value::Undef(_) | Value::Error(_) => return None,
             Value::Inst(_) if !value_defined_in_loop(func, value, loop_data) => {
                 AffineExpr::base(value)
@@ -144,7 +158,7 @@ impl ScalarEvolution {
                 if loop_data.induction_vars.iter().any(|iv| iv.value == value) {
                     AffineExpr::induction(value)
                 } else {
-                    match func.instructions[*inst_id].kind {
+                    match func.inst(*inst_id).kind {
                         InstKind::Add(a, b) => {
                             let a = self.affine_expr(func, loop_data, a)?;
                             let b = self.affine_expr(func, loop_data, b)?;
@@ -197,9 +211,9 @@ fn value_defined_in_loop(func: &Function, value: ValueId, loop_data: &Loop) -> b
         Value::Inst(inst_id) => loop_data
             .blocks
             .iter()
-            .any(|&block_id| func.blocks[block_id].instructions.contains(inst_id)),
+            .any(|block_id| func.blocks[block_id].instructions.contains(inst_id)),
         Value::Undef(_) | Value::Error(_) => true,
-        Value::Arg { .. } | Value::Immediate(_) => false,
+        Value::Arg(_) | Value::Immediate(_) => false,
     }
 }
 

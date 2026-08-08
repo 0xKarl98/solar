@@ -3,12 +3,14 @@ use crate::{
     ast_lowering::SymbolResolver,
     builtins::{Builtin, members},
     hir::{self, Hir, SourceId},
+    typeck::override_checker::OverrideProxy,
 };
 use alloy_primitives::{B256, Selector, U256, keccak256};
 use either::Either;
 use solar_ast::{DataLocation, StateMutability, TypeSize, UserDefinableOperator, Visibility};
 use solar_data_structures::{
     BumpExt,
+    bit_set::{DenseBitSet, GrowableBitSet},
     fmt::{from_fn, or_list},
     map::{FxBuildHasher, FxHashMap, FxHashSet},
     smallvec::SmallVec,
@@ -19,6 +21,7 @@ use solar_interface::{
     config::CompilerStage,
     diagnostics::{DiagCtxt, ErrorGuaranteed},
     source_map::{FileName, SourceFile},
+    sym,
 };
 use std::{
     fmt,
@@ -31,12 +34,16 @@ use std::{
 };
 use thread_local::ThreadLocal;
 
+pub use crate::natspec::NatSpecView;
+
 mod print;
 pub(crate) use print::TySolcPrinter;
 pub use print::{TyAbiPrinter, TyAbiPrinterMode};
 
 mod common;
 pub use common::{CommonTypes, EachDataLoc};
+
+mod call_graph;
 
 mod interner;
 use interner::Interner;
@@ -76,9 +83,12 @@ pub struct InterfaceFunctions<'gcx> {
 #[derive(Clone, Debug, Default)]
 pub struct TypeckResults<'gcx> {
     pub(crate) expr_types: FxHashMap<hir::ExprId, Ty<'gcx>>,
+    pub(crate) resolved_exprs: FxHashMap<hir::ExprId, hir::Res>,
     pub(crate) resolved_callees: FxHashMap<hir::ExprId, ResolvedCallee>,
-    pub(crate) resolved_members: FxHashMap<hir::ExprId, ResolvedMember>,
-    pub(crate) unsupported_udvt_operators: FxHashSet<hir::ExprId>,
+    pub(crate) unsupported_udvt_operators: GrowableBitSet<hir::ExprId>,
+    /// The user-defined operator function a binary/unary operator expression
+    /// resolves to, keyed by the operator expression's id.
+    pub(crate) user_operators: FxHashMap<hir::ExprId, hir::FunctionId>,
 }
 
 /// The target selected for a call callee expression.
@@ -94,26 +104,6 @@ impl ResolvedCallee {
     pub fn new(res: hir::Res, attached: bool) -> Self {
         Self { res, attached }
     }
-}
-
-/// The target selected for a non-call member access expression.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ResolvedMember {
-    /// A member with a regular item or builtin resolution.
-    Res(hir::Res),
-    /// A struct field selected from the receiver type.
-    StructField { struct_id: hir::StructId, field_index: usize },
-    /// An enum variant selected from `Enum.Variant`.
-    EnumVariant { enum_id: hir::EnumId, variant_index: usize },
-}
-
-/// A completion candidate for a member visible on a receiver type.
-#[derive(Clone, Copy, Debug)]
-pub struct MemberCompletion<'gcx> {
-    /// The visible member candidate.
-    pub member: members::Member<'gcx>,
-    /// The source-level target for the member, if one can be identified.
-    pub resolved: Option<ResolvedMember>,
 }
 
 /// Parameter names available for a callable's visible arguments.
@@ -140,6 +130,8 @@ pub enum CallableParamSource {
     Event(hir::EventId),
     /// An error invocation.
     Error(hir::ErrorId),
+    /// A builtin with named parameters.
+    Builtin(Builtin),
 }
 
 /// The visible signature of a callable expression.
@@ -160,25 +152,20 @@ impl<'gcx> TypeckResults<'gcx> {
         self.expr_types.get(&id).copied()
     }
 
+    /// Returns the target selected for an expression, if available.
+    #[inline]
+    pub fn resolved_expr(&self, expr: &hir::Expr<'_>) -> Option<hir::Res> {
+        let expr = expr.peel_parens();
+        self.resolved_callee(expr.id)
+            .map(|callee| callee.res)
+            .or_else(|| self.resolved_exprs.get(&expr.id).copied())
+            .or_else(|| expr.as_res())
+    }
+
     /// Returns the overload/member target selected for a call callee expression, if available.
     #[inline]
     pub fn resolved_callee(&self, id: hir::ExprId) -> Option<ResolvedCallee> {
         self.resolved_callees.get(&id).copied()
-    }
-
-    /// Returns the target selected for a non-call member access expression, if available.
-    #[inline]
-    pub fn resolved_member(&self, id: hir::ExprId) -> Option<ResolvedMember> {
-        self.resolved_members.get(&id).copied()
-    }
-
-    /// Returns the selected builtin target for a non-call member access expression, if available.
-    #[inline]
-    pub fn builtin_member(&self, id: hir::ExprId) -> Option<Builtin> {
-        match self.resolved_member(id)? {
-            ResolvedMember::Res(hir::Res::Builtin(builtin)) => Some(builtin),
-            _ => None,
-        }
     }
 
     /// Returns the selected builtin target for a call callee expression, if available.
@@ -193,7 +180,14 @@ impl<'gcx> TypeckResults<'gcx> {
     /// Returns whether codegen cannot lower the user-defined operator used by this expression.
     #[inline]
     pub fn unsupported_udvt_operator(&self, id: hir::ExprId) -> bool {
-        self.unsupported_udvt_operators.contains(&id)
+        self.unsupported_udvt_operators.contains(id)
+    }
+
+    /// Returns the user-defined operator function this operator expression
+    /// resolves to, if any.
+    #[inline]
+    pub fn user_operator(&self, id: hir::ExprId) -> Option<hir::FunctionId> {
+        self.user_operators.get(&id).copied()
     }
 }
 
@@ -357,8 +351,7 @@ pub struct GlobalCtxt<'gcx> {
     pub(crate) hir_arenas: ThreadLocal<hir::Arena>,
     interner: Interner<'gcx>,
     cache: Cache<'gcx>,
-    pub(crate) inherited_override_functions:
-        FxOnceMap<hir::ContractId, &'gcx crate::typeck::override_checker::InheritedFunctions<'gcx>>,
+    pub(crate) override_index: OnceLock<crate::typeck::override_checker::OverrideIndex<'gcx>>,
 }
 
 impl fmt::Debug for GlobalCtxt<'_> {
@@ -393,7 +386,7 @@ impl<'gcx> GlobalCtxt<'gcx> {
             hir_arenas,
             interner,
             cache: Cache::default(),
-            inherited_override_functions: FxOnceMap::default(),
+            override_index: OnceLock::new(),
         }
     }
 }
@@ -523,11 +516,118 @@ impl<'gcx> Gcx<'gcx> {
 
     /// Returns the type inferred for the given expression, if available.
     ///
-    /// Expression types are populated by the experimental type checker, which runs when `-Ztypeck`
-    /// or `-Zcodegen` is enabled, or when a codegen output was requested.
+    /// Expression types are populated by the type checker.
     #[inline]
     pub fn type_of_expr(self, id: hir::ExprId) -> Option<Ty<'gcx>> {
         self.typeck_results.get()?.type_of_expr(id)
+    }
+
+    /// Returns the target selected for an expression, if available.
+    ///
+    /// This uses the type checker's selection for overloaded identifiers, member accesses, and
+    /// call callees. Identifier expressions with a single name-resolution candidate do not need a
+    /// type-checker entry and resolve directly from HIR.
+    pub fn resolved_expr(self, expr: &hir::Expr<'_>) -> Option<hir::Res> {
+        if let Some(results) = self.typeck_results.get() {
+            return results.resolved_expr(expr);
+        }
+        expr.as_res()
+    }
+
+    /// Returns the variable selected for an expression, if available.
+    #[inline]
+    pub fn resolved_variable(self, expr: &hir::Expr<'_>) -> Option<hir::VariableId> {
+        self.resolved_expr(expr)?.as_variable()
+    }
+
+    /// Returns the function selected for an expression, if available.
+    #[inline]
+    pub fn resolved_function(self, expr: &hir::Expr<'_>) -> Option<hir::FunctionId> {
+        self.resolved_expr(expr)?.as_function()
+    }
+
+    /// Returns the builtin selected for an expression, if available.
+    #[inline]
+    pub fn resolved_builtin(self, expr: &hir::Expr<'_>) -> Option<Builtin> {
+        self.resolved_expr(expr)?.as_builtin()
+    }
+
+    /// Returns the source argument at the given visible parameter index.
+    ///
+    /// Named arguments are reordered into the selected callable's declaration order. For an
+    /// attached `using for` call, the implicit receiver is not part of this indexing. Positional
+    /// variadic calls are indexed by their source arguments, and explicit type conversions expose
+    /// their single argument at index zero.
+    ///
+    /// Returns `None` if type checking did not identify a callable target. This query maps source
+    /// arguments but does not revalidate their types.
+    pub fn call_arg(
+        self,
+        call: &hir::Expr<'gcx>,
+        parameter_index: usize,
+    ) -> Option<&'gcx hir::Expr<'gcx>> {
+        let hir::ExprKind::Call(callee, args, _) = call.peel_parens().kind else { return None };
+        let callee_ty = self.type_of_expr(callee.id)?;
+        let signature = self.callable_signature_of_ty(callee_ty);
+
+        let parameter_names = match args.kind {
+            hir::CallArgsKind::Unnamed(_) => {
+                let valid_index = signature.is_some_and(|signature| {
+                    parameter_index < signature.parameters.len()
+                        || signature
+                            .parameters
+                            .last()
+                            .is_some_and(|ty| matches!(ty.kind, TyKind::Variadic))
+                }) || matches!(callee_ty.kind, TyKind::Type(_))
+                    && parameter_index == 0;
+                if !valid_index {
+                    return None;
+                }
+                None
+            }
+            hir::CallArgsKind::Named(_) => {
+                let signature = signature?;
+                if parameter_index >= signature.parameters.len() {
+                    return None;
+                }
+                let source = self.call_param_source(callee).or(signature.param_source)?;
+                Some(self.callable_param_names(source))
+            }
+        };
+        args.argument_for_parameter(parameter_index, parameter_names.as_deref())
+    }
+
+    /// Returns the parameter-name source for a type-checked call callee.
+    ///
+    /// The selected callable type takes precedence. Syntax and builtin semantics only recover
+    /// parameter names when the selected signature does not carry a declaration source.
+    pub fn call_param_source(self, callee: &hir::Expr<'_>) -> Option<CallableParamSource> {
+        let callee = callee.peel_parens();
+        if let Some(source) = self
+            .type_of_expr(callee.id)
+            .and_then(|ty| self.callable_signature_of_ty(ty))
+            .and_then(|signature| signature.param_source)
+        {
+            return Some(source);
+        }
+
+        if let Some(id) = self.resolved_variable(callee)
+            && matches!(self.hir.variable(id).ty.kind, hir::TypeKind::Function(_))
+        {
+            return Some(CallableParamSource::FunctionType(id));
+        }
+        if let hir::ExprKind::New(hir_ty) = &callee.kind
+            && let TyKind::Contract(id) = self.type_of_hir_ty(hir_ty).kind
+            && let Some(id) = self.hir.contract(id).ctor
+        {
+            return Some(CallableParamSource::Function { id, skips_receiver: false });
+        }
+        if let Some(builtin) = self.resolved_builtin(callee)
+            && matches!(builtin, Builtin::AbiDecode)
+        {
+            return Some(CallableParamSource::Builtin(builtin));
+        }
+        None
     }
 
     /// Returns the overload/member target selected for a call callee expression, if available.
@@ -536,28 +636,50 @@ impl<'gcx> Gcx<'gcx> {
         self.typeck_results.get()?.resolved_callee(id)
     }
 
-    /// Returns the target selected for a non-call member access expression, if available.
+    /// Returns the target selected for a full call expression.
+    ///
+    /// This preserves whether a member call is attached through `using for` and may resolve to a
+    /// function-typed variable rather than a function declaration.
     #[inline]
-    pub fn resolved_member(self, id: hir::ExprId) -> Option<ResolvedMember> {
-        self.typeck_results.get()?.resolved_member(id)
+    pub fn resolved_call(self, expr: &hir::Expr<'gcx>) -> Option<ResolvedCallee> {
+        let hir::ExprKind::Call(callee, ..) = expr.peel_parens().kind else { return None };
+        self.resolved_callee(callee.id)
     }
 
-    /// Returns the selected builtin target for a non-call member access expression, if available.
-    #[inline]
-    pub fn builtin_member(self, id: hir::ExprId) -> Option<Builtin> {
-        self.typeck_results.get()?.builtin_member(id)
+    /// Resolves every segment of a source path in its source and contract scopes.
+    pub fn source_path_resolutions(
+        self,
+        segments: &[Ident],
+        source: hir::SourceId,
+        contract: Option<hir::ContractId>,
+    ) -> Option<Vec<Vec<hir::Res>>> {
+        self.symbol_resolver.source_path_resolutions(segments, source, contract)
     }
 
-    /// Returns the selected builtin target for a call callee expression, if available.
-    #[inline]
-    pub fn builtin_callee(self, id: hir::ExprId) -> Option<Builtin> {
-        self.typeck_results.get()?.builtin_callee(id)
+    /// Resolves a contract name within a source's scope for NatSpec `@inheritdoc`.
+    pub fn natspec_contract(self, name: Symbol, source: hir::SourceId) -> Option<hir::ContractId> {
+        self.natspec_contract_in_source((name, source))
+    }
+
+    /// Returns the resolved NatSpec doc comments for the given doc ID.
+    ///
+    /// This preserves the flat representation used by compiler outputs. Use [`Gcx::natspec_view`]
+    /// when documentation must be associated with the current item's parameter or return positions.
+    pub fn natspec_doc_comments(self, id: hir::DocId) -> &'gcx [hir::NatSpecItem] {
+        if id.is_empty() { &[] } else { self.natspec_resolution(self.hir.doc(id).item).items() }
     }
 
     /// Returns whether codegen cannot lower the user-defined operator used by this expression.
     #[inline]
     pub fn unsupported_udvt_operator(self, id: hir::ExprId) -> bool {
         self.typeck_results.get().is_some_and(|results| results.unsupported_udvt_operator(id))
+    }
+
+    /// Returns the user-defined operator function this operator expression
+    /// resolves to, if any.
+    #[inline]
+    pub fn user_operator(self, id: hir::ExprId) -> Option<hir::FunctionId> {
+        self.typeck_results.get()?.user_operator(id)
     }
 
     /// Returns whether sparse type-checker results are available for codegen queries.
@@ -599,7 +721,7 @@ impl<'gcx> Gcx<'gcx> {
         state_mutability: StateMutability,
         returns: &[Ty<'gcx>],
     ) -> Ty<'gcx> {
-        self.mk_ty_fn_with_kind(TyFnKind::Internal, parameters, state_mutability, returns)
+        self.mk_ty_fn_with_kind(TyFnKind::Builtin, parameters, state_mutability, returns)
     }
 
     pub(crate) fn mk_yul_builtin_fn(self, parameters: usize, returns: usize) -> Ty<'gcx> {
@@ -934,6 +1056,10 @@ impl<'gcx> Gcx<'gcx> {
             CallableParamSource::Struct(id) => self.param_names(self.hir.strukt(id).fields),
             CallableParamSource::Event(id) => self.param_names(self.hir.event(id).parameters),
             CallableParamSource::Error(id) => self.param_names(self.hir.error(id).parameters),
+            CallableParamSource::Builtin(Builtin::AbiDecode) => {
+                [Some(sym::data), Some(sym::types)].into_iter().collect()
+            }
+            CallableParamSource::Builtin(_) => Default::default(),
         }
     }
 
@@ -989,7 +1115,22 @@ impl<'gcx> Gcx<'gcx> {
                 })
             }
             solar_ast::LitKind::Rational(_) => {
-                self.mk_ty_err(self.dcx().emit_err(lit.span, "rational literals are not supported"))
+                let value = lit.symbol.as_str();
+                if value.ends_with('_')
+                    || value.contains("__")
+                    || value.contains("._")
+                    || value.contains("_.")
+                    || value.contains("_e")
+                    || value.contains("_E")
+                    || value.contains("e_")
+                    || value.contains("E_")
+                {
+                    self.mk_ty_misc_err()
+                } else {
+                    self.mk_ty_err(
+                        self.dcx().emit_err(lit.span, "rational literals are not supported"),
+                    )
+                }
             }
             solar_ast::LitKind::Address(_) => self.types.address,
             solar_ast::LitKind::Bool(_) => self.types.bool,
@@ -1007,58 +1148,6 @@ impl<'gcx> Gcx<'gcx> {
             self.native_members_in_context(ty, contract).unwrap_or_else(|| self.native_members(ty));
         let attached = self.attached_functions(ty, source, contract);
         native.iter().copied().chain(attached)
-    }
-
-    pub fn member_completions_of(
-        self,
-        ty: Ty<'gcx>,
-        source: hir::SourceId,
-        contract: Option<hir::ContractId>,
-    ) -> impl Iterator<Item = MemberCompletion<'gcx>> + 'gcx {
-        self.members_of(ty, source, contract).map(move |member| MemberCompletion {
-            resolved: self.resolve_member_target(ty, member.name, member.res),
-            member,
-        })
-    }
-
-    pub(crate) fn resolve_member_target(
-        self,
-        receiver_ty: Ty<'gcx>,
-        name: Symbol,
-        res: Option<hir::Res>,
-    ) -> Option<ResolvedMember> {
-        if let Some(res) = res {
-            return Some(ResolvedMember::Res(res));
-        }
-
-        match receiver_ty.kind {
-            TyKind::Ref(inner, _) => {
-                let TyKind::Struct(struct_id) = inner.kind else { return None };
-                let field_index = self.struct_field_index(struct_id, name)?;
-                Some(ResolvedMember::StructField { struct_id, field_index })
-            }
-            TyKind::Struct(struct_id) => {
-                let field_index = self.struct_field_index(struct_id, name)?;
-                Some(ResolvedMember::StructField { struct_id, field_index })
-            }
-            TyKind::Type(ty) => {
-                let TyKind::Enum(enum_id) = ty.kind else { return None };
-                let variant_index = self
-                    .hir
-                    .enumm(enum_id)
-                    .variants
-                    .iter()
-                    .position(|variant| variant.name == name)?;
-                Some(ResolvedMember::EnumVariant { enum_id, variant_index })
-            }
-            _ => None,
-        }
-    }
-
-    fn struct_field_index(self, struct_id: hir::StructId, name: Symbol) -> Option<usize> {
-        self.hir.strukt(struct_id).fields.iter().position(|&field_id| {
-            self.hir.variable(field_id).name.is_some_and(|field| field.name == name)
-        })
     }
 
     fn native_members_in_context(
@@ -1099,7 +1188,7 @@ impl<'gcx> Gcx<'gcx> {
             return;
         };
         let ty = self.type_of_item(user_ty.into());
-        let mut seen = FxHashSet::default();
+        let mut seen = DenseBitSet::new_empty(self.hir.function_ids().len());
         self.for_each_using_directive_for_type(ty, source, contract, &mut |using| {
             for entry in using.entries {
                 if entry.operator == Some(op)
@@ -1236,6 +1325,93 @@ impl<'gcx> Gcx<'gcx> {
         let loc = ty.loc().unwrap_or(DataLocation::Storage);
         using_directive_ty_matches(ty, using_ty.with_loc_if_ref(self, loc))
     }
+
+    /// Resolves a virtual function in the context of the most-derived contract.
+    pub fn resolve_virtual_function(
+        self,
+        contract: hir::ContractId,
+        function: hir::FunctionId,
+    ) -> hir::FunctionId {
+        let f = self.hir.function(function);
+        if !f.virtual_ || f.contract == Some(contract) {
+            return function;
+        }
+        self.virtual_function_target((contract, function))
+    }
+
+    /// Resolves a `super` function call in the context of the most-derived contract.
+    pub fn resolve_super_function(
+        self,
+        contract: hir::ContractId,
+        defining_contract: hir::ContractId,
+        function: hir::FunctionId,
+    ) -> hir::FunctionId {
+        self.super_function_target((contract, defining_contract, function))
+    }
+
+    /// Returns all events included in the external interface of the given contract.
+    pub fn interface_events(self, id: hir::ContractId) -> &'gcx DenseBitSet<hir::EventId> {
+        let items = self.interface_items(id);
+        let mut events = DenseBitSet::new_empty(self.hir.event_ids().len());
+        for item in self.hir.contract_item_ids(id) {
+            if let hir::ItemId::Event(event) = item {
+                events.insert(event);
+            }
+        }
+        for event in items.creation.events.iter().chain(items.deployed.events.iter()) {
+            events.insert(event);
+        }
+        self.alloc(events)
+    }
+
+    /// Returns all errors included in the external interface of the given contract.
+    pub fn interface_errors(self, id: hir::ContractId) -> &'gcx DenseBitSet<hir::ErrorId> {
+        let items = self.interface_items(id);
+        let mut errors = DenseBitSet::new_empty(self.hir.error_ids().len());
+        for item in self.hir.contract_item_ids(id) {
+            if let hir::ItemId::Error(error) = item {
+                errors.insert(error);
+            }
+        }
+        for error in items.creation.errors.iter().chain(items.deployed.errors.iter()) {
+            errors.insert(error);
+        }
+        self.alloc(errors)
+    }
+
+    /// Returns the functions reachable during contract creation or at runtime.
+    pub fn contract_reachable_functions(
+        self,
+        id: hir::ContractId,
+    ) -> &'gcx DenseBitSet<hir::FunctionId> {
+        let items = self.interface_items(id);
+        let mut functions = DenseBitSet::new_empty(self.hir.function_ids().len());
+        for function in items.creation.functions.iter().chain(items.deployed.functions.iter()) {
+            functions.insert(function);
+        }
+        self.alloc(functions)
+    }
+
+    /// Returns the contracts whose bytecode is referenced by the given contract.
+    pub fn contract_bytecode_dependencies(
+        self,
+        id: hir::ContractId,
+    ) -> &'gcx DenseBitSet<hir::ContractId> {
+        if self.sess.opts.unstable.codegen_all_functions {
+            return self.all_contract_bytecode_dependencies(id);
+        }
+        let items = self.interface_items(id);
+        let mut dependencies = DenseBitSet::new_empty(self.hir.contract_ids().len());
+        for dependency in items
+            .creation
+            .bytecode_dependencies
+            .iter()
+            .chain(items.deployed.bytecode_dependencies.iter())
+        {
+            dependencies.insert(dependency);
+        }
+        self.alloc(dependencies)
+    }
 }
 
 fn using_directive_ty_matches(ty: Ty<'_>, using_ty: Ty<'_>) -> bool {
@@ -1277,12 +1453,30 @@ fn fn_state_mutability(kind: TyFnKind, state_mutability: StateMutability) -> Sta
     }
 }
 
+macro_rules! cached_key_type {
+    ($key_type:ty) => {
+        $key_type
+    };
+    ($key_type:ty, $cache_key_type:ty) => {
+        $cache_key_type
+    };
+}
+
+macro_rules! cached_key_expr {
+    ($key:expr) => {
+        $key
+    };
+    ($key:expr, $cache_key:expr) => {
+        $cache_key
+    };
+}
+
 macro_rules! cached {
-    ($($(#[$attr:meta])* $vis:vis fn $name:ident($gcx:ident: _, $key:ident : $key_type:ty) -> $value:ty $imp:block)*) => {
+    ($($(#[$attr:meta])* $vis:vis fn $name:ident($gcx:ident: _, $key:ident : $key_type:ty) $(cached_by($cache_key_type:ty, $cache_key:expr))? -> $value:ty $imp:block)*) => {
         #[derive(Default)]
         struct Cache<'gcx> {
             $(
-                $name: FxOnceMap<$key_type, $value>,
+                $name: FxOnceMap<cached_key_type!($key_type $(, $cache_key_type)?), $value>,
             )*
         }
 
@@ -1290,11 +1484,12 @@ macro_rules! cached {
             $(
                 $(#[$attr])*
                 $vis fn $name(self, $key: $key_type) -> $value {
+                    let cache_key = cached_key_expr!($key $(, $cache_key)?);
                     #[cfg(false)]
-                    let _guard = log_cache_query(stringify!($name), &$key);
+                    let _guard = log_cache_query(stringify!($name), &cache_key);
                     #[cfg(false)]
                     let mut hit = true;
-                    let r = cache_insert(&self.cache.$name, $key, |&$key| {
+                    let r = cache_insert(&self.cache.$name, cache_key, |_| {
                         #[cfg(false)]
                         {
                             hit = false;
@@ -1312,6 +1507,74 @@ macro_rules! cached {
 }
 
 cached! {
+fn virtual_function_target(
+    gcx: _,
+    key: (hir::ContractId, hir::FunctionId)
+) -> hir::FunctionId {
+    fn function_overrides(gcx: Gcx<'_>, function: hir::FunctionId, base: hir::FunctionId) -> bool {
+        gcx.base_override_items(function.into()).iter().any(|item| {
+            let hir::ItemId::Function(overridden) = item else { return false };
+            *overridden == base || function_overrides(gcx, *overridden, base)
+        })
+    }
+
+    let (contract, function) = key;
+    debug_assert!(gcx.hir.function(function).virtual_);
+    for &base in gcx.hir.contract(contract).linearized_bases {
+        for candidate in gcx.hir.contract(base).functions() {
+            if candidate == function || function_overrides(gcx, candidate, function) {
+                return candidate;
+            }
+        }
+    }
+    function
+}
+
+fn super_function_target(
+    gcx: _,
+    key: (hir::ContractId, hir::ContractId, hir::FunctionId)
+) -> hir::FunctionId {
+    let (contract, defining_contract, function) = key;
+    let item = hir::ItemId::from(function);
+    let name = gcx.item_name(item).name;
+    let parameters = gcx.item_parameter_types(item);
+    let bases = gcx
+        .hir
+        .contract(contract)
+        .linearized_bases
+        .iter()
+        .skip_while(|&&base| base != defining_contract)
+        .skip(1);
+    for &base in bases {
+        for candidate in gcx.hir.contract(base).functions() {
+            let candidate_function = gcx.hir.function(candidate);
+            if candidate_function.is_ordinary()
+                && candidate_function.visibility > hir::Visibility::Private
+                && candidate_function.visibility != hir::Visibility::External
+                && candidate_function.body.is_some()
+                && gcx.item_name(candidate).name == name
+                && gcx.item_parameter_types(candidate) == parameters
+            {
+                return candidate;
+            }
+        }
+    }
+    function
+}
+
+fn interface_items(gcx: _, id: hir::ContractId) -> &'gcx call_graph::InterfaceItems {
+    assert!(gcx.has_typeck_results(), "interface items require type checking");
+    gcx.alloc(call_graph::interface_items(gcx, id))
+}
+
+fn all_contract_bytecode_dependencies(
+    gcx: _,
+    id: hir::ContractId
+) -> &'gcx DenseBitSet<hir::ContractId> {
+    assert!(gcx.has_typeck_results(), "contract dependencies require type checking");
+    call_graph::all_bytecode_dependencies(gcx, id)
+}
+
 /// Returns the [ERC-165] interface ID of the given contract.
 ///
 /// This is the XOR of the selectors of all function selectors in the interface.
@@ -1366,7 +1629,17 @@ pub fn interface_functions(gcx: _, id: hir::ContractId) -> InterfaceFunctions<'g
                 continue;
             }
             if !ty.can_be_exported(gcx) {
-                // TODO: implement `interfaceType`
+                // Libraries may expose mapping parameters (solc `interfaceType(true)`).
+                // Signature printing already handles them; keep the function in the
+                // interface instead of silently dropping it.
+                if c.kind.is_library()
+                    && ty.has_mapping(gcx)
+                    && !ty.is_recursive(gcx)
+                    && !ty.has_internal_function()
+                {
+                    continue;
+                }
+                // TODO: implement remaining `interfaceType` cases for libraries.
                 if c.kind.is_library() {
                     result = Err(ErrorGuaranteed::new_unchecked());
                     continue;
@@ -1425,9 +1698,35 @@ pub(crate) fn base_override_functions(
     crate::typeck::override_checker::base_override_functions(gcx, proxy)
 }
 
-/// Returns the resolved NatSpec doc comments for the given doc ID.
-pub fn natspec_doc_comments(gcx: _, id: hir::DocId) -> &'gcx [hir::NatSpecItem] {
-    crate::natspec::resolve_doc_comments(gcx, id)
+/// Returns the base declarations overridden by a function, modifier, or public variable.
+pub fn base_override_items(gcx: _, item: hir::ItemId) -> &'gcx [hir::ItemId] {
+    let proxy = match item {
+        hir::ItemId::Function(id) => OverrideProxy::Function(id),
+        hir::ItemId::Variable(id) if gcx.hir.variable(id).getter.is_some() => {
+            OverrideProxy::Variable(id)
+        }
+        _ => return &[],
+    };
+    gcx.bump().alloc_from_iter(gcx.base_override_functions(proxy).iter().map(|base| match base {
+        OverrideProxy::Function(id) => hir::ItemId::Function(*id),
+        OverrideProxy::Variable(id) => hir::ItemId::Variable(*id),
+    }))
+}
+
+pub(crate) fn natspec_resolution(
+    gcx: _,
+    item: hir::ItemId
+) -> crate::natspec::ResolvedNatSpec<'gcx> {
+    crate::natspec::resolve_item(gcx, item)
+}
+
+/// Returns the validated and resolved NatSpec view for an item.
+///
+/// Parameter and return documentation is aligned by position with the current item, including
+/// through explicit `@inheritdoc` chains. For a public state variable, positions correspond to its
+/// compiler-generated getter. Other variables have no positional documentation.
+pub fn natspec_view(gcx: _, item: hir::ItemId) -> NatSpecView<'gcx> {
+    crate::natspec::resolve_view(gcx, item)
 }
 
 /// Resolves a contract name within a source's scope for NatSpec `@inheritdoc`.
@@ -1590,7 +1889,16 @@ fn internal_function_members_in_context(
     let (id, current_contract) = key;
     gcx.bump().alloc_vec(members::internal_function_members_in_context(gcx, id, current_contract))
 }
+
+pub(crate) fn eval_const_value_result(gcx: _, expr: &hir::Expr<'_>)
+    cached_by(hir::ExprId, expr.id) -> &'gcx crate::eval::EvalResult
+{
+    gcx.alloc(crate::eval::eval_const(gcx, expr))
 }
+
+} // cached!
+
+// DO NOT ADD `impl Gcx` HERE. ADD FUNCTIONS IN THE IMPL BLOCK ABOVE.
 
 fn var_type<'gcx>(gcx: Gcx<'gcx>, var: &'gcx hir::Variable<'gcx>, ty: Ty<'gcx>) -> Ty<'gcx> {
     use hir::DataLocation::*;
@@ -1745,4 +2053,249 @@ fn log_cache_query(name: &str, key: &dyn fmt::Debug) -> tracing::span::EnteredSp
 #[cfg(false)]
 fn log_cache_query_result(result: &dyn fmt::Debug, hit: bool) {
     trace!(?result, hit);
+}
+
+#[cfg(test)]
+mod call_arg_tests {
+    use super::*;
+    use crate::{Compiler, hir::Visit};
+    use solar_data_structures::Never;
+    use solar_interface::{Session, config::CompileOpts};
+    use std::{collections::BTreeMap, ops::ControlFlow, path::PathBuf};
+
+    struct CallCollector<'hir> {
+        hir: &'hir hir::Hir<'hir>,
+        calls: Vec<&'hir hir::Expr<'hir>>,
+    }
+
+    impl<'hir> Visit<'hir> for CallCollector<'hir> {
+        type BreakValue = Never;
+
+        fn hir(&self) -> &'hir hir::Hir<'hir> {
+            self.hir
+        }
+
+        fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) -> ControlFlow<Self::BreakValue> {
+            if matches!(expr.kind, hir::ExprKind::Call(..)) {
+                self.calls.push(expr);
+            }
+            self.walk_expr(expr)
+        }
+    }
+
+    fn call_arguments(source: &str, expect_errors: bool) -> BTreeMap<String, Vec<Option<String>>> {
+        let sess = Session::builder().opts(CompileOpts::default()).with_test_emitter().build();
+        let mut compiler = Compiler::new(sess);
+
+        compiler.enter_mut(|c| {
+            let mut pcx = c.parse();
+            let file =
+                c.sess().source_map().new_source_file(PathBuf::from("test.sol"), source).unwrap();
+            pcx.add_file(file);
+            pcx.parse();
+
+            assert_eq!(c.lower_asts(), Ok(ControlFlow::Continue(())));
+            assert_eq!(c.analysis(), Ok(ControlFlow::Continue(())));
+        });
+        assert_eq!(compiler.sess().dcx.has_errors().is_err(), expect_errors);
+
+        compiler.enter(|c| {
+            let gcx = c.gcx();
+            let mut visitor = CallCollector { hir: &gcx.hir, calls: Vec::new() };
+            for source in gcx.hir.source_ids() {
+                let _ = visitor.visit_nested_source(source);
+            }
+            visitor
+                .calls
+                .into_iter()
+                .map(|call| {
+                    let source_map = gcx.sess.source_map();
+                    let call_source = source_map.span_to_snippet(call.span).unwrap();
+                    let arguments = (0..3)
+                        .map(|index| {
+                            gcx.call_arg(call, index)
+                                .map(|arg| source_map.span_to_snippet(arg.span).unwrap())
+                        })
+                        .collect();
+                    (call_source, arguments)
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn call_arg_uses_visible_parameter_order() {
+        let calls = call_arguments(
+            r#"
+struct CollisionHolder {
+    function(bool fieldFlag, address fieldAccount) internal pure callback;
+}
+
+library L {
+    function attached(uint256 self, uint256 first, uint256 second)
+        internal
+        pure
+        returns (uint256)
+    {
+        return self + first + second;
+    }
+
+    function callback(
+        CollisionHolder memory self,
+        uint256 attachedFirst,
+        address attachedAccount
+    ) internal pure {
+        self;
+        attachedFirst;
+        attachedAccount;
+    }
+}
+
+contract D {
+    constructor(uint256 first, uint256 second) {
+        first;
+        second;
+    }
+}
+
+contract C {
+    using L for uint256;
+    using L for CollisionHolder;
+
+    struct Pair { uint256 first; uint256 second; }
+    event E(uint256 first, uint256 second);
+    error Err(uint256 first, uint256 second);
+
+    function target(uint256 first, uint256 second) internal pure {}
+    function fieldTarget(bool fieldFlag, address fieldAccount) internal pure {
+        fieldFlag;
+        fieldAccount;
+    }
+    function overloaded(uint256 first, uint256 second) internal pure {}
+    function overloaded(address recipient, uint256 amount) internal pure {}
+
+    function calls(uint256 receiver) external {
+        target(11, 22);
+        target({second: 22, first: 11});
+        receiver.attached({second: 22, first: 11});
+        Pair memory pair = Pair({second: 22, first: 11});
+        D created = new D(11, 22);
+        emit E({second: 22, first: 11});
+        overloaded({amount: 22, recipient: address(11)});
+        abi.encode(11, 22, 33);
+        CollisionHolder memory collision =
+            CollisionHolder({callback: fieldTarget});
+        collision.callback({attachedAccount: address(44), attachedFirst: 33});
+        pair;
+        created;
+        collision;
+    }
+
+    function fail() external pure {
+        revert Err({second: 22, first: 11});
+    }
+
+    function decode(bytes memory raw) external pure returns (uint256) {
+        return abi.decode({types: (uint256), data: raw});
+    }
+}
+"#,
+            false,
+        );
+
+        assert_eq!(calls["target(11, 22)"], [Some("11".into()), Some("22".into()), None]);
+        assert_eq!(
+            calls["target({second: 22, first: 11})"],
+            [Some("11".into()), Some("22".into()), None]
+        );
+        assert_eq!(
+            calls["receiver.attached({second: 22, first: 11})"],
+            [Some("11".into()), Some("22".into()), None]
+        );
+        assert_eq!(
+            calls["Pair({second: 22, first: 11})"],
+            [Some("11".into()), Some("22".into()), None]
+        );
+        assert_eq!(calls["new D(11, 22)"], [Some("11".into()), Some("22".into()), None]);
+        assert_eq!(
+            calls["emit E({second: 22, first: 11});"],
+            [Some("11".into()), Some("22".into()), None]
+        );
+        assert_eq!(
+            calls["revert Err({second: 22, first: 11});"],
+            [Some("11".into()), Some("22".into()), None]
+        );
+        assert_eq!(
+            calls["overloaded({amount: 22, recipient: address(11)})"],
+            [Some("address(11)".into()), Some("22".into()), None]
+        );
+        assert_eq!(calls["address(11)"], [Some("11".into()), None, None]);
+        assert_eq!(
+            calls["abi.encode(11, 22, 33)"],
+            [Some("11".into()), Some("22".into()), Some("33".into())]
+        );
+        assert_eq!(
+            calls["abi.decode({types: (uint256), data: raw})"],
+            [Some("raw".into()), Some("(uint256)".into()), None]
+        );
+        assert_eq!(
+            calls["collision.callback({attachedAccount: address(44), attachedFirst: 33})"],
+            [Some("33".into()), Some("address(44)".into()), None]
+        );
+    }
+
+    #[test]
+    fn call_arg_handles_error_recovery() {
+        let calls = call_arguments(
+            r#"
+contract C {
+    struct Holder {
+        function(uint256 first, uint256 second) internal pure callback;
+    }
+
+    function ambiguous(uint256 value) internal pure {}
+    function ambiguous(int256 value) internal pure {}
+    function target(uint256 first, uint256 second) internal pure {}
+
+    function calls() external pure {
+        ambiguous({value: 1});
+        ambiguous(1);
+        abi.encode({value: 1});
+        uint256 notCallable = 1;
+        notCallable(1);
+        new D({second: 22, first: 11});
+        function(uint256 first, uint256 second) internal pure callback = target;
+        callback({second: 22, first: 11});
+        Holder memory holder = Holder({callback: target});
+        holder.callback({second: 44, first: 33});
+    }
+}
+
+contract D {
+    constructor(uint256 first, uint256 second) {
+        first;
+        second;
+    }
+}
+"#,
+            true,
+        );
+
+        assert_eq!(calls["ambiguous({value: 1})"], [None, None, None]);
+        assert_eq!(calls["ambiguous(1)"], [None, None, None]);
+        assert_eq!(calls["abi.encode({value: 1})"], [None, None, None]);
+        assert_eq!(calls["notCallable(1)"], [None, None, None]);
+        assert_eq!(
+            calls["new D({second: 22, first: 11})"],
+            [Some("11".into()), Some("22".into()), None]
+        );
+        assert_eq!(
+            calls["callback({second: 22, first: 11})"],
+            [Some("11".into()), Some("22".into()), None]
+        );
+        assert_eq!(
+            calls["holder.callback({second: 44, first: 33})"],
+            [Some("33".into()), Some("44".into()), None]
+        );
+    }
 }

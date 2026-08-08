@@ -6,42 +6,49 @@
 //! normal encoder path.
 
 use crate::{
-    mir::{Function, Immediate, InstKind, Terminator, Value, ValueId},
-    pass::FunctionPass,
-    utils::evm_word,
+    mir::{BlockId, Function, Immediate, InstKind, Module, Terminator, Value, ValueId},
+    pass::{MirPass, run_function_pass},
+    utils::eval,
 };
 use alloy_primitives::U256;
 use solar_data_structures::map::FxHashMap;
+
+/// Function pass for bounded pure MIR evaluation.
+pub(crate) struct PureEval;
+
+impl MirPass for PureEval {
+    fn name(&self) -> &'static str {
+        "pure-eval"
+    }
+
+    fn run_pass(
+        &self,
+        _gcx: solar_sema::Gcx<'_>,
+        module: &mut Module,
+        analyses: &mut crate::pass::ModuleAnalyses,
+    ) -> bool {
+        run_function_pass(module, analyses, |func, _| {
+            let changed = PureEvaluator::new().run(func).functions_folded != 0;
+            let repaired = crate::mir::utils::repair_reachability_phis(func);
+            changed || repaired
+        })
+    }
+}
 
 const DEFAULT_FUEL: usize = 10_000;
 
 /// Statistics from bounded pure evaluation.
 #[derive(Clone, Debug, Default)]
-pub struct PureEvalStats {
+struct PureEvalStats {
     /// Number of functions folded to constant returns.
-    pub functions_folded: usize,
+    functions_folded: usize,
 }
 
 /// Bounded pure MIR evaluator.
 #[derive(Debug)]
-pub struct PureEvaluator {
+struct PureEvaluator {
     fuel: usize,
     stats: PureEvalStats,
-}
-
-/// Function pass for bounded pure MIR evaluation.
-pub struct PureEvalPass;
-
-impl FunctionPass for PureEvalPass {
-    fn name(&self) -> &str {
-        "pure-eval"
-    }
-
-    fn run_on_function(&mut self, func: &mut Function) -> bool {
-        let changed = PureEvaluator::new().run(func).functions_folded != 0;
-        let repaired = crate::mir::utils::repair_reachability_phis(func);
-        changed || repaired
-    }
 }
 
 impl Default for PureEvaluator {
@@ -53,18 +60,12 @@ impl Default for PureEvaluator {
 impl PureEvaluator {
     /// Creates a new evaluator with the default fuel.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
-    /// Returns statistics for the most recent run.
-    #[must_use]
-    pub const fn stats(&self) -> &PureEvalStats {
-        &self.stats
-    }
-
     /// Runs the evaluator on one function.
-    pub fn run(&mut self, func: &mut Function) -> &PureEvalStats {
+    fn run(&mut self, func: &mut Function) -> &PureEvalStats {
         self.stats = PureEvalStats::default();
         if !func.params.is_empty() || !self.is_side_effect_free(func) {
             return &self.stats;
@@ -73,6 +74,9 @@ impl PureEvaluator {
         let Some(values) = self.evaluate(func) else {
             return &self.stats;
         };
+        if values.len() != func.returns.len() {
+            return &self.stats;
+        }
         if self.is_already_folded(func, &values) {
             return &self.stats;
         }
@@ -85,7 +89,7 @@ impl PureEvaluator {
     /// [`Self::rewrite_to_return`] would produce, so rewriting again would
     /// report a change (and allocate fresh immediates) without progress.
     fn is_already_folded(&self, func: &Function, values: &[U256]) -> bool {
-        let entry = func.entry_block;
+        let entry = BlockId::ENTRY;
         for (block_id, block) in func.blocks.iter_enumerated() {
             if !block.instructions.is_empty() {
                 return false;
@@ -107,27 +111,23 @@ impl PureEvaluator {
     }
 
     fn is_side_effect_free(&self, func: &Function) -> bool {
-        for block in &func.blocks {
-            for &inst_id in &block.instructions {
-                if func.instructions[inst_id].kind.has_side_effects() {
-                    return false;
-                }
-            }
-        }
-        true
+        func.instructions().all(|inst_id| !func.inst(inst_id).kind.has_side_effects())
     }
 
     fn evaluate(&self, func: &Function) -> Option<Vec<U256>> {
         let mut env = FxHashMap::default();
-        for (value_id, value) in func.values.iter_enumerated() {
-            if let Value::Immediate(imm) = value
+        let mut insert_immediate = |value_id| {
+            if let Value::Immediate(imm) = func.value(value_id)
                 && let Some(value) = imm.as_u256()
             {
                 env.insert(value_id, value);
             }
+        };
+        for value in func.live_values() {
+            insert_immediate(value);
         }
 
-        let mut current = func.entry_block;
+        let mut current = BlockId::ENTRY;
         let mut predecessor = None;
         let mut fuel = self.fuel;
         while fuel != 0 {
@@ -135,7 +135,7 @@ impl PureEvaluator {
             let block = &func.blocks[current];
 
             for &inst_id in &block.instructions {
-                let inst = &func.instructions[inst_id];
+                let inst = func.inst(inst_id);
                 let result = match &inst.kind {
                     InstKind::Phi(incoming) => {
                         let pred = predecessor?;
@@ -162,12 +162,13 @@ impl PureEvaluator {
                 Terminator::Switch { value, default, cases } => {
                     let value = self.value_const(&env, *value)?;
                     predecessor = Some(current);
-                    current = cases
-                        .iter()
-                        .find_map(|(case, target)| {
-                            (self.value_const(&env, *case)? == value).then_some(*target)
-                        })
-                        .unwrap_or(*default);
+                    current = *default;
+                    for (case, target) in cases {
+                        if self.value_const(&env, *case)? == value {
+                            current = *target;
+                            break;
+                        }
+                    }
                 }
                 Terminator::Return { values } => {
                     return values
@@ -179,6 +180,7 @@ impl PureEvaluator {
                 | Terminator::Revert { .. }
                 | Terminator::Stop
                 | Terminator::SelfDestruct { .. }
+                | Terminator::TailCall { .. }
                 | Terminator::Invalid => return None,
             }
         }
@@ -191,60 +193,14 @@ impl PureEvaluator {
 
     fn eval_inst(&self, kind: &InstKind, env: &FxHashMap<ValueId, U256>) -> Option<U256> {
         let get = |value| self.value_const(env, value);
-        Some(match *kind {
-            InstKind::Add(a, b) => get(a)?.wrapping_add(get(b)?),
-            InstKind::Sub(a, b) => get(a)?.wrapping_sub(get(b)?),
-            InstKind::Mul(a, b) => get(a)?.wrapping_mul(get(b)?),
-            InstKind::Div(a, b) => {
-                let b = get(b)?;
-                if b.is_zero() { U256::ZERO } else { get(a)? / b }
-            }
-            InstKind::Mod(a, b) => {
-                let b = get(b)?;
-                if b.is_zero() { U256::ZERO } else { get(a)? % b }
-            }
-            InstKind::Exp(a, b) => get(a)?.wrapping_pow(get(b)?),
-            InstKind::And(a, b) => get(a)? & get(b)?,
-            InstKind::Or(a, b) => get(a)? | get(b)?,
-            InstKind::Xor(a, b) => get(a)? ^ get(b)?,
-            InstKind::Not(a) => !get(a)?,
-            InstKind::Shl(shift, value) => {
-                let shift = get(shift)?;
-                if shift >= U256::from(256) {
-                    U256::ZERO
-                } else {
-                    get(value)? << shift.to::<usize>()
-                }
-            }
-            InstKind::Shr(shift, value) => {
-                let shift = get(shift)?;
-                if shift >= U256::from(256) {
-                    U256::ZERO
-                } else {
-                    get(value)? >> shift.to::<usize>()
-                }
-            }
-            InstKind::Sar(shift, value) => evm_word::sar(get(value)?, get(shift)?),
-            InstKind::Byte(index, value) => evm_word::byte(get(index)?, get(value)?),
-            InstKind::SignExtend(size, value) => evm_word::signextend(get(size)?, get(value)?),
-            InstKind::Lt(a, b) => U256::from(get(a)? < get(b)?),
-            InstKind::Gt(a, b) => U256::from(get(a)? > get(b)?),
-            InstKind::Eq(a, b) => U256::from(get(a)? == get(b)?),
-            InstKind::IsZero(a) => U256::from(get(a)?.is_zero()),
-            InstKind::Select(condition, then_value, else_value) => {
-                if get(condition)?.is_zero() {
-                    get(else_value)?
-                } else {
-                    get(then_value)?
-                }
-            }
-            InstKind::Phi(_) => unreachable!("phis are handled by the block interpreter"),
-            _ => return None,
-        })
+        if let InstKind::Select(condition, then_value, else_value) = *kind {
+            return if get(condition)?.is_zero() { get(else_value) } else { get(then_value) };
+        }
+        eval::eval_inst(kind, |value| get(value).ok_or(())).ok().flatten()
     }
 
     fn rewrite_to_return(&self, func: &mut Function, values: &[U256]) {
-        let entry = func.entry_block;
+        let entry = BlockId::ENTRY;
         let block_ids: Vec<_> = func.blocks.indices().collect();
         for block_id in block_ids {
             let block = &mut func.blocks[block_id];
@@ -257,9 +213,13 @@ impl PureEvaluator {
             }
         }
 
+        let returns = func.returns.clone();
         let values = values
             .iter()
-            .map(|&value| func.alloc_value(Value::Immediate(Immediate::uint256(value))))
+            .zip(returns)
+            .map(|(&value, ty)| {
+                func.alloc_value(Value::Immediate(Immediate::for_type(Some(ty), value)))
+            })
             .collect();
         func.blocks[entry].terminator = Some(Terminator::Return { values });
     }

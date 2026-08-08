@@ -6,7 +6,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.95" # MSRV
+rust-version = "1.96" # MSRV
 authors = ["DaniPopes <57450786+DaniPopes@users.noreply.github.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/paradigmxyz/solar"
@@ -18,21 +18,21 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [workspace.lints.clippy]
-dbg-macro = "warn"
-manual-string-new = "warn"
-uninlined-format-args = "warn"
-use-self = "warn"
-redundant-clone = "warn"
+dbg_macro = "warn"
+manual_string_new = "warn"
+uninlined_format_args = "warn"
+use_self = "warn"
+redundant_clone = "warn"
 # Files in `examples/` are present as doctests but run in `cargo test` normally too.
-test-attr-in-doctest = "allow"
+test_attr_in_doctest = "allow"
 
 [workspace.lints.rust]
-rust-2018-idioms = "warn"
-unreachable-pub = "warn"
-unused-must-use = "warn"
-redundant-lifetimes = "warn"
-unnameable-types = "warn"
-unused-crate-dependencies = "warn"
+rust_2018_idioms = "warn"
+unreachable_pub = "warn"
+unused_must_use = "warn"
+redundant_lifetimes = "warn"
+unnameable_types = "warn"
+unused_crate_dependencies = "warn"
 
 [workspace.lints.rustdoc]
 all = "warn"
@@ -110,6 +110,7 @@ solar-codegen = { version = "=0.2.0", path = "crates/codegen", default-features 
 solar-config = { version = "=0.2.0", path = "crates/config", default-features = false }
 solar-data-structures = { version = "=0.2.0", path = "crates/data-structures", default-features = false }
 solar-interface = { version = "=0.2.0", path = "crates/interface", default-features = false }
+solar-lint = { version = "=0.2.0", path = "crates/lint", default-features = false }
 solar-lsp = { version = "=0.2.0", path = "crates/lsp", default-features = false }
 solar-macros = { version = "=0.2.0", path = "crates/macros", default-features = false }
 solar-parse = { version = "=0.2.0", path = "crates/parse", default-features = false }
@@ -119,8 +120,15 @@ solar-sema = { version = "=0.2.0", path = "crates/sema", default-features = fals
 solar-tester = { path = "tools/tester" }
 
 # Ethereum
+alloy-consensus = "2.2"
+alloy-dyn-abi = "1.6"
 alloy-primitives = "1.3"
 alloy-json-abi = "1.3"
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "f85cf2657362c742ce7f6e4e6d39d4ac14823cb3", default-features = false, features = [
+    "std",
+    "map-foldhash",
+    "asm-keccak",
+] }
 ruint = { version = "1.16", features = ["num-integer"] }
 
 num-bigint = "0.4"
@@ -141,6 +149,9 @@ colorchoice = "1.0"
 serde = "1.0"
 serde_json = "1.0"
 toml_edit = "0.25"
+
+# compression
+flate2 = "1.1"
 
 # macros
 proc-macro2 = "1.0"
@@ -164,6 +175,7 @@ criterion = { package = "codspeed-criterion-compat", version = "4", default-feat
     "cargo_bench_support",
 ] }
 regex = "1.10"
+diff = "0.1"
 snapbox = { version = "1.2", features = ["json"] }
 tempfile = "3.9"
 
@@ -180,10 +192,12 @@ lsp-types = "0.95.0"
 tower = "0.5"
 
 # misc
+arrayvec = "0.7"
 bitflags = "2.4"
 bumpalo = "3.14"
 cfg-if = "1.0"
 either = "1"
+glob = "0.3"
 oxc_index = { version = "5.0", features = ["nonmax"] }
 indexmap = "2.2"
 itertools = ">=0.10, <=0.14"

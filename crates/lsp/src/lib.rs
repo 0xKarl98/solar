@@ -7,56 +7,132 @@
 
 use crate::global_state::GlobalState;
 use async_lsp::{
-    ClientSocket, client_monitor::ClientProcessMonitorLayer, concurrency::ConcurrencyLayer,
+    ClientSocket, LspService, ResponseError, client_monitor::ClientProcessMonitorLayer,
     router::Router, server::LifecycleLayer, tracing::TracingLayer,
 };
+#[cfg(test)]
+use criterion as _;
 use lsp_types::{notification as notif, request as req};
 use serde_json as _;
 use solar_config::LspArgs;
 use std::ops::ControlFlow;
 use tower::ServiceBuilder;
 
+mod call_hierarchy;
+mod code_actions;
+mod code_lens;
+mod commands;
 mod config;
 mod diagnostics;
+mod document_links;
+mod documentation;
+mod file_operations;
 mod flycheck;
+mod folding_range;
+mod formatter;
 mod global_state;
 mod handlers;
 mod inlay_hints;
+mod natspec_completion;
+mod override_index;
+mod progress;
+#[cfg(any(test, feature = "bench"))]
+#[cfg_attr(all(feature = "bench", not(test)), allow(dead_code))]
+mod project_fixture;
 mod proto;
+mod protocol_trace;
+mod rename;
+mod request_cancellation;
+mod selection_range;
 mod serde;
+mod signature_help;
 mod symbols;
+mod type_hierarchy;
 mod utils;
 mod vfs;
 mod workspace;
+
+/// Benchmark-only access to prepared LSP projects and opaque analysis snapshots.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub use global_state::benchmark::{
+    BenchmarkAnalysis, BenchmarkDocumentChange, BenchmarkDocumentUpdate, BenchmarkEdit,
+    BenchmarkError, BenchmarkProject, BenchmarkRequest, BenchmarkResponse,
+    BenchmarkWorkspaceReports,
+};
+
+/// Runs the selection-range kernel for Criterion benchmarks.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub fn benchmark_selection_ranges(
+    source: String,
+    positions: &[lsp_types::Position],
+) -> Option<Vec<lsp_types::SelectionRange>> {
+    selection_range::selection_ranges(source, positions)
+}
 
 #[cfg(test)]
 mod test_support;
 
 pub(crate) type NotifyResult = ControlFlow<async_lsp::Result<()>>;
 
-fn new_router(client: ClientSocket) -> Router<GlobalState> {
-    let this = GlobalState::new(client);
+fn new_router_with_state(this: GlobalState) -> Router<GlobalState> {
     let mut router = Router::new(this);
 
     // Lifecycle
     router
-        .request::<req::Initialize, _>(GlobalState::on_initialize)
+        .request::<proto::Initialize, _>(|state, params| {
+            let pull_diagnostic_data_support = params.pull_diagnostic_data_support();
+            state.on_initialize_with_pull_diagnostic_data(
+                params.into_inner(),
+                pull_diagnostic_data_support,
+            )
+        })
         .notification::<notif::Initialized>(GlobalState::on_initialized)
         .request::<req::Shutdown, _>(|_, _| std::future::ready(Ok(())))
         .notification::<notif::Exit>(|_, _| ControlFlow::Break(Ok(())));
 
     // Requests
     router
+        .request::<req::ExecuteCommand, _>(commands::execute_command)
         .request::<req::DocumentSymbolRequest, _>(handlers::document_symbol)
+        .request::<req::DocumentLinkRequest, _>(handlers::document_links)
+        .request::<req::CodeActionRequest, _>(handlers::code_actions)
         .request::<req::WorkspaceSymbolRequest, _>(handlers::workspace_symbol)
         .request::<req::GotoDefinition, _>(handlers::goto_definition)
+        .request::<req::GotoTypeDefinition, _>(handlers::goto_type_definition)
         .request::<req::GotoDeclaration, _>(handlers::goto_declaration)
+        .request::<req::GotoImplementation, _>(handlers::goto_implementation)
         .request::<req::References, _>(handlers::references)
+        .request::<req::CodeLensRequest, _>(handlers::code_lens)
+        .request::<req::CallHierarchyPrepare, _>(handlers::prepare_call_hierarchy)
+        .request::<req::CallHierarchyIncomingCalls, _>(handlers::call_hierarchy_incoming)
+        .request::<req::CallHierarchyOutgoingCalls, _>(handlers::call_hierarchy_outgoing)
+        .request::<req::DocumentHighlightRequest, _>(handlers::document_highlight)
+        .request::<req::HoverRequest, _>(handlers::hover)
+        .request::<req::PrepareRenameRequest, _>(handlers::prepare_rename)
+        .request::<req::Rename, _>(handlers::rename)
+        .request::<req::SignatureHelpRequest, _>(handlers::signature_help)
         .request::<req::InlayHintRequest, _>(handlers::inlay_hints)
-        .request::<req::Completion, _>(handlers::completion);
+        .request::<req::FoldingRangeRequest, _>(handlers::folding_range)
+        .request::<req::SelectionRangeRequest, _>(handlers::selection_range)
+        .request::<req::TypeHierarchyPrepare, _>(handlers::prepare_type_hierarchy)
+        .request::<req::TypeHierarchySupertypes, _>(handlers::type_hierarchy_supertypes)
+        .request::<req::TypeHierarchySubtypes, _>(handlers::type_hierarchy_subtypes)
+        .request::<req::Completion, _>(handlers::completion)
+        .request::<req::ResolveCompletionItem, _>(handlers::resolve_completion_item)
+        .request::<req::DocumentDiagnosticRequest, _>(handlers::document_diagnostic)
+        .request::<req::WorkspaceDiagnosticRequest, _>(handlers::workspace_diagnostic)
+        .request::<req::Formatting, _>(handlers::formatting);
 
     // Workspace management
     router
+        .request::<req::WillCreateFiles, _>(handlers::will_create_files)
+        .request::<req::WillRenameFiles, _>(handlers::will_rename_files)
+        .request::<req::WillDeleteFiles, _>(handlers::will_delete_files)
+        .notification::<notif::DidCreateFiles>(handlers::did_create_files)
+        .notification::<notif::DidRenameFiles>(handlers::did_rename_files)
+        .notification::<notif::DidDeleteFiles>(handlers::did_delete_files)
         .notification::<notif::DidChangeWorkspaceFolders>(handlers::did_change_workspace_folders)
         .notification::<notif::DidChangeWatchedFiles>(handlers::did_change_watched_files);
 
@@ -65,10 +141,32 @@ fn new_router(client: ClientSocket) -> Router<GlobalState> {
         .notification::<notif::DidOpenTextDocument>(handlers::did_open_text_document)
         .notification::<notif::DidCloseTextDocument>(handlers::did_close_text_document)
         .notification::<notif::DidChangeTextDocument>(handlers::did_change_text_document)
+        .notification::<notif::WillSaveTextDocument>(handlers::will_save_text_document)
         .notification::<notif::DidSaveTextDocument>(handlers::did_save_text_document)
-        .notification::<notif::DidChangeConfiguration>(handlers::did_change_configuration);
+        .notification::<notif::DidChangeConfiguration>(handlers::did_change_configuration)
+        .notification::<notif::SetTrace>(GlobalState::on_set_trace)
+        .notification::<notif::WorkDoneProgressCancel>(GlobalState::on_work_done_progress_cancel);
 
     router
+}
+
+fn request_layer(client: ClientSocket) -> request_cancellation::RequestCancellationLayer {
+    request_cancellation::RequestCancellationLayer::new(client)
+}
+
+fn new_server_service(
+    client: ClientSocket,
+) -> impl LspService<Response = serde_json::Value, Error = ResponseError, Future: Send + 'static> + Send
+{
+    let state = GlobalState::new(client.clone());
+    let protocol_trace = state.protocol_trace();
+    ServiceBuilder::new()
+        .layer(TracingLayer::default())
+        .layer(LifecycleLayer::default())
+        .layer(protocol_trace::ProtocolTraceLayer::new(protocol_trace))
+        .layer(request_layer(client.clone()))
+        .layer(ClientProcessMonitorLayer::new(client))
+        .service(new_router_with_state(state))
 }
 
 /// Start the LSP server over stdin/stdout.
@@ -87,115 +185,15 @@ pub async fn run_server_stdio(_args: LspArgs) -> async_lsp::Result<()> {
         tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(tokio::io::stdout()),
     );
 
-    let (eloop, _) = async_lsp::MainLoop::new_server(|client| {
-        ServiceBuilder::new()
-            .layer(TracingLayer::default())
-            .layer(LifecycleLayer::default())
-            // TODO: infer concurrency
-            .layer(ConcurrencyLayer::new(2.try_into().unwrap()))
-            .layer(ClientProcessMonitorLayer::new(client.clone()))
-            .service(new_router(client))
-    });
+    let (eloop, _) = async_lsp::MainLoop::new_server(new_server_service);
 
     eloop.run_buffered(stdin, stdout).await
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use async_lsp::{AnyNotification, LanguageServer, LspService, router::Router};
-    use lsp_types::{
-        DidChangeWatchedFilesClientCapabilities, DidChangeWatchedFilesParams,
-        DidSaveTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializedParams,
-        TextDocumentIdentifier, WorkspaceClientCapabilities, notification as notif,
-        notification::Notification, request,
-    };
-    use std::ops::ControlFlow;
-    use tokio::sync::oneshot;
-    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+#[path = "tests/router.rs"]
+mod tests;
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn router_handles_watched_file_changes() {
-        let mut router = new_router(ClientSocket::new_closed());
-        let params = DidChangeWatchedFilesParams {
-            changes: vec![FileEvent::new(
-                lsp_types::Url::parse("file:///workspace/src/Test.sol").unwrap(),
-                FileChangeType::CHANGED,
-            )],
-        };
-        let notification = serde_json::from_value::<AnyNotification>(serde_json::json!({
-            "method": notif::DidChangeWatchedFiles::METHOD,
-            "params": params,
-        }))
-        .unwrap();
-
-        assert!(matches!(router.notify(notification), ControlFlow::Continue(())));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn router_handles_document_saves() {
-        let mut router = new_router(ClientSocket::new_closed());
-        let params = DidSaveTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: lsp_types::Url::parse("file:///workspace/src/Test.sol").unwrap(),
-            },
-            text: None,
-        };
-        let notification = serde_json::from_value::<AnyNotification>(serde_json::json!({
-            "method": notif::DidSaveTextDocument::METHOD,
-            "params": params,
-        }))
-        .unwrap();
-
-        assert!(matches!(router.notify(notification), ControlFlow::Continue(())));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn initialized_registers_watched_files_when_client_supports_dynamic_registration() {
-        let (server_main, _client) = async_lsp::MainLoop::new_server(new_router);
-        let (registration_tx, registration_rx) = oneshot::channel();
-        let (client_main, mut server) = async_lsp::MainLoop::new_client(|_| {
-            let mut router = Router::new(Some(registration_tx));
-            router.request::<request::RegisterCapability, _>(|state, params| {
-                state.take().unwrap().send(params).unwrap();
-                async move { Ok(()) }
-            });
-            router.notification::<notif::LogMessage>(|_, _| ControlFlow::Continue(()));
-            router
-        });
-
-        let (server_stream, client_stream) = tokio::io::duplex(64 << 10);
-        let (server_rx, server_tx) = tokio::io::split(server_stream);
-        let (server_rx, server_tx) = (server_rx.compat(), server_tx.compat_write());
-        let server_main =
-            tokio::spawn(async move { server_main.run_buffered(server_rx, server_tx).await });
-        let (client_rx, client_tx) = tokio::io::split(client_stream);
-        let (client_rx, client_tx) = (client_rx.compat(), client_tx.compat_write());
-        let client_main =
-            tokio::spawn(async move { client_main.run_buffered(client_rx, client_tx).await });
-
-        let mut params = InitializeParams::default();
-        params.capabilities.workspace = Some(WorkspaceClientCapabilities {
-            did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
-                dynamic_registration: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        server.initialize(params).await.unwrap();
-        server.initialized(InitializedParams {}).unwrap();
-
-        let registrations =
-            tokio::time::timeout(std::time::Duration::from_secs(1), registration_rx)
-                .await
-                .unwrap()
-                .unwrap();
-        let [registration] = registrations.registrations.try_into().unwrap();
-        assert_eq!(registration.method, notif::DidChangeWatchedFiles::METHOD);
-
-        server.shutdown(()).await.unwrap();
-        server.exit(()).unwrap();
-        assert!(server_main.await.unwrap().is_ok());
-        assert!(matches!(client_main.await.unwrap(), Err(async_lsp::Error::Eof)));
-    }
-}
+#[cfg(test)]
+#[path = "tests/flycheck.rs"]
+mod flycheck_tests;

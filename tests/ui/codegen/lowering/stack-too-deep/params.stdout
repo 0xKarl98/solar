@@ -1,0 +1,314 @@
+// === ROOT/tests/ui/codegen/lowering/stack-too-deep/params.sol:StackTooDeepParams (creation) ===
+// === deployment ===
+@module deployment
+bb0:
+  push 431
+  dup1
+  push 10
+  push 0
+  codecopy
+  push 0
+  return
+
+// === runtime ===
+@module runtime
+bb0:
+  push 224
+  push 64
+  mstore
+  callvalue
+  push bb4
+  jumpi
+  calldatasize
+  iszero
+  push bb4
+  jumpi
+  push 0
+  calldataload
+  push 224
+  shr
+  dup1
+  push 0x8c4ee692
+  eq
+  push bb5
+  jumpi
+  jump bb4
+bb4 [cold]:
+  push 0
+  dup1
+  revert
+bb27 [cold]:
+  push 0x4e487b71
+  push 224
+  shl
+  push 0
+  mstore
+  push 17
+  push 4
+  mstore
+  push 36
+  push 0
+  revert
+bb5:
+  calldatasize
+  push 4
+  swap1
+  sub
+  push 640
+  sgt
+  push bb4
+  jumpi
+  push 36
+  calldataload
+  push 4
+  calldataload
+  add
+  dup1
+  push 160
+  mstore
+  push 4
+  calldataload
+  gt
+  push bb27
+  jumpi
+  push 68
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 100
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 132
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 164
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 196
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 228
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 260
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 292
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 324
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 356
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 388
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 420
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 452
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 484
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 516
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 548
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 580
+  calldataload
+  push 160
+  mload
+  add
+  dup1
+  push 192
+  mstore
+  push 160
+  mload
+  gt
+  push bb27
+  jumpi
+  push 612
+  calldataload
+  push 192
+  mload
+  add
+  dup1
+  push 160
+  mstore
+  push 192
+  mload
+  gt
+  push bb27
+  jumpi
+  push 160
+  mload
+  push 128
+  mstore
+  push 32
+  push 128
+  return

@@ -1,7 +1,14 @@
+//! JSON diagnostics, including rustc-compatible and solc-compatible representations.
+//!
+//! The rustc-compatible representation is modified from rustc's [`JsonEmitter`](https://github.com/rust-lang/rust/blob/3b58636b30eb364ac72aeaf03d46347084ed87d1/compiler/rustc_errors/src/json.rs).
+//! It preserves this codebase's source-map model, which has no macro expansion metadata.
+
 use super::{Emitter, human::HumanBufferEmitter, io_panic};
 use crate::{
     Span,
-    diagnostics::{CodeSuggestion, Diag, Level, MultiSpan, SpanLabel, SubDiagnostic},
+    diagnostics::{
+        Applicability, CodeSuggestion, Diag, Level, MultiSpan, SpanLabel, SubDiagnostic,
+    },
     source_map::{LineInfo, SourceFile, SourceMap},
 };
 use anstream::ColorChoice;
@@ -41,12 +48,18 @@ impl Emitter for JsonEmitter {
 
 impl JsonEmitter {
     /// Creates a new `JsonEmitter` that writes to given writer.
-    pub fn new(writer: Box<dyn io::Write + Send>, source_map: Arc<SourceMap>) -> Self {
+    pub fn new(
+        writer: Box<dyn io::Write + Send>,
+        source_map: Arc<SourceMap>,
+        color_choice: ColorChoice,
+    ) -> Self {
+        let color_choice =
+            if color_choice == ColorChoice::Auto { ColorChoice::Never } else { color_choice };
         Self {
             writer,
             pretty: false,
             rustc_like: false,
-            human_emitter: HumanBufferEmitter::new(ColorChoice::Never).source_map(Some(source_map)),
+            human_emitter: HumanBufferEmitter::new(color_choice).source_map(Some(source_map)),
         }
     }
 
@@ -92,7 +105,12 @@ impl JsonEmitter {
             .children
             .iter()
             .map(|sub| self.sub_diagnostic(sub))
-            .chain(diagnostic.suggestions.iter().map(|sugg| self.suggestion_to_diagnostic(sugg)))
+            .chain(
+                diagnostic
+                    .suggestions
+                    .iter()
+                    .flat_map(|suggestion| self.suggestion_to_diagnostics(suggestion)),
+            )
             .collect();
 
         JsonDiagnostic {
@@ -119,23 +137,31 @@ impl JsonEmitter {
         }
     }
 
-    fn suggestion_to_diagnostic(&self, sugg: &CodeSuggestion) -> JsonDiagnostic<'static> {
-        // Collect all spans from all substitutions
-        let spans = sugg
-            .substitutions
-            .iter()
-            .flat_map(|sub| sub.parts.iter())
-            .map(|part| self.span_with_suggestion(part.span, part.snippet.to_string()))
-            .collect();
-
-        JsonDiagnostic {
-            message: Cow::Owned(sugg.msg.as_str().to_string()),
-            code: None,
-            level: Cow::Borrowed("help"),
-            spans,
-            children: vec![],
-            rendered: None,
-        }
+    fn suggestion_to_diagnostics<'a>(
+        &'a self,
+        suggestion: &'a CodeSuggestion,
+    ) -> impl Iterator<Item = JsonDiagnostic<'static>> + 'a {
+        suggestion.substitutions.iter().map(move |substitution| {
+            let spans = substitution
+                .parts
+                .iter()
+                .map(|part| {
+                    self.span_with_suggestion(
+                        part.span,
+                        part.snippet.to_string(),
+                        suggestion.applicability,
+                    )
+                })
+                .collect();
+            JsonDiagnostic {
+                message: Cow::Owned(suggestion.msg.as_str().to_string()),
+                code: None,
+                level: Cow::Borrowed("help"),
+                spans,
+                children: vec![],
+                rendered: None,
+            }
+        })
     }
 
     fn spans(&self, msp: &MultiSpan) -> Vec<JsonDiagnosticSpan<'static>> {
@@ -159,11 +185,33 @@ impl JsonEmitter {
             text: self.span_lines(span),
             label: label.label.as_ref().map(|msg| Cow::Owned(msg.as_str().to_string())),
             suggested_replacement: None,
+            suggestion_applicability: None,
+            expansion: None,
         }
     }
 
-    fn span_with_suggestion(&self, span: Span, replacement: String) -> JsonDiagnosticSpan<'static> {
+    fn span_with_suggestion(
+        &self,
+        span: Span,
+        replacement: String,
+        applicability: Applicability,
+    ) -> JsonDiagnosticSpan<'static> {
         let sm = &**self.source_map();
+        let start = sm.lookup_char_pos(span.lo());
+        let span = if start.col.0 == 0
+            && replacement.is_empty()
+            && span.hi() < start.file.end_position()
+            && start.file.contains(span.hi())
+            && start
+                .file
+                .src
+                .get(start.file.relative_position(span.hi()).to_usize()..)
+                .is_some_and(|after| after.starts_with('\n'))
+        {
+            span.with_hi(span.hi() + crate::BytePos(1))
+        } else {
+            span
+        };
         let start = sm.lookup_char_pos(span.lo());
         let end = sm.lookup_char_pos(span.hi());
         JsonDiagnosticSpan {
@@ -178,6 +226,8 @@ impl JsonEmitter {
             text: self.span_lines(span),
             label: None,
             suggested_replacement: Some(Cow::Owned(replacement)),
+            suggestion_applicability: Some(applicability),
+            expansion: None,
         }
     }
 
@@ -306,7 +356,7 @@ pub struct JsonDiagnostic<'a> {
     /// The diagnostic code.
     #[serde(borrow)]
     pub code: Option<JsonDiagnosticCode<'a>>,
-    /// "error", "warning", "note", "help".
+    /// "error: internal compiler error", "error", "warning", "note", or "help".
     #[serde(borrow)]
     pub level: Cow<'a, str>,
     /// The diagnostic spans.
@@ -351,6 +401,25 @@ pub struct JsonDiagnosticSpan<'a> {
     /// that should be sliced in atop this span.
     #[serde(borrow)]
     pub suggested_replacement: Option<Cow<'a, str>>,
+    /// How confidently the suggested replacement can be applied.
+    pub suggestion_applicability: Option<Applicability>,
+    /// Macro expansion that produced this span, if available.
+    #[serde(borrow)]
+    pub expansion: Option<Box<JsonDiagnosticSpanMacroExpansion<'a>>>,
+}
+
+/// A macro expansion represented in a rustc-like JSON diagnostic span.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JsonDiagnosticSpanMacroExpansion<'a> {
+    /// The span where the macro was invoked.
+    #[serde(borrow)]
+    pub span: JsonDiagnosticSpan<'a>,
+    /// The macro declaration name.
+    #[serde(borrow)]
+    pub macro_decl_name: Cow<'a, str>,
+    /// The span where the macro was defined.
+    #[serde(borrow)]
+    pub def_site_span: JsonDiagnosticSpan<'a>,
 }
 
 /// A source line in a rustc-like JSON diagnostic span.
@@ -385,7 +454,7 @@ pub struct JsonDiagnosticCode<'a> {
 pub struct SolcDiagnostic<'a> {
     #[serde(borrow)]
     pub source_location: Option<SourceLocation<'a>>,
-    #[serde(borrow)]
+    #[serde(default, borrow)]
     pub secondary_source_locations: Vec<SourceLocation<'a>>,
     #[serde(borrow)]
     pub r#type: Cow<'a, str>,
@@ -445,12 +514,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn whole_line_deletion_includes_newline() {
+        let source_map = Arc::new(SourceMap::empty());
+        source_map
+            .new_source_file(crate::source_map::FileName::custom("test.sol"), "foo\nbar\n")
+            .unwrap();
+        let emitter = JsonEmitter::new(Box::new(io::sink()), source_map, ColorChoice::Never);
+
+        let span = emitter.span_with_suggestion(
+            Span::new(crate::BytePos(0), crate::BytePos(3)),
+            String::new(),
+            Applicability::MachineApplicable,
+        );
+
+        assert_eq!(span.byte_start, 0);
+        assert_eq!(span.byte_end, 4);
+        assert_eq!(span.line_start, 1);
+        assert_eq!(span.line_end, 2);
+        assert_eq!(span.column_end, 1);
+        assert!(span.expansion.is_none());
+    }
+
+    #[test]
     fn solc_diagnostic_serializes_borrowed_strings() {
+        let start = 0_u32;
+        let end = 1_u32;
         let diagnostic = SolcDiagnostic {
             source_location: Some(SourceLocation {
                 file: Cow::Borrowed("input.sol"),
-                start: 0,
-                end: 1,
+                start,
+                end,
                 message: Some(Cow::Borrowed("borrowed \"message\"")),
             }),
             secondary_source_locations: Vec::new(),

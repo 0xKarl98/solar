@@ -58,6 +58,8 @@ pub struct Parser<'sess, 'ast, 'cb> {
     in_yul: bool,
     /// Whether the parser is currently parsing a contract block.
     in_contract: bool,
+    /// Whether incomplete input should be recovered into a partial AST.
+    recover_incomplete_input: bool,
 
     /// Current recursion depth for recursive parsing operations.
     recursion_depth: usize,
@@ -157,6 +159,7 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             tokens: tokens.into_iter(),
             in_yul: false,
             in_contract: false,
+            recover_incomplete_input: sess.opts.unstable.recover_incomplete_input,
             recursion_depth: 0,
             import_callback: None,
         };
@@ -409,7 +412,19 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
     #[inline]
     #[track_caller]
     fn expect_semi(&mut self) -> PResult<'sess, ()> {
-        self.expect(TokenKind::Semi).map(drop)
+        let recover = self.recover_incomplete_input
+            && matches!(self.token.kind, TokenKind::CloseDelim(Delimiter::Brace) | TokenKind::Eof);
+        if recover && self.last_unexpected_token_span == Some(self.token.span) {
+            return Ok(());
+        }
+        match self.expect(TokenKind::Semi) {
+            Ok(_) => Ok(()),
+            Err(err) if recover => {
+                err.emit();
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Checks if the next token is `tok`, and returns `true` if so.
@@ -666,37 +681,45 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         let mut trailing = false;
         let mut v = SmallVec::<[T; 8]>::new();
 
-        if !allow_empty {
-            v.push(f(self)?);
-            first = false;
-        }
-
-        while !self.check(ket) {
-            if self.token.kind == TokenKind::Eof {
+        loop {
+            let required_first = first && !allow_empty;
+            if !required_first && self.check(ket) {
+                break;
+            }
+            if !required_first && self.token.kind == TokenKind::Eof {
                 recovered = Recovered::Yes;
                 break;
             }
 
-            if let Some(sep_kind) = sep.sep {
-                if first {
-                    // no separator for the first element
-                    first = false;
-                } else {
-                    // check for separator
-                    let recovered_ = self.expect(sep_kind)?;
-                    if recovered_ == Recovered::Yes {
-                        recovered = Recovered::Yes;
-                        break;
-                    }
+            if first {
+                // No separator for the first element.
+                first = false;
+            } else if let Some(sep_kind) = sep.sep {
+                // Check for a separator.
+                let recovered_ = self.expect(sep_kind)?;
+                if recovered_ == Recovered::Yes {
+                    recovered = Recovered::Yes;
+                    break;
+                }
 
-                    if self.check(ket) {
-                        trailing = true;
-                        break;
-                    }
+                if self.check(ket) {
+                    trailing = true;
+                    break;
                 }
             }
 
-            v.push(f(self)?);
+            match f(self) {
+                Ok(value) => v.push(value),
+                Err(err) if self.can_recover_sequence(ket) => {
+                    err.emit();
+                    if self.token.kind == ket {
+                        self.bump();
+                    }
+                    recovered = Recovered::Yes;
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         if let Some(sep_kind) = sep.sep {
@@ -715,6 +738,15 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         }
 
         Ok((self.alloc_smallvec(v), recovered))
+    }
+
+    fn can_recover_sequence(&self, ket: TokenKind) -> bool {
+        self.recover_incomplete_input
+            && (self.token.kind == ket
+                || matches!(
+                    self.token.kind,
+                    TokenKind::Semi | TokenKind::Eof | TokenKind::CloseDelim(_)
+                ))
     }
 
     /// Advance the parser by one token.
@@ -1104,11 +1136,16 @@ fn parse_natspec(
             // can only be followed by whitespace
             ast::CommentKind::Line => bytes[line_start..at_pos].trim_ascii().is_empty(),
 
-            // can only be followed by whitespaces + ('*') + whitespaces
+            // can only be followed by whitespaces and '*' decorations, which
+            // may repeat (`* * @return` still starts a tag, as in solc, where
+            // the scanner strips one decoration and the parser finds the tag
+            // anywhere in the line).
             ast::CommentKind::Block => {
-                let trimmed = &bytes[line_start..at_pos].trim_ascii_start();
-                trimmed.is_empty()
-                    || (trimmed.starts_with(b"*") && trimmed[1..].trim_ascii_end().is_empty())
+                let mut rest = bytes[line_start..at_pos].trim_ascii_start();
+                while let Some(stripped) = rest.strip_prefix(b"*") {
+                    rest = stripped.trim_ascii_start();
+                }
+                rest.is_empty()
             }
         }
     };
@@ -1120,6 +1157,16 @@ fn parse_natspec(
             && is_line_start(line_start, line_start + tag_offset)
         {
             let tag_start = line_start + tag_offset + 1;
+
+            // The tag name must immediately follow the '@': `@ param` is
+            // plain text continuing the previous tag, matching solc.
+            let (tag, rest_start) = crate::natspec::split_once_ws(content, tag_start, line_end);
+            if tag.is_empty() {
+                prev_line_end = line_end;
+                line_start = line_end + 1;
+                continue;
+            }
+
             flush_item(
                 &mut items,
                 &mut kind,
@@ -1129,15 +1176,8 @@ fn parse_natspec(
                 prev_line_end,
             );
 
-            // Skip leading whitespace after '@'
-            let tag_slice = &bytes[tag_start..line_end];
-            let trimmed = tag_slice.len() - tag_slice.trim_ascii_start().len();
-            let (tag, rest_start) =
-                crate::natspec::split_once_ws(content, tag_start + trimmed, line_end);
-
-            // Calculate span: from first non-whitespace char after '@' to end of tag name.
-            let tag_lo =
-                comment_span.lo().0 + PREFIX_BYTES + 1 + (line_start + tag_offset + trimmed) as u32; // +1 for '@'
+            // Calculate span: from the char after '@' to end of tag name.
+            let tag_lo = comment_span.lo().0 + PREFIX_BYTES + 1 + (line_start + tag_offset) as u32; // +1 for '@'
             let tag_hi = tag_lo + tag.len() as u32;
             span = Some(Span::new(BytePos(tag_lo), BytePos(tag_hi)));
             content_start = rest_start;
@@ -1148,10 +1188,15 @@ fn parse_natspec(
                 "notice" => ast::NatSpecKind::Notice,
                 "dev" => ast::NatSpecKind::Dev,
                 "param" | "inheritdoc" => {
+                    let name_start = rest_start;
+                    // Names are identifier prefixes, mirroring solc: `@param -`
+                    // documents an unnamed parameter with an empty name.
                     let (name, content_start_pos) =
-                        crate::natspec::split_once_ws(content, rest_start, line_end);
+                        crate::natspec::split_once_ident(content, rest_start, line_end);
                     content_start = content_start_pos;
-                    let ident = Ident::new(Symbol::intern(name), comment_span);
+                    let name_lo = comment_span.lo() + PREFIX_BYTES + name_start as u32;
+                    let name_span = Span::new(name_lo, name_lo + name.len() as u32);
+                    let ident = Ident::new(Symbol::intern(name), name_span);
                     match tag {
                         "param" => ast::NatSpecKind::Param { name: ident },
                         "inheritdoc" => ast::NatSpecKind::Inheritdoc { contract: ident },
@@ -1265,6 +1310,27 @@ import * as B from "b.sol";
     }
 
     #[test]
+    fn nonempty_sequence_requires_a_first_element() {
+        for (allow_empty, succeeds) in [(true, true), (false, false)] {
+            let sess = Session::builder()
+                .with_buffer_emitter(Default::default())
+                .single_threaded()
+                .build();
+            sess.enter_sequential(|| {
+                let arena = ast::Arena::new();
+                let mut parser =
+                    Parser::from_source_code(&sess, &arena, "test.sol".to_string().into(), "{}")
+                        .unwrap();
+                let result = parser
+                    .parse_delim_comma_seq(Delimiter::Brace, allow_empty, Parser::parse_ident)
+                    .map_err(|err| err.emit());
+
+                assert_eq!(result.is_ok(), succeeds);
+            });
+        }
+    }
+
+    #[test]
     fn parse_natspec_line_cmnts() {
         let src = r#"
 /// @title MyContract
@@ -1292,7 +1358,9 @@ import * as B from "b.sol";
             let docs = parser.parse_doc_comments();
 
             let natspec_items: Vec<_> = docs.iter().flat_map(|d| d.natspec.iter().map(move |i| (d.symbol, i))).collect();
-            assert_eq!(natspec_items.len(), 12);
+            // `@ notice with space` is not a tag: the name must immediately
+            // follow the `@`, so the line yields no item.
+            assert_eq!(natspec_items.len(), 11);
 
             let check = |i: usize, snip, kind, name, content| {
                 check_natspec_item(sm, natspec_items[i].0, natspec_items[i].1, snip, kind, name, content)
@@ -1311,7 +1379,6 @@ import * as B from "b.sol";
             check(8, "inheritdoc", "inheritdoc", Some("BaseContract"), Some(""));
             check(9, "custom:security", "custom", Some("security"), Some("High priority"));
             check(10, "solidity", "internal", Some("solidity"), Some("memory-safe"));
-            check(11, "notice", "notice", None, Some("with space"));
 
             assert_eq!(sm.span_to_snippet(docs.span()).unwrap(), "/// @title MyContract\n/// @author Alice\n/// @notice This is a notice\n/// that spans multiple lines\n/// and continues here\n/// @dev This is dev documentation\n/// @param x The input parameter\n/// @return result The return value\n/// @inheritdoc BaseContract\n/// @custom:security High priority\n/// @solidity memory-safe\n/// @ notice with space");
         });

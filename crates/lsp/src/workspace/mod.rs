@@ -26,6 +26,8 @@ pub(crate) struct Workspace {
     compile_opts: CompileOpts,
     source_roots: Vec<PathBuf>,
     source_files: Vec<PathBuf>,
+    flycheck_source_roots: Vec<PathBuf>,
+    flycheck_source_files: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,8 +46,10 @@ impl Workspace {
         Self {
             kind: WorkspaceKind::Naked,
             compile_opts: CompileOpts { base_path: Some(root), ..Default::default() },
+            flycheck_source_roots: source_roots.clone(),
             source_roots,
             source_files: Vec::new(),
+            flycheck_source_files: Vec::new(),
         }
     }
 
@@ -55,6 +59,8 @@ impl Workspace {
             compile_opts: CompileOpts::default(),
             source_roots: Vec::new(),
             source_files: Vec::new(),
+            flycheck_source_roots: Vec::new(),
+            flycheck_source_files: Vec::new(),
         }
     }
 
@@ -75,40 +81,73 @@ impl Workspace {
         &self.source_files
     }
 
+    pub(crate) fn flycheck_source_files(&self) -> &[PathBuf] {
+        &self.flycheck_source_files
+    }
+
     pub(crate) fn refresh_source_files(&mut self) {
         self.source_files.clear();
-        if self.kind == WorkspaceKind::Naked {
-            return;
-        }
+        // Naked roots need workspace-wide symbols for reverse navigation, but have no manifest
+        // boundary to keep dependency and build directories out of the scan.
+        let skip_heavy_dirs = self.kind == WorkspaceKind::Naked;
         for root in &self.source_roots {
-            collect_solidity_files(root, &mut self.source_files);
+            collect_solidity_files(root, root, &mut self.source_files, skip_heavy_dirs);
         }
         self.source_files.sort();
         self.source_files.dedup();
+
+        self.flycheck_source_files.clone_from(&self.source_files);
+        for root in &self.flycheck_source_roots {
+            if !self.source_roots.contains(root) {
+                collect_solidity_files(
+                    root,
+                    root,
+                    &mut self.flycheck_source_files,
+                    skip_heavy_dirs,
+                );
+            }
+        }
+        self.flycheck_source_files.sort();
+        self.flycheck_source_files.dedup();
     }
 
     pub(crate) fn add_source_file(&mut self, path: PathBuf) {
-        if !self.tracks_disk_file(&path) {
-            return;
+        if self.tracks_disk_file(&path) {
+            insert_sorted(&mut self.source_files, path.clone());
         }
-        match self.source_files.binary_search(&path) {
-            Ok(_) => {}
-            Err(pos) => self.source_files.insert(pos, path),
-        }
+        self.add_flycheck_source_file(&path);
     }
 
     pub(crate) fn remove_source_file(&mut self, path: &Path) {
-        if let Ok(pos) =
-            self.source_files.binary_search_by(|candidate| candidate.as_path().cmp(path))
-        {
-            self.source_files.remove(pos);
+        remove_sorted(&mut self.source_files, path);
+        self.remove_flycheck_source_file(path);
+    }
+
+    pub(crate) fn add_flycheck_source_file(&mut self, path: &Path) {
+        if self.tracks_flycheck_file(path) {
+            insert_sorted(&mut self.flycheck_source_files, path.to_path_buf());
         }
     }
 
+    pub(crate) fn remove_flycheck_source_file(&mut self, path: &Path) {
+        remove_sorted(&mut self.flycheck_source_files, path);
+    }
+
     pub(crate) fn tracks_disk_file(&self, path: &Path) -> bool {
-        self.kind != WorkspaceKind::Naked
-            && is_solidity_file(path)
-            && self.source_roots.iter().any(|root| path.starts_with(root))
+        self.tracks_file_in_roots(path, &self.source_roots)
+    }
+
+    pub(crate) fn tracks_flycheck_file(&self, path: &Path) -> bool {
+        self.tracks_file_in_roots(path, &self.flycheck_source_roots)
+    }
+
+    fn tracks_file_in_roots(&self, path: &Path, roots: &[PathBuf]) -> bool {
+        is_solidity_file(path)
+            && roots.iter().any(|root| {
+                path.starts_with(root)
+                    && (self.kind != WorkspaceKind::Naked
+                        || !is_in_ignored_naked_directory(root, path))
+            })
     }
 
     pub(crate) fn load_foundry(path: PathBuf) -> Result<Self, WorkspaceError> {
@@ -124,9 +163,23 @@ impl Workspace {
         Ok(Self {
             kind: WorkspaceKind::Foundry,
             source_roots: profile.source_roots(&root),
+            flycheck_source_roots: profile.flycheck_source_roots(&root),
             compile_opts,
             source_files: Vec::new(),
+            flycheck_source_files: Vec::new(),
         })
+    }
+}
+
+fn insert_sorted(files: &mut Vec<PathBuf>, path: PathBuf) {
+    if let Err(pos) = files.binary_search(&path) {
+        files.insert(pos, path);
+    }
+}
+
+fn remove_sorted(files: &mut Vec<PathBuf>, path: &Path) {
+    if let Ok(pos) = files.binary_search_by(|candidate| candidate.as_path().cmp(path)) {
+        files.remove(pos);
     }
 }
 
@@ -159,15 +212,20 @@ impl<'a> WorkspacePathIndex<'a> {
     }
 
     pub(crate) fn workspace_idx_for_path(&self, path: &Path) -> usize {
-        self.entries
-            .iter()
-            .find(|entry| path.starts_with(entry.base_path))
-            .map(|entry| entry.idx)
-            .unwrap_or(0)
+        self.workspace_idx_containing_path(path).unwrap_or(0)
+    }
+
+    pub(crate) fn workspace_idx_containing_path(&self, path: &Path) -> Option<usize> {
+        self.entries.iter().find(|entry| path.starts_with(entry.base_path)).map(|entry| entry.idx)
     }
 }
 
-fn collect_solidity_files(path: &Path, files: &mut Vec<PathBuf>) {
+fn collect_solidity_files(
+    root: &Path,
+    path: &Path,
+    files: &mut Vec<PathBuf>,
+    skip_heavy_dirs: bool,
+) {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return;
     };
@@ -178,17 +236,40 @@ fn collect_solidity_files(path: &Path, files: &mut Vec<PathBuf>) {
         return;
     }
     if metadata.is_dir() {
+        if skip_heavy_dirs && is_ignored_naked_directory(root, path) {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
         };
         for entry in entries.filter_map(Result::ok) {
-            collect_solidity_files(&entry.path(), files);
+            collect_solidity_files(root, &entry.path(), files, skip_heavy_dirs);
         }
     }
 }
 
 fn is_solidity_file(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "sol")
+}
+
+fn is_heavy_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | "cache" | "lib" | "node_modules" | "out" | "target")
+    )
+}
+
+fn is_ignored_naked_directory(root: &Path, directory: &Path) -> bool {
+    directory != root && (is_heavy_dir(directory) || directory.join(".git").exists())
+}
+
+fn is_in_ignored_naked_directory(root: &Path, path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        parent
+            .ancestors()
+            .take_while(|directory| directory.starts_with(root))
+            .any(|directory| is_ignored_naked_directory(root, directory))
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -334,32 +415,44 @@ mod tests {
     }
 
     #[test]
-    fn naked_workspace_does_not_collect_disk_source_files() {
-        let project = TestProject::from_fixture(
-            r#"
-            //- /src/A.sol
-            contract A {}
-            "#,
-        );
+    fn naked_workspace_collects_disk_source_files_and_skips_heavy_dirs() {
+        let project = TestProject::new();
+        project.write_file("/src/A.sol", "contract A {}");
+        for dir in [".git", "cache", "lib", "node_modules", "out", "target"] {
+            project.write_file(&format!("/{dir}/Ignored.sol"), "contract Ignored {}");
+        }
+        project.write_file("/nested/.git", "gitdir: elsewhere");
+        project.write_file("/nested/Ignored.sol", "contract Ignored {}");
 
         let mut workspace = Workspace::naked(project.root().to_path_buf());
         workspace.refresh_source_files();
 
-        assert!(workspace.source_files().is_empty());
+        assert_eq!(workspace.source_files(), &[project.path("/src/A.sol")]);
     }
 
     #[test]
-    fn naked_workspace_does_not_add_created_disk_source_files() {
+    fn naked_workspace_adds_created_disk_source_files_outside_heavy_dirs() {
         let project = TestProject::from_fixture(
             r#"
             //- /src/A.sol
             contract A {}
+
+            //- /node_modules/Ignored.sol
+            contract Ignored {}
+
+            //- /nested/.git
+            gitdir: elsewhere
+
+            //- /nested/Ignored.sol
+            contract Ignored {}
             "#,
         );
 
         let mut workspace = Workspace::naked(project.root().to_path_buf());
         workspace.add_source_file(project.path("/src/A.sol"));
+        workspace.add_source_file(project.path("/node_modules/Ignored.sol"));
+        workspace.add_source_file(project.path("/nested/Ignored.sol"));
 
-        assert!(workspace.source_files().is_empty());
+        assert_eq!(workspace.source_files(), &[project.path("/src/A.sol")]);
     }
 }

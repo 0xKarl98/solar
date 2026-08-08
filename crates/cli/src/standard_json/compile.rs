@@ -2,18 +2,18 @@
 
 use super::data::{
     BytecodeOutput, CompilerInput, CompilerOutput, ContractOutput, EvmOutput, FxIndexMap,
-    Optimizer, OutputSelection, OutputSelectionFlags, ReadCallbackResult, Settings, SourceOutput,
-    StandardJsonReadCallback, print_standard_json_stats, strip_json_comments,
+    OffsetLength, Optimizer, OutputSelection, OutputSelectionFlags, ReadCallbackResult, Settings,
+    SourceOutput, StandardJsonReadCallback, print_standard_json_stats, strip_json_comments,
 };
-use alloy_primitives::Bytes;
 use serde_json::json;
-use solar_codegen::{EvmCodegen, lower};
+use solar_codegen::{ContractArtifact, ContractSelection};
 use solar_config::{
-    CompileOpts, CompilerStage, EvmVersion, ImportRemapping, Language, OptimizationMode,
+    CompileOpts, CompilerStage, EvmVersion, ImportRemapping, Language, LibraryAddress,
+    OptimizationMode,
 };
-use solar_data_structures::map::{FxHashMap, FxHashSet};
+use solar_data_structures::map::FxHashMap;
 use solar_interface::{
-    Result, SourceMap,
+    SourceMap,
     diagnostics::{DiagCtxt, InMemoryEmitter, JsonEmitter, SolcDiagnostic},
     source_map::FileLoader,
 };
@@ -59,7 +59,7 @@ pub fn compile_standard_json(
         }
     }
 
-    let mut emitter = JsonEmitter::new(Box::new(io::sink()), Arc::clone(&source_map))
+    let mut emitter = JsonEmitter::new(Box::new(io::sink()), Arc::clone(&source_map), opts.color)
         .ui_testing(opts.unstable.ui_testing)
         .human_kind(opts.error_format_human)
         .terminal_width(opts.diagnostic_width);
@@ -123,7 +123,8 @@ fn compile(
     // fields we don't act on yet are bound with a leading underscore and a note.
     // Adding a field to `Settings` then forces a decision here instead of it
     // being silently ignored.
-    let Settings { remappings, output_selection, stop_after, evm_version, optimizer } = settings;
+    let Settings { remappings, output_selection, stop_after, evm_version, optimizer, libraries } =
+        settings;
 
     let mut parsed_remappings = Vec::with_capacity(remappings.len());
     for remapping in &remappings {
@@ -153,14 +154,28 @@ fn compile(
     };
     opts.stop_after = stop_after.as_deref().and_then(|stage| CompilerStage::from_str(stage).ok());
 
-    // Map the solc optimizer toggle onto our MIR optimization objective. We only
-    // override when the input explicitly disables the optimizer, leaving the
-    // CLI-driven default otherwise. `runs` and `details` have no analogue in the
-    // MIR optimizer yet, so they're parsed but unused.
-    if let Some(Optimizer { enabled: false, runs: _runs }) = optimizer {
-        opts.optimization = OptimizationMode::None;
+    if let Some(Optimizer { enabled, runs }) = optimizer {
+        // 200 runs is the default value if unspecified in solc.
+        // Treat lower values as Size.
+        opts.optimization = if enabled {
+            if runs.is_none_or(|x| x >= 200) {
+                OptimizationMode::Gas
+            } else {
+                OptimizationMode::Size
+            }
+        } else {
+            OptimizationMode::None
+        };
     }
 
+    opts.libraries = Vec::with_capacity(libraries.len());
+    for (source, libraries) in libraries.0 {
+        opts.libraries.extend(libraries.into_iter().map(|(name, address)| LibraryAddress {
+            source: (!source.is_empty()).then(|| source.to_string()),
+            name: name.into(),
+            address,
+        }));
+    }
     opts.input = sources.keys().map(ToString::to_string).collect();
 
     let sess = solar_interface::Session::builder()
@@ -172,7 +187,7 @@ fn compile(
     let _ = crate::commands::compile::run_compiler_session_with(
         sess,
         |compiler| {
-            let _control_flow = crate::commands::compile::run_pipeline(
+            let control_flow = crate::commands::compile::run_pipeline(
                 compiler,
                 |pcx| {
                     let mut files = Vec::with_capacity(sources.len());
@@ -191,18 +206,20 @@ fn compile(
                 },
                 |compiler| output.sources = source_outputs_from_compiler(compiler),
             )?;
+            if control_flow.is_break() {
+                return Ok(());
+            }
 
             let gcx = compiler.gcx();
 
             // Code generation is experimental and gated behind `-Zcodegen`;
             // without it, no bytecode is produced even when requested.
-            let bytecodes = if gcx.sess.opts.unstable.codegen
-                && needs_bytecode_output(gcx, &output_selection)
-            {
-                Some(generate_contract_bytecodes(gcx)?)
+            let bytecode_contracts = if gcx.sess.opts.unstable.codegen {
+                requested_bytecode_contracts(gcx, &output_selection)
             } else {
-                None
+                ContractSelection::empty(gcx)
             };
+            let bytecodes = crate::emit::emit_requested(compiler, bytecode_contracts)?;
 
             gcx.dcx().has_errors()?;
 
@@ -226,11 +243,6 @@ fn compile(
         },
         false,
     );
-}
-
-struct GeneratedBytecodes {
-    deployment: Bytes,
-    runtime: Bytes,
 }
 
 struct StandardJsonFileLoader {
@@ -326,8 +338,8 @@ fn make_contract_output(
     gcx: Gcx<'_>,
     contract_id: solar_sema::hir::ContractId,
     output_selection: OutputSelectionFlags,
-    bytecodes: Option<&FxHashMap<ContractId, GeneratedBytecodes>>,
-) -> ContractOutput {
+    bytecodes: Option<&FxHashMap<ContractId, ContractArtifact>>,
+) -> ContractOutput<'static> {
     let mut output = ContractOutput::default();
 
     if output_selection.contains(OutputSelectionFlags::ABI) {
@@ -355,28 +367,19 @@ fn make_contract_output(
             );
         }
     }
-    // In solc's output selection `evm.bytecode` is the full bytecode object
-    // (`object`, `opcodes`, `sourceMap`, `linkReferences`, ...) and
-    // `evm.bytecode.object` selects only the `object` hex sub-field. We match
-    // either selector and emit a `BytecodeOutput`; since we only populate
-    // `object` for now, the two selectors currently produce identical output.
-    // Honoring the finer-grained `.object`/`.opcodes`/`.sourceMap` selectors is
-    // part of the larger effort to match solc's input->output key mapping.
-    if output_selection.contains(OutputSelectionFlags::BYTECODE_OBJECT) {
-        evm.bytecode = Some(
-            bytecodes
-                .and_then(|bytecodes| bytecodes.get(&contract_id))
-                .map(|bytecodes| BytecodeOutput::new(bytecodes.deployment.clone()))
-                .unwrap_or_else(BytecodeOutput::empty),
-        );
+    let artifact = bytecodes.and_then(|bytecodes| bytecodes.get(&contract_id));
+    let bytecode_outputs = OutputSelectionFlags::BYTECODE_OBJECT
+        | OutputSelectionFlags::BYTECODE_OPCODES
+        | OutputSelectionFlags::BYTECODE_LINK_REFERENCES;
+    if output_selection.intersects(bytecode_outputs) {
+        evm.bytecode = Some(make_bytecode_output(gcx, artifact, output_selection, false));
     }
-    if output_selection.contains(OutputSelectionFlags::DEPLOYED_BYTECODE_OBJECT) {
-        evm.deployed_bytecode = Some(
-            bytecodes
-                .and_then(|bytecodes| bytecodes.get(&contract_id))
-                .map(|bytecodes| BytecodeOutput::new(bytecodes.runtime.clone()))
-                .unwrap_or_else(BytecodeOutput::empty),
-        );
+    let deployed_bytecode_outputs = OutputSelectionFlags::DEPLOYED_BYTECODE_OBJECT
+        | OutputSelectionFlags::DEPLOYED_BYTECODE_OPCODES
+        | OutputSelectionFlags::DEPLOYED_BYTECODE_LINK_REFERENCES
+        | OutputSelectionFlags::DEPLOYED_BYTECODE_IMMUTABLE_REFERENCES;
+    if output_selection.intersects(deployed_bytecode_outputs) {
+        evm.deployed_bytecode = Some(make_bytecode_output(gcx, artifact, output_selection, true));
     }
     if !evm.is_empty() {
         output.evm = Some(evm);
@@ -385,85 +388,86 @@ fn make_contract_output(
     output
 }
 
-fn needs_bytecode_output(gcx: solar_sema::Gcx<'_>, output_selection: &OutputSelection<'_>) -> bool {
-    gcx.hir.contracts_enumerated().any(|(_, contract)| {
+fn make_bytecode_output(
+    gcx: Gcx<'_>,
+    artifact: Option<&ContractArtifact>,
+    output_selection: OutputSelectionFlags,
+    deployed: bool,
+) -> BytecodeOutput {
+    let object_flag = if deployed {
+        OutputSelectionFlags::DEPLOYED_BYTECODE_OBJECT
+    } else {
+        OutputSelectionFlags::BYTECODE_OBJECT
+    };
+    let opcodes_flag = if deployed {
+        OutputSelectionFlags::DEPLOYED_BYTECODE_OPCODES
+    } else {
+        OutputSelectionFlags::BYTECODE_OPCODES
+    };
+    let link_references_flag = if deployed {
+        OutputSelectionFlags::DEPLOYED_BYTECODE_LINK_REFERENCES
+    } else {
+        OutputSelectionFlags::BYTECODE_LINK_REFERENCES
+    };
+    let bytecode =
+        artifact.map(|artifact| if deployed { &artifact.runtime } else { &artifact.deployment });
+
+    let mut output = BytecodeOutput::default();
+    if output_selection.contains(object_flag) {
+        output.object = Some(bytecode.cloned().unwrap_or_default());
+    }
+    if output_selection.contains(opcodes_flag) {
+        output.opcodes = Some(solar_codegen::backend::evm::disassemble_standard_json(
+            bytecode.map_or(&[], |bytecode| bytecode.as_ref()),
+            gcx.sess.opts.evm_version,
+        ));
+    }
+    if output_selection.contains(link_references_flag) {
+        output.link_references = Some(FxIndexMap::default());
+    }
+    if deployed
+        && output_selection.contains(OutputSelectionFlags::DEPLOYED_BYTECODE_IMMUTABLE_REFERENCES)
+    {
+        let mut references = artifact
+            .into_iter()
+            .flat_map(|artifact| artifact.immutable_references.iter())
+            .map(|reference| (gcx.hir.global_item_id(reference.variable_id) as u64, reference))
+            .collect::<Vec<_>>();
+        references.sort_unstable_by_key(|(ast_id, reference)| (*ast_id, reference.start));
+
+        let mut by_ast_id = FxIndexMap::<String, Vec<OffsetLength>>::default();
+        for (ast_id, reference) in references {
+            by_ast_id.entry(ast_id.to_string()).or_default().push(OffsetLength {
+                start: reference.start,
+                length: usize::from(reference.type_size.bytes()),
+            });
+        }
+        output.immutable_references = Some(by_ast_id);
+    }
+    output
+}
+
+fn requested_bytecode_contracts(
+    gcx: solar_sema::Gcx<'_>,
+    output_selection: &OutputSelection<'_>,
+) -> ContractSelection {
+    let bytecode_outputs = OutputSelectionFlags::BYTECODE | OutputSelectionFlags::DEPLOYED_BYTECODE;
+    if output_selection.all().intersects(bytecode_outputs) {
+        return ContractSelection::All;
+    }
+
+    let mut contracts = ContractSelection::empty(gcx);
+    for (contract_id, contract) in gcx.hir.contracts_enumerated() {
+        if contract.kind.is_interface() || contract.kind.is_abstract_contract() {
+            continue;
+        }
+
         let source = gcx.hir.source(contract.source);
-        let source_name = source.file.name.display().to_string();
+        let source_name = standard_json_source_name(&source.file.name);
         let contract_name = contract.name.as_str();
-        output_selection.contract(&source_name, contract_name).intersects(
-            OutputSelectionFlags::BYTECODE_OBJECT | OutputSelectionFlags::DEPLOYED_BYTECODE_OBJECT,
-        )
-    })
-}
-
-fn generate_contract_bytecodes(
-    gcx: solar_sema::Gcx<'_>,
-) -> Result<FxHashMap<ContractId, GeneratedBytecodes>> {
-    let mut all_bytecodes = FxHashMap::default();
-    let mut visiting = FxHashSet::default();
-    for contract_id in gcx.hir.contract_ids() {
-        let contract = gcx.hir.contract(contract_id);
-        if !contract.kind.is_interface() && !contract.kind.is_abstract_contract() {
-            ensure_contract_bytecode(gcx, contract_id, &mut all_bytecodes, &mut visiting)?;
+        if output_selection.contract(&source_name, contract_name).intersects(bytecode_outputs) {
+            contracts.insert(contract_id);
         }
     }
-
-    let mut bytecodes = FxHashMap::default();
-    for contract_id in gcx.hir.contract_ids() {
-        let contract = gcx.hir.contract(contract_id);
-        if !contract.kind.is_interface() && !contract.kind.is_abstract_contract() {
-            let mut module = lower::lower_contract_with_bytecodes(gcx, contract_id, &all_bytecodes);
-            gcx.dcx().has_errors()?;
-            let mut codegen = EvmCodegen::new(gcx);
-            let (deployment, runtime) = codegen.generate_deployment_bytecode(&mut module);
-            bytecodes.insert(
-                contract_id,
-                GeneratedBytecodes { deployment: deployment.into(), runtime: runtime.into() },
-            );
-        }
-    }
-
-    Ok(bytecodes)
-}
-
-fn ensure_contract_bytecode(
-    gcx: solar_sema::Gcx<'_>,
-    contract_id: ContractId,
-    all_bytecodes: &mut FxHashMap<ContractId, Vec<u8>>,
-    visiting: &mut FxHashSet<ContractId>,
-) -> Result {
-    let contract = gcx.hir.contract(contract_id);
-
-    if all_bytecodes.contains_key(&contract_id) {
-        return Ok(());
-    }
-
-    if contract.kind.is_interface() || contract.kind.is_abstract_contract() {
-        return Err(gcx
-            .dcx()
-            .err("cannot generate creation bytecode for non-deployable contract")
-            .span(contract.span)
-            .emit());
-    }
-
-    if !visiting.insert(contract_id) {
-        return Err(gcx
-            .dcx()
-            .err("recursive contract creation bytecode dependency")
-            .span(contract.span)
-            .emit());
-    }
-
-    for dep in lower::contract_bytecode_dependencies(gcx, contract_id) {
-        ensure_contract_bytecode(gcx, dep, all_bytecodes, visiting)?;
-    }
-
-    let mut module = lower::lower_contract_with_bytecodes(gcx, contract_id, all_bytecodes);
-    gcx.dcx().has_errors()?;
-    let mut codegen = EvmCodegen::new(gcx);
-    let (deployment, _) = codegen.generate_deployment_bytecode(&mut module);
-    all_bytecodes.insert(contract_id, deployment);
-    visiting.remove(&contract_id);
-
-    Ok(())
+    contracts
 }

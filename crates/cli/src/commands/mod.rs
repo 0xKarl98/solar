@@ -1,21 +1,19 @@
 //! CLI command runners.
 
-use crate::args::{Args, Subcommands};
+use crate::args::Args;
+#[cfg(feature = "lsp")]
+use crate::args::Subcommands;
 use std::process::ExitCode;
 
 pub mod compile;
-pub(crate) mod evm_opt;
 #[cfg(feature = "lsp")]
 mod lsp;
-pub(crate) mod mir_opt;
 
 pub(crate) fn run(args: Args) -> ExitCode {
     let Args { commands, compile } = args;
     match commands {
         #[cfg(feature = "lsp")]
         Some(Subcommands::Lsp(args)) => lsp::run(args),
-        Some(Subcommands::MirOpt(args)) => mir_opt::run(args),
-        Some(Subcommands::EvmOpt(args)) => evm_opt::run(args),
         None => compile::run(compile),
     }
 }

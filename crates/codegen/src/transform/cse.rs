@@ -36,35 +36,64 @@
 //!   (diamond arms, loop bodies), including the child itself when it sits on a cycle
 
 use crate::{
-    analysis::{CfgInfo, DominatorTree},
-    mir::{
-        BlockId, Function, Immediate, InstId, InstKind, Instruction, MemoryRegion, MirType,
-        StorageAlias, Value, ValueId, utils as mir_utils,
+    analysis::{
+        Access, AddressSpace, AliasAnalysis, CfgInfo, DominatorTree, Location, LocationSize,
+        MemoryCallSummaries, MemoryLocation,
     },
-    pass::FunctionPass,
+    mir::{
+        BlockId, Function, Immediate, ImmutableId, InstId, InstKind, Instruction, MemoryObjectKind,
+        MemoryObjectLayout, MirType, Module, SliceLocation, StorageAlias, Value, ValueId,
+        utils as mir_utils,
+    },
+    pass::{MirPass, run_function_pass},
 };
 use alloy_primitives::U256;
-use solar_data_structures::map::{FxHashMap, FxHashSet};
-use std::cmp::Ordering;
-
-/// Common Subexpression Elimination pass.
-#[derive(Debug, Default)]
-pub struct CommonSubexprEliminator {
-    /// Number of instructions eliminated.
-    pub eliminated_count: usize,
-}
+use solar_data_structures::{
+    bit_set::{DenseBitSet, GrowableBitSet},
+    map::FxHashMap,
+};
+use std::{cmp::Ordering, rc::Rc, sync::Arc};
 
 /// Function pass for local common subexpression elimination.
-pub struct CsePass;
+pub(crate) struct Cse;
 
-impl FunctionPass for CsePass {
-    fn name(&self) -> &str {
+impl MirPass for Cse {
+    fn name(&self) -> &'static str {
         "cse"
     }
 
-    fn run_on_function(&mut self, func: &mut Function) -> bool {
-        CommonSubexprEliminator::new().run_to_fixpoint(func) != 0
+    fn run_pass(
+        &self,
+        _gcx: solar_sema::Gcx<'_>,
+        module: &mut Module,
+        analyses: &mut crate::pass::ModuleAnalyses,
+    ) -> bool {
+        analyses.set_call_summaries(Arc::new(MemoryCallSummaries::new(module)));
+        let changed = run_function_pass(module, analyses, |func, analyses| {
+            let mut eliminator = match &analyses.call_summaries {
+                Some(summaries) => {
+                    CommonSubexprEliminator::with_call_summaries(Arc::clone(summaries))
+                }
+                None => CommonSubexprEliminator::default(),
+            };
+            eliminator.cfg = Some(Rc::clone(&analyses.cfg));
+            eliminator.run_to_fixpoint(func) != 0
+        });
+        analyses.clear_call_summaries();
+        changed
     }
+}
+
+/// Common Subexpression Elimination pass.
+#[derive(Debug, Default)]
+struct CommonSubexprEliminator {
+    /// Shared CFG snapshot; CSE only removes instructions, so one snapshot
+    /// serves every fixpoint iteration.
+    cfg: Option<Rc<CfgInfo>>,
+    /// Number of instructions eliminated.
+    eliminated_count: usize,
+    alias: Option<AliasAnalysis>,
+    call_summaries: Option<Arc<MemoryCallSummaries>>,
 }
 
 /// A normalized expression key for CSE lookup.
@@ -96,10 +125,20 @@ enum ExprKey {
     Eq(OperandKey, OperandKey),
     IsZero(OperandKey),
     Not(OperandKey),
+    Clz(OperandKey),
     SignExtend(OperandKey, OperandKey),
     Select(OperandKey, OperandKey, OperandKey),
     MLoad(MemRangeKey),
     Keccak256(MemRangeKey),
+    MappingSlot(OperandKey, OperandKey),
+    MappingSlotMemory(OperandKey, OperandKey),
+    MappingSlotCalldata(OperandKey, OperandKey),
+    MakeSlice(OperandKey, OperandKey, SliceLocation),
+    SlicePtr(OperandKey),
+    SliceLen(OperandKey),
+    MemoryObjectData(OperandKey, MemoryObjectKind),
+    MemoryObjectFieldAddr(OperandKey, MemoryObjectLayout, u64),
+    MemoryObjectElementAddr(OperandKey, MemoryObjectLayout, OperandKey),
     SLoad(StorageAlias),
     TLoad(StorageAlias),
     CalldataLoad(OperandKey),
@@ -109,7 +148,7 @@ enum ExprKey {
     Balance(OperandKey),
     SelfBalance,
     BlobHash(OperandKey),
-    LoadImmutable(u32),
+    LoadImmutable(ImmutableId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -118,45 +157,95 @@ enum OperandKey {
     Immediate(Immediate),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct MemRangeKey {
-    region: MemoryRegion,
-    base: Option<ValueId>,
-    offset: Option<u64>,
-    size: Option<u64>,
-    /// The canonical size operand when `size` is not a known constant.
-    ///
-    /// Participates only in key equality so that reads with different dynamic sizes never
-    /// unify while reads with the same dynamic size operand still do. Aliasing checks ignore
-    /// it: `memory_ranges_may_alias` stays conservative whenever `size` is `None`, so write
-    /// keys can always leave it unset.
-    dyn_size: Option<ValueId>,
-}
+type MemRangeKey = MemoryLocation;
 
 struct GlobalCseContext<'a> {
     dom_tree: &'a DominatorTree,
-    inst_results: &'a FxHashMap<InstId, ValueId>,
     block_clobbers: &'a FxHashMap<BlockId, Vec<Clobber>>,
-    reachability: &'a FxHashMap<BlockId, FxHashSet<BlockId>>,
+    reachability: &'a FxHashMap<BlockId, DenseBitSet<BlockId>>,
     replacements: &'a mut FxHashMap<ValueId, ValueId>,
-    dead: &'a mut FxHashSet<InstId>,
+    dead: &'a mut DenseBitSet<InstId>,
+}
+
+/// The CSE expression cache, split by whether a side effect can invalidate an
+/// entry.
+///
+/// Every clobber has to drop the state-dependent entries, and it used to do so
+/// by retaining over the whole map. Pure arithmetic dominates the cache on large
+/// functions, so that walked thousands of entries no side effect can touch, once
+/// per side-effecting instruction — quadratic in block size. Keeping the two
+/// kinds apart makes an invalidation cost proportional to the state-dependent
+/// entries alone, which are themselves the ones clobbers keep removing.
+#[derive(Clone, Debug, Default)]
+struct ExprCache {
+    /// Entries no side effect can invalidate: pure arithmetic and constants.
+    pure: FxHashMap<ExprKey, ValueId>,
+    /// Entries a memory, storage, transient-storage, or account-environment
+    /// write may invalidate, per
+    /// [`CommonSubexprEliminator::is_path_sensitive_expr`].
+    stateful: FxHashMap<ExprKey, ValueId>,
+}
+
+impl ExprCache {
+    fn get(&self, key: &ExprKey) -> Option<&ValueId> {
+        if CommonSubexprEliminator::is_path_sensitive_expr(key) {
+            self.stateful.get(key)
+        } else {
+            self.pure.get(key)
+        }
+    }
+
+    fn insert(&mut self, key: ExprKey, value: ValueId) {
+        if CommonSubexprEliminator::is_path_sensitive_expr(&key) {
+            self.stateful.insert(key, value);
+        } else {
+            self.pure.insert(key, value);
+        }
+    }
+
+    /// Whether any entry is state-dependent. Clobbers are no-ops otherwise.
+    fn has_stateful(&self) -> bool {
+        !self.stateful.is_empty()
+    }
+
+    /// Retains the state-dependent entries matching `keep`. The pure entries are
+    /// untouched, which is why no clobber has to walk them.
+    fn retain_stateful(&mut self, keep: impl FnMut(&ExprKey, &mut ValueId) -> bool) {
+        self.stateful.retain(keep);
+    }
 }
 
 /// A single cache-invalidating effect of a side-effecting instruction.
 #[derive(Clone, Copy, Debug)]
 enum Clobber {
-    /// A memory write; `None` clobbers all of memory.
-    Memory(Option<MemRangeKey>),
-    /// A storage write to a possibly-aliasing slot.
-    Storage(StorageAlias),
-    /// An effect that may mutate any storage slot (e.g. a re-entering call).
-    AllStorage,
-    /// A transient-storage write to a possibly-aliasing slot.
-    Transient(StorageAlias),
-    /// An effect that may mutate any transient-storage slot.
-    AllTransient,
+    /// A memory write.
+    Memory(ClobberScope<MemRangeKey>),
+    /// A persistent-storage write.
+    Storage(ClobberScope<StorageAlias>),
+    /// A transient-storage write.
+    Transient(ClobberScope<StorageAlias>),
+    /// An immutable assignment.
+    Immutable(ClobberScope<ImmutableId>),
     /// An effect that may change account balances or deployed code.
     AccountEnvironment,
+}
+
+/// The scope of a cache-invalidating effect.
+#[derive(Clone, Copy, Debug)]
+enum ClobberScope<T> {
+    /// One possibly-aliasing target.
+    Specific(T),
+    /// Every target in the address space.
+    All,
+}
+
+impl<T: Copy> ClobberScope<T> {
+    fn preserves(self, cached: T, may_alias: impl FnOnce(T, T) -> bool) -> bool {
+        match self {
+            Self::Specific(write) => !may_alias(cached, write),
+            Self::All => false,
+        }
+    }
 }
 
 struct PhiExpressionCandidate {
@@ -171,41 +260,54 @@ struct PhiExpressionCandidate {
 struct PhiSinkContext<'a> {
     dominators: &'a DominatorTree,
     inst_blocks: &'a FxHashMap<InstId, BlockId>,
-    inst_results: &'a FxHashMap<InstId, ValueId>,
     replacements: &'a FxHashMap<ValueId, ValueId>,
 }
 
 impl CommonSubexprEliminator {
-    /// Creates a new CSE pass.
-    pub fn new() -> Self {
-        Self::default()
+    fn with_call_summaries(summaries: Arc<MemoryCallSummaries>) -> Self {
+        Self { call_summaries: Some(summaries), ..Self::default() }
     }
 
-    /// Runs CSE on a function.
-    /// Returns the number of expressions eliminated.
-    pub fn run(&mut self, func: &mut Function) -> usize {
+    fn refresh_alias(&mut self, func: &Function) {
+        self.alias = Some(match &self.call_summaries {
+            Some(summaries) => AliasAnalysis::with_call_summaries(func, Arc::clone(summaries)),
+            None => AliasAnalysis::new(func),
+        });
+    }
+
+    fn alias(&self) -> &AliasAnalysis {
+        self.alias.as_ref().expect("CSE alias snapshot is initialized")
+    }
+
+    fn run_with_cfg(&mut self, func: &mut Function, cfg: &CfgInfo) -> usize {
         self.eliminated_count = 0;
 
-        self.sink_redundant_phi_expressions(func);
+        // One provenance snapshot per run: eliminating expressions only removes
+        // instructions, which keeps the allocation facts conservative. Only the
+        // value-address memo can go stale, so it is dropped between phases and
+        // blocks instead of recomputing the whole analysis each time.
+        self.refresh_alias(func);
+        self.sink_redundant_phi_expressions(func, cfg);
 
-        // Neither the global nor the local pass allocates values, so the map stays valid.
-        let inst_results = func.inst_results();
-        self.process_global_pure(func, &inst_results);
+        self.alias().clear_cached_addresses();
+        self.process_global_pure(func, cfg);
 
         // Process each block independently (local CSE)
         let block_ids: Vec<BlockId> = func.blocks.indices().collect();
         for block_id in block_ids {
-            self.process_block(func, block_id, &inst_results);
+            self.alias().clear_cached_addresses();
+            self.process_block(func, block_id);
         }
 
         self.eliminated_count
     }
 
     /// Runs CSE iteratively until no more changes.
-    pub fn run_to_fixpoint(&mut self, func: &mut Function) -> usize {
+    fn run_to_fixpoint(&mut self, func: &mut Function) -> usize {
         let mut total = 0;
+        let cfg = self.cfg.as_ref().map_or_else(|| Rc::new(CfgInfo::new(func)), Rc::clone);
         loop {
-            let eliminated = self.run(func);
+            let eliminated = self.run_with_cfg(func, &cfg);
             if eliminated == 0 {
                 break;
             }
@@ -214,52 +316,50 @@ impl CommonSubexprEliminator {
         total
     }
 
-    fn process_global_pure(
-        &mut self,
-        func: &mut Function,
-        inst_results: &FxHashMap<InstId, ValueId>,
-    ) {
-        let mut cfg = CfgInfo::new(func);
-        let block_clobbers = self.block_clobber_summaries(func);
-        let reachability = if block_clobbers.is_empty() {
-            FxHashMap::default()
+    fn process_global_pure(&mut self, func: &mut Function, cfg: &CfgInfo) {
+        let has_path_sensitive_expr = func
+            .instructions()
+            .any(|inst_id| Self::is_path_sensitive_kind(&func.inst(inst_id).kind));
+        let block_clobbers = if has_path_sensitive_expr {
+            self.block_clobber_summaries(func)
         } else {
-            cfg.transitive_reachability().clone()
+            FxHashMap::default()
+        };
+        let empty_reachability = FxHashMap::default();
+        let (dom_tree, reachability) = if block_clobbers.is_empty() {
+            (cfg.dominators(), &empty_reachability)
+        } else {
+            (cfg.dominators(), cfg.transitive_reachability())
         };
         let mut replacements = FxHashMap::default();
-        let mut dead = FxHashSet::default();
-        let mut cache = FxHashMap::default();
+        let mut dead = DenseBitSet::new_empty(func.num_insts());
         let mut ctx = GlobalCseContext {
-            dom_tree: cfg.dominators(),
-            inst_results,
+            dom_tree,
             block_clobbers: &block_clobbers,
-            reachability: &reachability,
+            reachability,
             replacements: &mut replacements,
             dead: &mut dead,
         };
 
-        self.process_global_block(func, func.entry_block, &mut cache, &mut ctx);
+        self.process_global_blocks(func, &mut ctx);
 
         if !replacements.is_empty() {
             self.apply_replacements_to_all_blocks(func, &replacements);
         }
         if !dead.is_empty() {
             for block in func.blocks.iter_mut() {
-                block.instructions.retain(|id| !dead.contains(id));
+                block.instructions.retain(|&id| !dead.contains(id));
             }
         }
     }
 
-    fn sink_redundant_phi_expressions(&mut self, func: &mut Function) {
-        let cfg = CfgInfo::new(func);
-        let inst_results = func.inst_results();
+    fn sink_redundant_phi_expressions(&mut self, func: &mut Function, cfg: &CfgInfo) {
         let inst_blocks = func.inst_blocks();
         let use_counts = Self::value_use_counts(func);
         let replacements = FxHashMap::default();
         let ctx = PhiSinkContext {
             dominators: cfg.dominators(),
             inst_blocks: &inst_blocks,
-            inst_results: &inst_results,
             replacements: &replacements,
         };
         let mut candidates = Vec::new();
@@ -269,7 +369,7 @@ impl CommonSubexprEliminator {
                 .instructions
                 .iter()
                 .copied()
-                .take_while(|&inst_id| matches!(func.instructions[inst_id].kind, InstKind::Phi(_)))
+                .take_while(|&inst_id| matches!(func.inst(inst_id).kind, InstKind::Phi(_)))
                 .collect();
             for phi_inst in phi_insts {
                 if let Some(candidate) =
@@ -284,19 +384,18 @@ impl CommonSubexprEliminator {
             return;
         }
 
-        let mut dead = FxHashSet::default();
+        let mut dead = GrowableBitSet::with_capacity(func.num_insts());
         let mut replacements = FxHashMap::default();
         let mut inserted_by_block: FxHashMap<BlockId, usize> = FxHashMap::default();
 
         for candidate in candidates {
-            let new_inst =
-                func.alloc_inst(Instruction::new(candidate.kind, Some(candidate.result_ty)));
-            let new_value = func.alloc_value(Value::Inst(new_inst));
+            let (new_inst, new_value) =
+                func.alloc_value_inst(Instruction::new(candidate.kind, Some(candidate.result_ty)));
 
             let phi_count = func.blocks[candidate.block_id]
                 .instructions
                 .iter()
-                .take_while(|&&inst_id| matches!(func.instructions[inst_id].kind, InstKind::Phi(_)))
+                .take_while(|&&inst_id| matches!(func.inst(inst_id).kind, InstKind::Phi(_)))
                 .count();
             let inserted = inserted_by_block.entry(candidate.block_id).or_default();
             func.blocks[candidate.block_id].instructions.insert(phi_count + *inserted, new_inst);
@@ -314,7 +413,7 @@ impl CommonSubexprEliminator {
 
         self.apply_replacements_to_all_blocks(func, &replacements);
         for block in func.blocks.iter_mut() {
-            block.instructions.retain(|id| !dead.contains(id));
+            block.instructions.retain(|&id| !dead.contains(id));
         }
     }
 
@@ -325,9 +424,9 @@ impl CommonSubexprEliminator {
         phi_inst: InstId,
         ctx: &PhiSinkContext<'_>,
     ) -> Option<PhiExpressionCandidate> {
-        let inst = &func.instructions[phi_inst];
+        let inst = func.inst(phi_inst);
         let result_ty = inst.result_ty?;
-        let phi_result = *ctx.inst_results.get(&phi_inst)?;
+        let phi_result = func.inst_result_value(phi_inst)?;
         let InstKind::Phi(incoming) = &inst.kind else { return None };
         if incoming.len() < 2 {
             return None;
@@ -339,7 +438,7 @@ impl CommonSubexprEliminator {
 
         for &(_, value) in incoming {
             let Value::Inst(inst_id) = func.value(value) else { return None };
-            let source_inst = &func.instructions[*inst_id];
+            let source_inst = func.inst(*inst_id);
             if source_inst.kind.has_side_effects()
                 || !Self::operands_dominate_block(
                     func,
@@ -374,41 +473,50 @@ impl CommonSubexprEliminator {
         })
     }
 
-    fn process_global_block(
-        &mut self,
-        func: &Function,
-        block_id: BlockId,
-        cache: &mut FxHashMap<ExprKey, ValueId>,
-        ctx: &mut GlobalCseContext<'_>,
-    ) {
-        let inst_ids = func.blocks[block_id].instructions.clone();
-        for inst_id in inst_ids {
-            let kind = func.instructions[inst_id].kind.clone();
-            if kind.has_side_effects() {
-                self.invalidate_for_side_effect(func, inst_id, &kind, ctx.replacements, cache);
-                continue;
+    fn process_global_blocks(&mut self, func: &Function, ctx: &mut GlobalCseContext<'_>) {
+        let mut worklist = vec![(BlockId::ENTRY, ExprCache::default())];
+        while let Some((block_id, mut cache)) = worklist.pop() {
+            for &inst_id in &func.blocks[block_id].instructions {
+                let kind = func.inst(inst_id).kind.clone();
+                if kind.has_side_effects() {
+                    self.invalidate_for_side_effect(
+                        func,
+                        inst_id,
+                        &kind,
+                        ctx.replacements,
+                        &mut cache,
+                    );
+                    continue;
+                }
+
+                let Some(key) = self.make_expr_key(func, inst_id, &kind, ctx.replacements) else {
+                    continue;
+                };
+
+                let Some(result) = func.inst_result_value(inst_id) else {
+                    continue;
+                };
+                if let Some(cached) = cache.get(&key) {
+                    ctx.replacements.insert(result, *cached);
+                    ctx.dead.insert(inst_id);
+                    self.eliminated_count += 1;
+                } else {
+                    cache.insert(key, result);
+                }
             }
 
-            let Some(key) = self.make_expr_key(func, inst_id, &kind, ctx.replacements) else {
+            let Some((&first_child, remaining_children)) =
+                ctx.dom_tree.children(block_id).split_first()
+            else {
                 continue;
             };
-
-            let Some(&result) = ctx.inst_results.get(&inst_id) else {
-                continue;
-            };
-            if let Some(cached) = cache.get(&key) {
-                ctx.replacements.insert(result, *cached);
-                ctx.dead.insert(inst_id);
-                self.eliminated_count += 1;
-            } else {
-                cache.insert(key, result);
+            for &child in remaining_children.iter().rev() {
+                let mut child_cache = cache.clone();
+                self.filter_inherited_cache(block_id, child, &mut child_cache, ctx);
+                worklist.push((child, child_cache));
             }
-        }
-
-        for &child in ctx.dom_tree.children(block_id) {
-            let mut child_cache = cache.clone();
-            self.filter_inherited_cache(block_id, child, &mut child_cache, ctx);
-            self.process_global_block(func, child, &mut child_cache, ctx);
+            self.filter_inherited_cache(block_id, first_child, &mut cache, ctx);
+            worklist.push((first_child, cache));
         }
     }
 
@@ -424,19 +532,19 @@ impl CommonSubexprEliminator {
         &self,
         parent: BlockId,
         child: BlockId,
-        cache: &mut FxHashMap<ExprKey, ValueId>,
+        cache: &mut ExprCache,
         ctx: &GlobalCseContext<'_>,
     ) {
-        if ctx.block_clobbers.is_empty() || !cache.keys().any(Self::is_path_sensitive_expr) {
+        if ctx.block_clobbers.is_empty() || !cache.has_stateful() {
             return;
         }
         let Some(reachable_from_parent) = ctx.reachability.get(&parent) else { return };
         for (&mid, clobbers) in ctx.block_clobbers {
             // Clobbers in `parent` itself were already applied while processing it sequentially.
-            if mid == parent || !reachable_from_parent.contains(&mid) {
+            if mid == parent || !reachable_from_parent.contains(mid) {
                 continue;
             }
-            if !ctx.reachability.get(&mid).is_some_and(|reachable| reachable.contains(&child)) {
+            if !ctx.reachability.get(&mid).is_some_and(|reachable| reachable.contains(child)) {
                 continue;
             }
             for clobber in clobbers {
@@ -452,7 +560,7 @@ impl CommonSubexprEliminator {
         for (block_id, block) in func.blocks.iter_enumerated() {
             let mut clobbers = Vec::new();
             for &inst_id in &block.instructions {
-                let kind = &func.instructions[inst_id].kind;
+                let kind = &func.inst(inst_id).kind;
                 if kind.has_side_effects() {
                     self.side_effect_clobbers(func, inst_id, kind, &no_replacements, &mut clobbers);
                 }
@@ -464,34 +572,48 @@ impl CommonSubexprEliminator {
         summaries
     }
 
+    /// Whether a side effect can ever invalidate `key`.
+    ///
+    /// This is exactly the union of what [`Self::apply_clobber`] removes, which
+    /// is what lets [`ExprCache`] keep the rest out of every invalidation scan.
     fn is_path_sensitive_expr(key: &ExprKey) -> bool {
         Self::is_memory_expr(key)
             || Self::is_account_environment_expr(key)
-            || matches!(key, ExprKey::SLoad(_) | ExprKey::TLoad(_))
+            || matches!(key, ExprKey::SLoad(_) | ExprKey::TLoad(_) | ExprKey::LoadImmutable(..))
+    }
+
+    fn is_path_sensitive_kind(kind: &InstKind) -> bool {
+        matches!(
+            kind,
+            InstKind::MLoad(_)
+                | InstKind::Keccak256(_, _)
+                | InstKind::Keccak256Bytes(_)
+                | InstKind::MappingSlotMemory(_, _)
+                | InstKind::SLoad(_)
+                | InstKind::TLoad(_)
+                | InstKind::ExtCodeSize(_)
+                | InstKind::ExtCodeHash(_)
+                | InstKind::Balance(_)
+                | InstKind::SelfBalance
+                | InstKind::LoadImmutable(_)
+        )
     }
 
     /// Processes a single basic block.
-    fn process_block(
-        &mut self,
-        func: &mut Function,
-        block_id: BlockId,
-        inst_results: &FxHashMap<InstId, ValueId>,
-    ) {
+    fn process_block(&mut self, func: &mut Function, block_id: BlockId) {
         // Map from expression key to the ValueId that computed it
-        let mut expr_cache: FxHashMap<ExprKey, ValueId> = FxHashMap::default();
+        let mut expr_cache = ExprCache::default();
 
         // Map from ValueId to its replacement ValueId
         let mut replacements: FxHashMap<ValueId, ValueId> = FxHashMap::default();
 
         // Instructions to remove
-        let mut to_remove: FxHashSet<InstId> = FxHashSet::default();
+        let mut to_remove = DenseBitSet::new_empty(func.num_insts());
 
-        // Get instruction list for this block
-        let block = func.block(block_id);
-        let inst_ids: Vec<InstId> = block.instructions.clone();
-
-        for inst_id in inst_ids {
-            let inst = &func.instructions[inst_id];
+        let instruction_count = func.blocks[block_id].instructions.len();
+        for index in 0..instruction_count {
+            let inst_id = func.blocks[block_id].instructions[index];
+            let inst = func.inst(inst_id);
             let kind = inst.kind.clone();
 
             if kind.has_side_effects() {
@@ -507,7 +629,7 @@ impl CommonSubexprEliminator {
 
             // Try to create an expression key
             if let Some(key) = self.make_expr_key(func, inst_id, &kind, &replacements)
-                && let Some(&result) = inst_results.get(&inst_id)
+                && let Some(result) = func.inst_result_value(inst_id)
             {
                 if let Some(&cached_value) = expr_cache.get(&key) {
                     // This expression was already computed - mark for elimination
@@ -528,7 +650,7 @@ impl CommonSubexprEliminator {
 
         // Remove eliminated instructions
         let block = func.block_mut(block_id);
-        block.instructions.retain(|id| !to_remove.contains(id));
+        block.instructions.retain(|&id| !to_remove.contains(id));
     }
 
     /// Creates a normalized expression key for an instruction.
@@ -612,6 +734,7 @@ impl CommonSubexprEliminator {
             // Unary operations
             InstKind::IsZero(a) => Some(ExprKey::IsZero(operand(*a))),
             InstKind::Not(a) => Some(ExprKey::Not(operand(*a))),
+            InstKind::Clz(a) => Some(ExprKey::Clz(operand(*a))),
             InstKind::CalldataLoad(a) => Some(ExprKey::CalldataLoad(operand(*a))),
             InstKind::ExtCodeSize(a) => Some(ExprKey::ExtCodeSize(operand(*a))),
             InstKind::ExtCodeHash(a) => Some(ExprKey::ExtCodeHash(operand(*a))),
@@ -619,7 +742,7 @@ impl CommonSubexprEliminator {
             InstKind::BlockHash(a) => Some(ExprKey::BlockHash(operand(*a))),
             InstKind::BlobHash(a) => Some(ExprKey::BlobHash(operand(*a))),
             // Immutable reads are constant once the runtime code is patched.
-            InstKind::LoadImmutable(offset) => Some(ExprKey::LoadImmutable(*offset)),
+            InstKind::LoadImmutable(id) => Some(ExprKey::LoadImmutable(*id)),
 
             InstKind::Select(condition, then_value, else_value) => Some(ExprKey::Select(
                 operand(*condition),
@@ -628,30 +751,65 @@ impl CommonSubexprEliminator {
             )),
 
             InstKind::MLoad(addr) => {
-                let key = self.memory_range_key(func, inst_id, value(*addr), Some(32))?;
+                let key =
+                    self.memory_range_key(func, inst_id, value(*addr), LocationSize::Const(32))?;
                 Some(ExprKey::MLoad(key))
             }
+            InstKind::Fmp => Some(ExprKey::MLoad(Self::fmp_range_key())),
             InstKind::Keccak256(offset, size) => {
                 let size = value(*size);
-                let const_size = func.value_u64(size);
-                let mut key = self.memory_range_key(func, inst_id, value(*offset), const_size)?;
-                if const_size.is_none() {
-                    // Key the dynamic size operand so reads of different lengths never unify.
-                    key.dyn_size = Some(size);
-                }
+                let size =
+                    func.value_u64(size).map_or(LocationSize::Dynamic(size), LocationSize::Const);
+                let key = self.memory_range_key(func, inst_id, value(*offset), size)?;
                 Some(ExprKey::Keccak256(key))
             }
+            // A whole-object hash reads the length word and the data, so its
+            // range is the object with an unknown extent: any overlapping
+            // write conservatively invalidates the cached hash.
+            InstKind::Keccak256Bytes(object) => {
+                let key =
+                    self.memory_range_key(func, inst_id, value(*object), LocationSize::Unknown)?;
+                Some(ExprKey::Keccak256(key))
+            }
+            InstKind::MappingSlot(key, slot) => {
+                Some(ExprKey::MappingSlot(operand(*key), operand(*slot)))
+            }
+            InstKind::MappingSlotMemory(key, slot) => {
+                Some(ExprKey::MappingSlotMemory(operand(*key), operand(*slot)))
+            }
+            InstKind::MappingSlotCalldata(key, slot) => {
+                Some(ExprKey::MappingSlotCalldata(operand(*key), operand(*slot)))
+            }
+            InstKind::MakeSlice { ptr, len, location } => {
+                Some(ExprKey::MakeSlice(operand(*ptr), operand(*len), *location))
+            }
+            InstKind::SlicePtr(slice) => Some(ExprKey::SlicePtr(operand(*slice))),
+            InstKind::SliceLen(slice) => Some(ExprKey::SliceLen(operand(*slice))),
+            InstKind::MemoryObjectLen(object, kind) => {
+                let key = self.alias().memory_object_length_location(
+                    func,
+                    inst_id,
+                    value(*object),
+                    *kind,
+                )?;
+                Some(ExprKey::MLoad(key))
+            }
+            InstKind::MemoryObjectData(object, kind) => {
+                Some(ExprKey::MemoryObjectData(operand(*object), *kind))
+            }
+            InstKind::MemoryObjectFieldAddr { object, layout, field } => {
+                Some(ExprKey::MemoryObjectFieldAddr(operand(*object), *layout, *field))
+            }
+            InstKind::MemoryObjectElementAddr { object, layout, index } => {
+                Some(ExprKey::MemoryObjectElementAddr(operand(*object), *layout, operand(*index)))
+            }
 
-            InstKind::SLoad(slot) => Some(ExprKey::SLoad(func.storage_alias_after_replacements(
-                inst_id,
-                *slot,
-                replacements,
-            ))),
-            InstKind::TLoad(slot) => Some(ExprKey::TLoad(func.storage_alias_after_replacements(
-                inst_id,
-                *slot,
-                replacements,
-            ))),
+            InstKind::SLoad(slot) => Some(ExprKey::SLoad(
+                self.alias().storage_alias_after_replacements(func, inst_id, *slot, replacements),
+            )),
+            InstKind::TLoad(slot) => Some(ExprKey::TLoad(
+                self.alias().storage_alias_after_replacements(func, inst_id, *slot, replacements),
+            )),
 
             InstKind::SelfBalance => Some(ExprKey::SelfBalance),
 
@@ -671,7 +829,7 @@ impl CommonSubexprEliminator {
         inst_id: InstId,
         kind: &InstKind,
         replacements: &FxHashMap<ValueId, ValueId>,
-        expr_cache: &mut FxHashMap<ExprKey, ValueId>,
+        expr_cache: &mut ExprCache,
     ) {
         let mut clobbers = Vec::new();
         self.side_effect_clobbers(func, inst_id, kind, replacements, &mut clobbers);
@@ -689,104 +847,88 @@ impl CommonSubexprEliminator {
         replacements: &FxHashMap<ValueId, ValueId>,
         clobbers: &mut Vec<Clobber>,
     ) {
-        match *kind {
-            InstKind::MStore(addr, _) => {
-                let addr = mir_utils::resolve_replacement(addr, replacements);
-                clobbers.push(Clobber::Memory(self.memory_range_key(
-                    func,
-                    inst_id,
-                    addr,
-                    Some(32),
-                )));
-            }
-            InstKind::MStore8(addr, _) => {
-                let addr = mir_utils::resolve_replacement(addr, replacements);
-                clobbers.push(Clobber::Memory(self.memory_range_key(func, inst_id, addr, Some(1))));
-            }
-            InstKind::MCopy(dest, _, size)
-            | InstKind::CalldataCopy(dest, _, size)
-            | InstKind::CodeCopy(dest, _, size)
-            | InstKind::ReturnDataCopy(dest, _, size)
-            | InstKind::ExtCodeCopy(_, dest, _, size) => {
-                let dest = mir_utils::resolve_replacement(dest, replacements);
-                let size = func.value_u64(mir_utils::resolve_replacement(size, replacements));
-                clobbers.push(Clobber::Memory(self.memory_range_key(func, inst_id, dest, size)));
-            }
-            InstKind::SStore(slot, _) => {
-                clobbers.push(Clobber::Storage(func.storage_alias_after_replacements(
-                    inst_id,
-                    slot,
-                    replacements,
-                )));
-            }
-            InstKind::TStore(slot, _) => {
-                clobbers.push(Clobber::Transient(func.storage_alias_after_replacements(
-                    inst_id,
-                    slot,
-                    replacements,
-                )));
-            }
-            _ if kind.may_mutate_memory() => {
-                clobbers.push(Clobber::Memory(None));
-                if Self::may_change_account_environment(kind) {
-                    clobbers.push(Clobber::AccountEnvironment);
+        let effects =
+            self.alias().instruction_mod_ref_with_replacements(func, inst_id, replacements);
+        for &write in effects.writes() {
+            clobbers.push(match write {
+                Access::Location(Location::Memory(location)) => {
+                    Clobber::Memory(ClobberScope::Specific(location))
                 }
-                if kind.may_mutate_storage() {
-                    clobbers.push(Clobber::AllStorage);
+                Access::Location(Location::Storage(alias)) => {
+                    Clobber::Storage(ClobberScope::Specific(alias))
                 }
-                if kind.may_mutate_transient_storage() {
-                    clobbers.push(Clobber::AllTransient);
+                Access::Location(Location::Transient(alias)) => {
+                    Clobber::Transient(ClobberScope::Specific(alias))
                 }
-            }
-            _ if kind.may_mutate_storage() => clobbers.push(Clobber::AllStorage),
-            _ if kind.may_mutate_transient_storage() => clobbers.push(Clobber::AllTransient),
-            _ => {}
+                Access::Location(Location::Immutable(id)) => {
+                    Clobber::Immutable(ClobberScope::Specific(id))
+                }
+                Access::Any(AddressSpace::Memory) => Clobber::Memory(ClobberScope::All),
+                Access::Any(AddressSpace::Storage) => Clobber::Storage(ClobberScope::All),
+                Access::Any(AddressSpace::Transient) => Clobber::Transient(ClobberScope::All),
+                Access::Any(AddressSpace::Immutable) => Clobber::Immutable(ClobberScope::All),
+            });
+        }
+        if Self::may_change_account_environment(kind) {
+            clobbers.push(Clobber::AccountEnvironment);
         }
     }
 
     /// Removes cache entries invalidated by a single clobbering effect.
-    fn apply_clobber(&self, expr_cache: &mut FxHashMap<ExprKey, ValueId>, clobber: &Clobber) {
+    fn apply_clobber(&self, expr_cache: &mut ExprCache, clobber: &Clobber) {
         match *clobber {
             Clobber::Memory(write) => self.invalidate_memory(expr_cache, write),
-            Clobber::Storage(alias) => {
-                expr_cache.retain(|key, _| match key {
-                    ExprKey::SLoad(cached) => !cached.may_alias(alias),
+            Clobber::Storage(write) => {
+                expr_cache.retain_stateful(|key, _| match key {
+                    ExprKey::SLoad(cached) => write.preserves(*cached, |cached, assigned| {
+                        AliasAnalysis::alias_locations(
+                            Location::Storage(cached),
+                            Location::Storage(assigned),
+                        )
+                        .may_alias()
+                    }),
                     _ => true,
                 });
             }
-            Clobber::AllStorage => {
-                expr_cache.retain(|key, _| !matches!(key, ExprKey::SLoad(_)));
-            }
-            Clobber::Transient(alias) => {
-                expr_cache.retain(|key, _| match key {
-                    ExprKey::TLoad(cached) => !cached.may_alias(alias),
+            Clobber::Transient(write) => {
+                expr_cache.retain_stateful(|key, _| match key {
+                    ExprKey::TLoad(cached) => write.preserves(*cached, |cached, assigned| {
+                        AliasAnalysis::alias_locations(
+                            Location::Transient(cached),
+                            Location::Transient(assigned),
+                        )
+                        .may_alias()
+                    }),
                     _ => true,
                 });
             }
-            Clobber::AllTransient => {
-                expr_cache.retain(|key, _| !matches!(key, ExprKey::TLoad(_)));
+            Clobber::Immutable(write) => {
+                expr_cache.retain_stateful(|key, _| match key {
+                    ExprKey::LoadImmutable(cached) => {
+                        write.preserves(*cached, |cached, assigned| cached == assigned)
+                    }
+                    _ => true,
+                });
             }
             Clobber::AccountEnvironment => {
-                expr_cache.retain(|key, _| !Self::is_account_environment_expr(key));
+                expr_cache.retain_stateful(|key, _| !Self::is_account_environment_expr(key));
             }
         }
     }
 
-    fn invalidate_memory(
-        &self,
-        expr_cache: &mut FxHashMap<ExprKey, ValueId>,
-        write: Option<MemRangeKey>,
-    ) {
-        expr_cache.retain(|key, _| match key {
-            ExprKey::MLoad(read) | ExprKey::Keccak256(read) => {
-                write.is_some_and(|write| !Self::memory_ranges_may_alias(*read, write))
-            }
+    fn invalidate_memory(&self, expr_cache: &mut ExprCache, write: ClobberScope<MemRangeKey>) {
+        expr_cache.retain_stateful(|key, _| match key {
+            ExprKey::MLoad(read) | ExprKey::Keccak256(read) => write
+                .preserves(*read, |read, write| {
+                    AliasAnalysis::memory_alias_locations(read, write).may_alias()
+                }),
+            ExprKey::MappingSlotMemory(..) => false,
             _ => true,
         });
     }
 
     fn is_memory_expr(key: &ExprKey) -> bool {
-        matches!(key, ExprKey::MLoad(_) | ExprKey::Keccak256(_))
+        matches!(key, ExprKey::MLoad(_) | ExprKey::Keccak256(_) | ExprKey::MappingSlotMemory(..))
     }
 
     fn is_account_environment_expr(key: &ExprKey) -> bool {
@@ -801,11 +943,12 @@ impl CommonSubexprEliminator {
 
     /// STATICCALL is excluded: the whole static context forbids value transfers, `SSTORE`,
     /// `CREATE`, and `SELFDESTRUCT`, so balances and deployed code cannot change. Its memory
-    /// clobber (the return buffer write) is handled separately via `may_mutate_memory`.
+    /// clobber (the return buffer write) is represented precisely by ModRef analysis.
     fn may_change_account_environment(kind: &InstKind) -> bool {
         matches!(
             kind,
             InstKind::Call { .. }
+                | InstKind::CallCode { .. }
                 | InstKind::DelegateCall { .. }
                 | InstKind::InternalCall { .. }
                 | InstKind::Create(_, _, _)
@@ -818,6 +961,9 @@ impl CommonSubexprEliminator {
             key,
             ExprKey::MLoad(_)
                 | ExprKey::Keccak256(_)
+                | ExprKey::MappingSlot(..)
+                | ExprKey::MappingSlotMemory(..)
+                | ExprKey::MappingSlotCalldata(..)
                 | ExprKey::SLoad(_)
                 | ExprKey::TLoad(_)
                 | ExprKey::CalldataLoad(_)
@@ -827,6 +973,7 @@ impl CommonSubexprEliminator {
                 | ExprKey::Balance(_)
                 | ExprKey::SelfBalance
                 | ExprKey::BlobHash(_)
+                | ExprKey::LoadImmutable(_)
         )
     }
 
@@ -850,7 +997,7 @@ impl CommonSubexprEliminator {
         dominators: &DominatorTree,
     ) -> bool {
         match func.value(value) {
-            Value::Immediate(_) | Value::Arg { .. } | Value::Undef(_) | Value::Error(_) => true,
+            Value::Immediate(_) | Value::Arg(_) | Value::Undef(_) | Value::Error(_) => true,
             Value::Inst(inst_id) => inst_blocks
                 .get(inst_id)
                 .is_some_and(|&def_block| dominators.dominates(def_block, block_id)),
@@ -862,48 +1009,13 @@ impl CommonSubexprEliminator {
         func: &Function,
         inst_id: InstId,
         addr: ValueId,
-        size: Option<u64>,
+        size: LocationSize,
     ) -> Option<MemRangeKey> {
-        let region = func.instructions[inst_id]
-            .metadata
-            .memory_region()
-            .unwrap_or_else(|| func.memory_region_for_addr(addr));
-        let (base, offset) = Self::memory_addr_base_offset(func, addr);
-        Some(MemRangeKey { region, base, offset, size, dyn_size: None })
+        self.alias().memory_location(func, inst_id, addr, size)
     }
 
-    fn memory_addr_base_offset(func: &Function, addr: ValueId) -> (Option<ValueId>, Option<u64>) {
-        if let Some((base, offset)) = Self::offset_value(func, addr, &FxHashMap::default(), 0) {
-            if let (OperandKey::Value(base), Some(offset)) = (base, mir_utils::u256_to_u64(offset))
-            {
-                return (Some(base), Some(offset));
-            }
-            return (Some(addr), Some(0));
-        }
-        match func.value(addr) {
-            Value::Immediate(imm) => (None, imm.as_u256().and_then(mir_utils::u256_to_u64)),
-            Value::Arg { .. } | Value::Inst(_) | Value::Undef(_) | Value::Error(_) => {
-                (Some(addr), Some(0))
-            }
-        }
-    }
-
-    fn memory_ranges_may_alias(read: MemRangeKey, write: MemRangeKey) -> bool {
-        if read.region != MemoryRegion::Unknown
-            && write.region != MemoryRegion::Unknown
-            && read.region != write.region
-        {
-            return false;
-        }
-        if read.base != write.base {
-            return true;
-        }
-        let (Some(read_offset), Some(read_size), Some(write_offset), Some(write_size)) =
-            (read.offset, read.size, write.offset, write.size)
-        else {
-            return true;
-        };
-        mir_utils::ranges_overlap(read_offset, read_size, write_offset, write_size)
+    fn fmp_range_key() -> MemRangeKey {
+        AliasAnalysis::fmp_location()
     }
 
     fn offset_expr_for_add(
@@ -947,10 +1059,10 @@ impl CommonSubexprEliminator {
         let value = mir_utils::resolve_replacement(value, replacements);
         match func.value(value) {
             Value::Immediate(_) => None,
-            Value::Arg { .. } | Value::Undef(_) | Value::Error(_) => {
+            Value::Arg(_) | Value::Undef(_) | Value::Error(_) => {
                 Some((OperandKey::Value(value), U256::ZERO))
             }
-            Value::Inst(inst_id) => match func.instructions[*inst_id].kind {
+            Value::Inst(inst_id) => match func.inst(*inst_id).kind {
                 InstKind::Add(a, b) => {
                     if let Some(offset) = func.value_u256_after_replacements(b, replacements) {
                         let (base, existing) =
@@ -1005,8 +1117,6 @@ impl CommonSubexprEliminator {
             Immediate::Bool(_) => 0,
             Immediate::UInt(_, _) => 1,
             Immediate::Int(_, _) => 2,
-            Immediate::Address(_) => 3,
-            Immediate::FixedBytes(_, _) => 4,
         };
         rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
             (Immediate::Bool(a), Immediate::Bool(b)) => a.cmp(b),
@@ -1014,19 +1124,15 @@ impl CommonSubexprEliminator {
             | (Immediate::Int(a_value, a_bits), Immediate::Int(b_value, b_bits)) => {
                 a_bits.cmp(b_bits).then_with(|| a_value.cmp(b_value))
             }
-            (Immediate::Address(a), Immediate::Address(b)) => a.cmp(b),
-            (Immediate::FixedBytes(a_value, a_len), Immediate::FixedBytes(b_value, b_len)) => {
-                a_len.cmp(b_len).then_with(|| a_value.cmp(b_value))
-            }
             _ => Ordering::Equal,
         })
     }
 
     fn value_use_counts(func: &Function) -> FxHashMap<ValueId, usize> {
         let mut counts = FxHashMap::default();
-        for inst in func.instructions.iter() {
-            for value in inst.operands() {
-                *counts.entry(value).or_insert(0) += 1;
+        for inst_id in func.instructions() {
+            for value in func.inst(inst_id).operands() {
+                *counts.entry(value).or_default() += 1;
             }
         }
         for block in func.blocks.iter() {
@@ -1044,7 +1150,7 @@ impl CommonSubexprEliminator {
         use crate::mir::Terminator;
 
         let mut count = |value| {
-            *counts.entry(value).or_insert(0) += 1;
+            *counts.entry(value).or_default() += 1;
         };
 
         match term {
@@ -1066,6 +1172,11 @@ impl CommonSubexprEliminator {
                 count(*size);
             }
             Terminator::SelfDestruct { recipient } => count(*recipient),
+            Terminator::TailCall { args, .. } => {
+                for &arg in args {
+                    count(arg);
+                }
+            }
         }
     }
 
@@ -1087,11 +1198,10 @@ impl CommonSubexprEliminator {
         block_id: BlockId,
         replacements: &FxHashMap<ValueId, ValueId>,
     ) {
-        let block = func.block(block_id);
-        let inst_ids: Vec<InstId> = block.instructions.clone();
-
-        for inst_id in inst_ids {
-            let inst = &mut func.instructions[inst_id];
+        let instruction_count = func.blocks[block_id].instructions.len();
+        for index in 0..instruction_count {
+            let inst_id = func.blocks[block_id].instructions[index];
+            let inst = func.inst_mut(inst_id);
             if mir_utils::replace_inst_uses_canonicalized(&mut inst.kind, replacements) != 0 {
                 if mir_utils::is_memory_inst(&inst.kind) {
                     inst.metadata.set_memory_region(None);

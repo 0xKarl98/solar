@@ -5,53 +5,75 @@
 use solar_data_structures::newtype_index;
 
 mod types;
-pub use types::MirType;
+pub(crate) use types::{
+    ImmutableEncoding, MemoryObjectKind, MemoryObjectLayout, MirType, SliceLocation, TypeSize,
+};
+
+mod abi;
+pub(crate) use abi::{AbiLayout, AbiLayoutRef, AbiType};
+
+mod storage;
+pub use storage::{StorageField, StorageLayout, StorageLayoutRef};
 
 mod value;
-pub use value::{Immediate, Value};
+pub(crate) use value::{Immediate, Value};
 
 mod inst;
-pub use inst::{
-    EffectKind, InstKind, Instruction, InstructionMetadata, MemoryRegion, StorageAlias,
+pub(crate) use inst::{
+    AllocationAlignment, AllocationFailure, AllocationInitialization, AllocationKind,
+    AllocationSemantics, EffectKind, InstKind, Instruction, InstructionMetadata, MemoryRegion,
+    StorageAlias,
 };
 
 mod block;
-pub use block::{BasicBlock, Terminator};
+pub(crate) use block::{BasicBlock, Terminator};
+
+mod mangling;
+pub(crate) use mangling::{Disambiguator, MangledSymbol};
 
 mod function;
-pub use function::{Function, FunctionAttributes};
+pub(crate) use function::{Function, FunctionAttributes};
 
 mod module;
-pub use module::{DataSegment, IMMUTABLE_WORD_SIZE, ImmutableSlot, Module, StorageSlot};
+pub use module::{MirPhase, Module};
 
 mod builder;
-pub use builder::FunctionBuilder;
+pub(crate) use builder::FunctionBuilder;
 
 mod display;
 
 mod parser;
-pub use parser::{ParseError, parse_function, parse_module};
+
+/// Validates the invariants of a MIR module.
+pub fn validate(dcx: &solar_interface::diagnostics::DiagCtxt, module: &Module) {
+    crate::analysis::validate(dcx, module);
+}
 
 pub(crate) mod utils;
 
 newtype_index! {
+    /// A function argument index in the MIR.
+    pub(crate) struct ArgIdx;
+
     /// A unique identifier for a value in the MIR.
-    pub struct ValueId;
-}
+    pub(crate) struct ValueId;
 
-newtype_index! {
     /// A unique identifier for an instruction in the MIR.
-    pub struct InstId;
-}
+    pub(crate) struct InstId;
 
-newtype_index! {
     /// A unique identifier for a basic block in the MIR.
-    pub struct BlockId;
+    pub(crate) struct BlockId;
+
+    /// A unique identifier for a function in the MIR.
+    pub(crate) struct FunctionId;
+
+    /// A unique identifier for an immutable in the MIR module.
+    pub(crate) struct ImmutableId;
 }
 
-newtype_index! {
-    /// A unique identifier for a function in the MIR.
-    pub struct FunctionId;
+impl BlockId {
+    /// The first block in every function.
+    pub(crate) const ENTRY: Self = Self::new(0);
 }
 
 /// Property tests verifying that the MIR printer/parser pair is self-consistent.
@@ -70,14 +92,18 @@ newtype_index! {
 /// indices. A *second* round-trip must be stable.
 #[cfg(test)]
 mod round_trip {
-    use super::{Module, parse_module};
-    use crate::{analysis::validate_module, lower};
+    use super::Module;
+    use crate::lower;
     use solar_interface::{ColorChoice, Session};
     use solar_sema::Compiler;
     use std::{
         ops::ControlFlow,
         path::{Path, PathBuf},
     };
+
+    fn parse_module(sess: &Session, input: &str) -> solar_interface::Result<Module> {
+        super::parser::parse_module(sess, input)
+    }
 
     /// Path to `tests/ui/codegen/` (the workspace's UI test directory).
     fn ui_codegen_dir() -> PathBuf {
@@ -100,6 +126,23 @@ mod round_trip {
             .map(|(i, (la, lb))| (i + 1, la, lb))
     }
 
+    fn fixture_paths(root: &Path, extension: &str) -> Vec<PathBuf> {
+        let mut dirs = vec![root.to_path_buf()];
+        let mut paths = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().and_then(|s| s.to_str()) == Some(extension) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort_unstable();
+        paths
+    }
+
     #[test]
     fn round_trip_all_sol_files() {
         let dir = ui_codegen_dir();
@@ -107,11 +150,7 @@ mod round_trip {
 
         let mut failures: Vec<String> = Vec::new();
         let mut count = 0usize;
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|s| s.to_str()) != Some("sol") {
-                continue;
-            }
+        for path in fixture_paths(&dir, "sol") {
             count += 1;
             if let Err(e) = round_trip_sol(&path) {
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -134,11 +173,7 @@ mod round_trip {
         let dir = ui_codegen_dir();
         let mut failures: Vec<String> = Vec::new();
         let mut count = 0usize;
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|s| s.to_str()) != Some("sol") {
-                continue;
-            }
+        for path in fixture_paths(&dir, "sol") {
             count += 1;
             if let Err(e) = validate_sol(&path) {
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -179,13 +214,13 @@ mod round_trip {
                     continue;
                 }
                 let module = lower::lower_contract(gcx, id);
-                let errors = validate_module(&module);
-                if !errors.is_empty() {
+                let errors_before = gcx.dcx().err_count();
+                super::validate(gcx.dcx(), &module);
+                if gcx.dcx().err_count() != errors_before {
                     result = Err(format!(
-                        "contract `{}` has {} validation error(s):\n    {}",
+                        "contract `{}` has invalid MIR:\n{}",
                         contract.name,
-                        errors.len(),
-                        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n    ")
+                        gcx.dcx().emitted_diagnostics().unwrap()
                     ));
                     return Ok(());
                 }
@@ -202,13 +237,12 @@ mod round_trip {
 
         let mut failures: Vec<String> = Vec::new();
         let mut count = 0usize;
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|s| s.to_str()) != Some("mir") {
-                continue;
-            }
+        for path in fixture_paths(&dir, "mir") {
             count += 1;
             if let Err(e) = round_trip_mir(&path) {
+                if e.starts_with("first parse failed:") && path.with_extension("stderr").is_file() {
+                    continue;
+                }
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 failures.push(format!("{name}: {e}"));
             }
@@ -254,7 +288,7 @@ mod round_trip {
                     continue;
                 }
                 let module = lower::lower_contract(gcx, id);
-                if let Err(e) = check_round_trip_module(&module) {
+                if let Err(e) = check_round_trip_module(gcx.sess, &module) {
                     result = Err(format!("contract `{}`: {e}", contract.name));
                     return Ok(());
                 }
@@ -266,7 +300,6 @@ mod round_trip {
 
     /// Round-trips one `.mir` file. Skips the lowering step.
     fn round_trip_mir(path: &Path) -> Result<(), String> {
-        // Tests don't need a SourceMap; reading a fixture as plain text is fine.
         #[allow(clippy::disallowed_methods)]
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         // Strip `//@compile-flags:` annotations the test harness reads — they're
@@ -278,18 +311,22 @@ mod round_trip {
         let sess = Session::builder().with_buffer_emitter(ColorChoice::Never).build();
         let mut result: Result<(), String> = Ok(());
         sess.enter(|| {
-            let parsed1 = match parse_module(&text) {
+            let parsed1 = match parse_module(&sess, &text) {
                 Ok(m) => m,
-                Err(e) => {
-                    result = Err(format!("first parse failed: {e}"));
+                Err(_) => {
+                    result =
+                        Err(format!("first parse failed: {}", sess.emitted_diagnostics().unwrap()));
                     return;
                 }
             };
             let print1 = parsed1.to_text().to_string();
-            let parsed2 = match parse_module(&print1) {
+            let parsed2 = match parse_module(&sess, &print1) {
                 Ok(m) => m,
-                Err(e) => {
-                    result = Err(format!("second parse failed: {e}"));
+                Err(_) => {
+                    result = Err(format!(
+                        "second parse failed: {}",
+                        sess.emitted_diagnostics().unwrap()
+                    ));
                     return;
                 }
             };
@@ -306,13 +343,20 @@ mod round_trip {
 
     /// Common idempotency check: print → parse → print → parse → print, last two
     /// must match. Caller must already be inside an active `Session::enter`.
-    fn check_round_trip_module(module: &Module) -> Result<(), String> {
+    fn check_round_trip_module(sess: &Session, module: &Module) -> Result<(), String> {
         let print1 = module.to_text().to_string();
-        let parsed1 = parse_module(&print1)
-            .map_err(|e| format!("first parse: {e}\n--- print1 ---\n{print1}"))?;
+        let parsed1 = parse_module(sess, &print1).map_err(|_| {
+            format!(
+                "first parse: {}\n--- print1 ---\n{print1}",
+                sess.emitted_diagnostics().unwrap()
+            )
+        })?;
         let print2 = parsed1.to_text().to_string();
-        let parsed2 = parse_module(&print2).map_err(|e| {
-            format!("second parse: {e}\n--- print1 ---\n{print1}\n--- print2 ---\n{print2}")
+        let parsed2 = parse_module(sess, &print2).map_err(|_| {
+            format!(
+                "second parse: {}\n--- print1 ---\n{print1}\n--- print2 ---\n{print2}",
+                sess.emitted_diagnostics().unwrap()
+            )
         })?;
         let print3 = parsed2.to_text().to_string();
 
