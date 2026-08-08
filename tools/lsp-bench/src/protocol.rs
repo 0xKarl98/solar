@@ -10,7 +10,15 @@ pub(crate) fn write_message(mut writer: impl Write, message: &Value) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn read_message(mut reader: impl BufRead) -> Result<Option<Value>> {
+    read_message_limited(&mut reader, usize::MAX)
+}
+
+pub(crate) fn read_message_limited(
+    mut reader: impl BufRead,
+    max_body_bytes: usize,
+) -> Result<Option<Value>> {
     let mut content_length = None;
     let mut line = String::new();
 
@@ -39,6 +47,9 @@ pub(crate) fn read_message(mut reader: impl BufRead) -> Result<Option<Value>> {
     let Some(content_length) = content_length else {
         bail!("LSP message is missing Content-Length")
     };
+    if content_length > max_body_bytes {
+        bail!("LSP message body is too large: {content_length} bytes (limit {max_body_bytes})")
+    }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body)?;
     serde_json::from_slice(&body).context("failed to decode LSP message").map(Some)

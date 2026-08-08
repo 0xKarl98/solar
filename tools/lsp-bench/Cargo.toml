@@ -2,6 +2,7 @@
 name = "solar-lsp-bench"
 description = "End-to-end Solar LSP performance harness"
 publish = false
+default-run = "solar-lsp-bench"
 
 version.workspace = true
 authors.workspace = true
@@ -18,10 +19,17 @@ workspace = true
 [dependencies]
 anyhow = "1.0"
 clap = { workspace = true, features = ["derive"] }
+libc = "0.2"
 lsp-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+serde_yaml = "0.9"
+sha2 = "0.10"
 tempfile.workspace = true
+thiserror.workspace = true
 
-[dev-dependencies]
-snapbox.workspace = true
+[[bin]]
+name = "solar-lsp-bench-fake"
+path = "tests/support/fake_server.rs"
+test = false
+bench = false

@@ -1,5 +1,10 @@
+//! Manifest-backed, process-isolated Solidity fixtures.
+
+use crate::config::{CompilerSpec, FixtureSpec, SourceSpec};
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use lsp_types::{Position, Url};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     ffi::OsStr,
     fs,
@@ -8,111 +13,326 @@ use std::{
 };
 use tempfile::TempDir;
 
-pub(crate) const SOLADY_REVISION: &str = "ab96a830e705de13e0f58cfaefadab4ac8257655";
-pub(crate) const SOLIDITY_FILE_COUNT: usize = 114;
-pub(crate) const SOLIDITY_LINE_COUNT: usize = 53_156;
-pub(crate) const SOLIDITY_BYTE_COUNT: usize = 2_317_649;
-pub(crate) const STARTUP_MARKER: &str = "solar_bench_startup";
-pub(crate) const CROSS_FILE_MARKER: &str = "solar_bench_cross_file";
-pub(crate) const FULL_MUL_DIV_CALL: &str =
-    "FixedPointMathLib.fullMulDiv(assets, supply, totalAssets())";
-pub(crate) const FULL_MUL_DIV_NAME: &str = "fullMulDiv";
-pub(crate) const FULL_MUL_DIV_DECLARATION: &str = "function fullMulDiv(";
+const IGNORED_DIRECTORIES: [&str; 7] =
+    [".git", "out", "cache", "broadcast", "node_modules", "target", ".vscode"];
 
-const ERC4626_PATH: &str = "src/tokens/ERC4626.sol";
-const FIXED_POINT_MATH_LIB_PATH: &str = "src/utils/FixedPointMathLib.sol";
-const REQUIRED_PATHS: [&str; 3] = ["foundry.toml", ERC4626_PATH, FIXED_POINT_MATH_LIB_PATH];
-const IGNORED_DIRECTORIES: [&str; 5] = [".git", "out", "cache", "broadcast", "node_modules"];
-
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct FixtureMetadata {
-    pub(crate) revision: String,
+    pub(crate) id: String,
+    pub(crate) root: PathBuf,
+    pub(crate) revision: Option<String>,
     pub(crate) source_file_count: usize,
     pub(crate) source_line_count: usize,
     pub(crate) source_byte_count: usize,
+    pub(crate) content_sha256: String,
+    pub(crate) corpus: Option<String>,
+    pub(crate) source: Option<SourceSpec>,
+    pub(crate) solc: Option<CompilerSpec>,
+    pub(crate) solc_native_sha256: Option<String>,
+    pub(crate) solc_soljson_sha256: Option<String>,
+    pub(crate) foundry: Option<CompilerSpec>,
+    pub(crate) foundry_native_sha256: Option<String>,
+    pub(crate) dependencies: std::collections::BTreeMap<String, String>,
 }
 
-pub(crate) struct Project {
+#[derive(Clone, Debug)]
+pub(crate) struct FixtureSource {
+    spec: FixtureSpec,
     root: PathBuf,
     metadata: FixtureMetadata,
 }
 
-impl Project {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
-        let root = path
-            .canonicalize()
-            .with_context(|| format!("project `{}` does not exist", path.display()))?;
-        validate_repository_state(&root, SOLADY_REVISION)?;
-        for relative in REQUIRED_PATHS {
-            if !root.join(relative).is_file() {
-                bail!("Solady checkout is missing `{relative}`")
-            }
+pub(crate) struct Fixture {
+    root: TempDir,
+    source: FixtureSource,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Anchor {
+    pub(crate) path: PathBuf,
+    pub(crate) position: Position,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PositionEncoding {
+    Utf8,
+    Utf16,
+    Utf32,
+}
+
+impl PositionEncoding {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "utf-8" => Ok(Self::Utf8),
+            "utf-16" => Ok(Self::Utf16),
+            "utf-32" => Ok(Self::Utf32),
+            _ => bail!("unsupported position encoding `{value}`"),
         }
-
-        let erc4626 = fs::read_to_string(root.join(ERC4626_PATH))?;
-        ensure_unique(&erc4626, FULL_MUL_DIV_CALL, ERC4626_PATH)?;
-        let fixed_point = fs::read_to_string(root.join(FIXED_POINT_MATH_LIB_PATH))?;
-        ensure_unique(&fixed_point, FULL_MUL_DIV_DECLARATION, FIXED_POINT_MATH_LIB_PATH)?;
-
-        let metadata = source_metadata(&root.join("src"))?;
-        if metadata.source_file_count != SOLIDITY_FILE_COUNT
-            || metadata.source_line_count != SOLIDITY_LINE_COUNT
-            || metadata.source_byte_count != SOLIDITY_BYTE_COUNT
-        {
-            bail!(
-                "unexpected Solady source shape: expected {SOLIDITY_FILE_COUNT} files, {SOLIDITY_LINE_COUNT} lines, and {SOLIDITY_BYTE_COUNT} bytes, found {} files, {} lines, and {} bytes",
-                metadata.source_file_count,
-                metadata.source_line_count,
-                metadata.source_byte_count,
-            )
-        }
-
-        Ok(Self { root, metadata })
     }
+}
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
+impl FixtureSource {
+    pub(crate) fn open(spec: &FixtureSpec) -> Result<Self> {
+        let root = spec
+            .root
+            .canonicalize()
+            .with_context(|| format!("fixture `{}` does not exist", spec.root.display()))?;
+        if !root.is_dir() {
+            bail!("fixture root `{}` is not a directory", root.display())
+        }
+        if let Some(expected) = &spec.revision {
+            validate_git_state(&root, expected)?;
+        }
+
+        let source_roots = spec.source_roots.iter().map(|path| root.join(path)).collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for source_root in &source_roots {
+            if !source_root.is_dir() {
+                bail!(
+                    "fixture `{}` source root `{}` is not a directory",
+                    spec.id,
+                    source_root.display()
+                )
+            }
+            collect_solidity_files(source_root, &mut paths)?;
+        }
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            bail!("fixture `{}` contains no Solidity sources", spec.id)
+        }
+
+        let mut lines = 0;
+        let mut bytes = 0;
+        for path in &paths {
+            let contents = fs::read(path)
+                .with_context(|| format!("failed to read fixture source `{}`", path.display()))?;
+            lines += contents.iter().filter(|byte| **byte == b'\n').count();
+            bytes += contents.len();
+        }
+
+        let revision = spec.revision.clone().or_else(|| git_revision(&root));
+        let content_sha256 = fixture_content_sha256(&root)?;
+        let metadata = FixtureMetadata {
+            id: spec.id.clone(),
+            root: root.clone(),
+            revision,
+            source_file_count: paths.len(),
+            source_line_count: lines,
+            source_byte_count: bytes,
+            content_sha256,
+            corpus: spec.corpus.clone(),
+            source: spec.source.clone(),
+            solc: spec.solc.clone(),
+            solc_native_sha256: compiler_file_sha256(
+                spec.solc.as_ref().and_then(|compiler| compiler.native.as_deref()),
+            ),
+            solc_soljson_sha256: compiler_file_sha256(
+                spec.solc.as_ref().and_then(|compiler| compiler.soljson.as_deref()),
+            ),
+            foundry: spec.foundry.clone(),
+            foundry_native_sha256: compiler_file_sha256(
+                spec.foundry.as_ref().and_then(|compiler| compiler.native.as_deref()),
+            ),
+            dependencies: spec.dependencies.clone(),
+        };
+        let source = Self { spec: spec.clone(), root, metadata };
+        source.validate_anchors()?;
+        Ok(source)
     }
 
     pub(crate) fn metadata(&self) -> &FixtureMetadata {
         &self.metadata
     }
-}
 
-pub(crate) struct Fixture {
-    root: TempDir,
+    pub(crate) fn materialize(&self) -> Result<Fixture> {
+        let destination = tempfile::tempdir()?;
+        copy_tree(&self.root, destination.path())?;
+        Ok(Fixture { root: destination, source: self.clone() })
+    }
+
+    fn validate_anchors(&self) -> Result<()> {
+        for (name, anchor) in &self.spec.anchors {
+            let path = self.relative_path(&anchor.path)?;
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read anchor file `{}`", path.display()))?;
+            let matches = text.match_indices(&anchor.needle).count();
+            if matches != 1 {
+                bail!(
+                    "fixture `{}` anchor `{name}` must match exactly once in `{}`; found {matches}",
+                    self.spec.id,
+                    anchor.path.display()
+                )
+            }
+            if anchor.offset > anchor.needle.len() {
+                bail!(
+                    "fixture `{}` anchor `{name}` offset {} exceeds needle length {}",
+                    self.spec.id,
+                    anchor.offset,
+                    anchor.needle.len()
+                )
+            }
+            let _ = position_at(&text, text.find(&anchor.needle).unwrap() + anchor.offset);
+        }
+        Ok(())
+    }
+
+    fn relative_path(&self, relative: &Path) -> Result<PathBuf> {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("fixture path `{}` must be relative and stay in its root", relative.display())
+        }
+        let path = self.root.join(relative);
+        if !path.starts_with(&self.root) {
+            bail!("fixture path `{}` escapes its root", relative.display())
+        }
+        Ok(path)
+    }
 }
 
 impl Fixture {
-    pub(crate) fn copy_from(project: &Project) -> Result<Self> {
-        let root = tempfile::tempdir()?;
-        copy_project(project.root(), root.path())?;
-        Ok(Self { root })
-    }
-
     pub(crate) fn root(&self) -> &Path {
         self.root.path()
     }
 
-    pub(crate) fn erc4626_path(&self) -> PathBuf {
-        self.root().join(ERC4626_PATH)
+    pub(crate) fn metadata(&self) -> &FixtureMetadata {
+        self.source.metadata()
     }
 
-    pub(crate) fn fixed_point_math_lib_path(&self) -> PathBuf {
-        self.root().join(FIXED_POINT_MATH_LIB_PATH)
+    pub(crate) fn path(&self, relative: &Path) -> Result<PathBuf> {
+        self.source.relative_path_for_materialized(self.root(), relative)
+    }
+
+    pub(crate) fn anchor(&self, name: &str) -> Result<Anchor> {
+        self.anchor_with_encoding(name, PositionEncoding::Utf16)
+    }
+
+    pub(crate) fn anchor_with_encoding(
+        &self,
+        name: &str,
+        encoding: PositionEncoding,
+    ) -> Result<Anchor> {
+        let spec =
+            self.source.spec.anchors.get(name).with_context(|| {
+                format!("fixture `{}` has no anchor `{name}`", self.metadata().id)
+            })?;
+        let path = self.path(&spec.path)?;
+        let text = fs::read_to_string(&path)?;
+        let offset = text.find(&spec.needle).with_context(|| {
+            format!("anchor `{name}` disappeared from `{}`", spec.path.display())
+        })? + spec.offset;
+        Ok(Anchor { path, position: position_at_with_encoding(&text, offset, encoding) })
+    }
+
+    pub(crate) fn anchor_needle(&self, name: &str) -> Result<String> {
+        self.source
+            .spec
+            .anchors
+            .get(name)
+            .map(|anchor| anchor.needle.clone())
+            .with_context(|| format!("fixture `{}` has no anchor `{name}`", self.metadata().id))
     }
 }
 
-fn validate_repository_state(root: &Path, expected_revision: &str) -> Result<()> {
+impl FixtureSource {
+    fn relative_path_for_materialized(
+        &self,
+        materialized: &Path,
+        relative: &Path,
+    ) -> Result<PathBuf> {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            bail!("fixture path `{}` must be relative and stay in its root", relative.display())
+        }
+        let path = materialized.join(relative);
+        if !path.starts_with(materialized) {
+            bail!("fixture path `{}` escapes its root", relative.display())
+        }
+        Ok(path)
+    }
+}
+
+pub(crate) fn file_uri(path: &Path) -> Result<Url> {
+    Url::from_file_path(path)
+        .map_err(|()| anyhow::anyhow!("invalid fixture file path `{}`", path.display()))
+}
+
+pub(crate) fn position_at(text: &str, offset: usize) -> Position {
+    position_at_with_encoding(text, offset, PositionEncoding::Utf16)
+}
+
+pub(crate) fn position_at_with_encoding(
+    text: &str,
+    offset: usize,
+    encoding: PositionEncoding,
+) -> Position {
+    let prefix = &text[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
+    let line_prefix = &prefix[line_start..];
+    let character = match encoding {
+        PositionEncoding::Utf8 => line_prefix.len(),
+        PositionEncoding::Utf16 => line_prefix.encode_utf16().count(),
+        PositionEncoding::Utf32 => line_prefix.chars().count(),
+    };
+    Position { line, character: character as u32 }
+}
+
+pub(crate) fn offset_at_position(
+    text: &str,
+    position: Position,
+    encoding: PositionEncoding,
+) -> Result<usize> {
+    let mut line_start = 0;
+    for _ in 0..position.line {
+        let Some(relative) = text[line_start..].find('\n') else {
+            bail!("position line {} is outside the document", position.line)
+        };
+        line_start += relative + 1;
+    }
+    let line_end = text[line_start..].find('\n').map_or(text.len(), |index| line_start + index);
+    let line = &text[line_start..line_end];
+    let target = position.character as usize;
+    if target == 0 {
+        return Ok(line_start);
+    }
+    let mut units = 0;
+    for (offset, character) in line.char_indices() {
+        units += match encoding {
+            PositionEncoding::Utf8 => character.len_utf8(),
+            PositionEncoding::Utf16 => character.len_utf16(),
+            PositionEncoding::Utf32 => 1,
+        };
+        if units == target {
+            return Ok(line_start + offset + character.len_utf8());
+        }
+        if units > target {
+            bail!("position character {} splits a Unicode scalar", position.character)
+        }
+    }
+    bail!("position character {} is outside line {}", position.character, position.line)
+}
+
+fn validate_git_state(root: &Path, expected: &str) -> Result<()> {
     let revision = git_output(root, &["rev-parse", "HEAD"])?;
-    if revision != expected_revision {
-        bail!("Solady checkout must be at `{expected_revision}`, found `{revision}`")
+    if revision != expected {
+        bail!("fixture `{}` must be at `{expected}`, found `{revision}`", root.display())
     }
     let status = git_output(root, &["status", "--porcelain", "--untracked-files=normal"])?;
     if !status.is_empty() {
-        bail!("Solady checkout must have a clean working tree")
+        bail!("fixture `{}` has a dirty working tree", root.display())
     }
     Ok(())
+}
+
+fn git_revision(root: &Path) -> Option<String> {
+    git_output(root, &["rev-parse", "HEAD"]).ok()
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -132,66 +352,82 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn ensure_unique(contents: &str, anchor: &str, path: &str) -> Result<()> {
-    let count = contents.match_indices(anchor).count();
-    if count != 1 {
-        bail!("expected `{anchor}` exactly once in `{path}`, found {count}")
-    }
-    Ok(())
-}
-
-fn source_metadata(source_root: &Path) -> Result<FixtureMetadata> {
-    let mut paths = Vec::new();
-    collect_solidity_files(source_root, &mut paths)?;
-    paths.sort();
-
-    let mut source_line_count = 0;
-    let mut source_byte_count = 0;
-    for path in &paths {
-        let contents = fs::read(path)?;
-        source_line_count += contents.iter().filter(|byte| **byte == b'\n').count();
-        source_byte_count += contents.len();
-    }
-
-    Ok(FixtureMetadata {
-        revision: SOLADY_REVISION.into(),
-        source_file_count: paths.len(),
-        source_line_count,
-        source_byte_count,
-    })
-}
-
-fn collect_solidity_files(path: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(path)? {
+fn collect_solidity_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
+        let file_type = entry.file_type()?;
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
+        if file_type.is_dir() {
+            if entry.file_name().to_str().is_some_and(|name| IGNORED_DIRECTORIES.contains(&name)) {
+                continue;
+            }
             collect_solidity_files(&path, paths)?;
-        } else if path.extension() == Some(OsStr::new("sol")) {
+        } else if file_type.is_file() && path.extension() == Some(OsStr::new("sol")) {
             paths.push(path);
         }
     }
     Ok(())
 }
 
-fn copy_project(source: &Path, destination: &Path) -> Result<()> {
+fn fixture_content_sha256(root: &Path) -> Result<String> {
+    let mut files = Vec::new();
+    collect_fixture_files(root, root, &mut files)?;
+    files.sort();
+    let mut hasher = Sha256::new();
+    for relative in files {
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        let contents = fs::read(root.join(&relative))?;
+        hasher.update(contents.len().to_le_bytes());
+        hasher.update(contents);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_fixture_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if entry.file_name().to_str().is_some_and(|name| IGNORED_DIRECTORIES.contains(&name)) {
+                continue;
+            }
+            collect_fixture_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            files.push(path.strip_prefix(root)?.to_path_buf());
+        } else if file_type.is_symlink() {
+            bail!("fixture contains unsupported symlink `{}`", path.display())
+        }
+    }
+    Ok(())
+}
+
+fn compiler_file_sha256(path: Option<&Path>) -> Option<String> {
+    let path = path.filter(|path| path.is_file())?;
+    let contents = fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(contents);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
-        let file_name = entry.file_name();
-        if IGNORED_DIRECTORIES.iter().any(|ignored| file_name == OsStr::new(ignored)) {
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| IGNORED_DIRECTORIES.contains(&name)) {
             continue;
         }
-
         let source_path = entry.path();
-        let destination_path = destination.join(&file_name);
+        let destination_path = destination.join(&name);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             fs::create_dir_all(&destination_path)?;
-            copy_project(&source_path, &destination_path)?;
+            copy_tree(&source_path, &destination_path)?;
         } else if file_type.is_file() {
             fs::copy(&source_path, &destination_path)?;
         } else if file_type.is_symlink() {
-            bail!("Solady checkout contains unsupported symlink `{}`", source_path.display())
+            bail!("fixture contains unsupported symlink `{}`", source_path.display())
         }
     }
     Ok(())
@@ -200,47 +436,83 @@ fn copy_project(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AnchorSpec, FixtureSpec};
+    use std::collections::BTreeMap;
 
     #[test]
-    fn repository_validation_rejects_wrong_revision_and_dirty_tree() {
+    fn validates_shape_and_resolves_utf16_anchor() {
         let root = tempfile::tempdir().unwrap();
-        git(root.path(), &["init", "-q"]);
-        git(root.path(), &["config", "user.email", "bench@example.com"]);
-        git(root.path(), &["config", "user.name", "LSP Bench"]);
-        fs::write(root.path().join("tracked"), "clean\n").unwrap();
-        git(root.path(), &["add", "tracked"]);
-        git(root.path(), &["commit", "-qm", "fixture"]);
-        let revision = git_output(root.path(), &["rev-parse", "HEAD"]).unwrap();
-
-        assert!(validate_repository_state(root.path(), "wrong").is_err());
-        validate_repository_state(root.path(), &revision).unwrap();
-
-        fs::write(root.path().join("untracked"), "dirty\n").unwrap();
-        assert!(validate_repository_state(root.path(), &revision).is_err());
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/Main.sol"), "// 😀\ncontract Main { uint x; }\n").unwrap();
+        let spec = FixtureSpec {
+            id: "fixture".into(),
+            root: root.path().into(),
+            revision: None,
+            enabled: true,
+            source_roots: vec!["src".into()],
+            anchors: BTreeMap::from([(
+                "x".into(),
+                AnchorSpec { path: "src/Main.sol".into(), needle: "x".into(), offset: 0 },
+            )]),
+            required: false,
+            corpus: None,
+            solc: None,
+            foundry: None,
+            dependencies: BTreeMap::new(),
+            source: None,
+        };
+        let source = FixtureSource::open(&spec).unwrap();
+        assert_eq!(source.metadata().source_file_count, 1);
+        let fixture = source.materialize().unwrap();
+        let anchor = fixture.anchor("x").unwrap();
+        assert_eq!(anchor.position, Position { line: 1, character: 21 });
     }
 
     #[test]
-    fn project_copy_ignores_repository_and_build_directories() {
-        let source = tempfile::tempdir().unwrap();
-        fs::create_dir_all(source.path().join("src")).unwrap();
-        fs::create_dir_all(source.path().join(".git")).unwrap();
-        fs::create_dir_all(source.path().join("out")).unwrap();
-        fs::create_dir_all(source.path().join("nested/cache")).unwrap();
-        fs::write(source.path().join("src/Test.sol"), "contract Test {}\n").unwrap();
-        fs::write(source.path().join(".git/config"), "ignored\n").unwrap();
-        fs::write(source.path().join("out/Test.json"), "ignored\n").unwrap();
-        fs::write(source.path().join("nested/cache/data"), "ignored\n").unwrap();
-        let destination = tempfile::tempdir().unwrap();
-
-        copy_project(source.path(), destination.path()).unwrap();
-
-        assert!(destination.path().join("src/Test.sol").is_file());
-        assert!(!destination.path().join(".git").exists());
-        assert!(!destination.path().join("out").exists());
-        assert!(!destination.path().join("nested/cache").exists());
+    fn rejects_duplicate_anchor_text() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("Main.sol"), "x x").unwrap();
+        let spec = FixtureSpec {
+            id: "fixture".into(),
+            root: root.path().into(),
+            revision: None,
+            enabled: true,
+            source_roots: vec![".".into()],
+            anchors: BTreeMap::from([(
+                "x".into(),
+                AnchorSpec { path: "Main.sol".into(), needle: "x".into(), offset: 0 },
+            )]),
+            required: false,
+            corpus: None,
+            solc: None,
+            foundry: None,
+            dependencies: BTreeMap::new(),
+            source: None,
+        };
+        assert!(FixtureSource::open(&spec).is_err());
     }
 
-    fn git(root: &Path, args: &[&str]) {
-        assert!(Command::new("git").arg("-C").arg(root).args(args).status().unwrap().success());
+    #[test]
+    fn positions_round_trip_for_all_lsp_encodings() {
+        let text = "prefix\na😀éz";
+        let offset = text.find('é').unwrap();
+        let expectations = [
+            (PositionEncoding::Utf8, 5),
+            (PositionEncoding::Utf16, 3),
+            (PositionEncoding::Utf32, 2),
+        ];
+        for (encoding, character) in expectations {
+            let position = position_at_with_encoding(text, offset, encoding);
+            assert_eq!(position, Position { line: 1, character });
+            assert_eq!(offset_at_position(text, position, encoding).unwrap(), offset);
+        }
+    }
+
+    #[test]
+    fn utf16_position_rejects_half_surrogate_offsets() {
+        let error =
+            offset_at_position("😀", Position { line: 0, character: 1 }, PositionEncoding::Utf16)
+                .unwrap_err();
+        assert!(error.to_string().contains("splits a Unicode scalar"));
     }
 }

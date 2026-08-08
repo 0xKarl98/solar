@@ -1,0 +1,121 @@
+name: Solidity LSP benchmark
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: full cross-server comparison
+    runs-on: [self-hosted, linux, x64, lsp-bench]
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Solar
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Check runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          for command in cargo curl git lscpu node npm python3 rustc sha256sum tar; do
+            command -v "$command"
+          done
+          python3 -m pip --version
+          python3 -m venv "$RUNNER_TEMP/lsp-bench-venv-check"
+          "$RUNNER_TEMP/lsp-bench-venv-check/bin/pip" --version
+
+      - name: Build benchmark harness
+        run: cargo build --locked -p solar-lsp-bench
+
+      - name: Prepare pinned servers and fixtures
+        run: target/debug/solar-lsp-bench prepare
+
+      - name: Record provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/lsp-bench/provenance
+          {
+            echo "repository=$(git rev-parse HEAD)"
+            echo "runner_name=$RUNNER_NAME"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo
+            uname -a
+            lscpu
+            echo
+            rustc --version --verbose
+            cargo --version --verbose
+            node --version
+            npm --version
+            python3 --version
+            python3 -m pip --version
+            echo
+            sha256sum \
+              tools/lsp-bench/benchmark.yaml \
+              tools/lsp-bench/servers.lock.yaml \
+              tools/lsp-bench/fixtures.lock.yaml
+          } > target/lsp-bench/provenance.txt
+          npm --prefix target/lsp-bench/servers/nomic-foundation ls --all --json \
+            > target/lsp-bench/provenance/nomic-foundation-npm-tree.json || true
+          npm --prefix target/lsp-bench/servers/juan-blanco ls --all --json \
+            > target/lsp-bench/provenance/juan-blanco-npm-tree.json || true
+          npm --prefix target/lsp-bench/servers/qiuxiang ls --all --json \
+            > target/lsp-bench/provenance/qiuxiang-npm-tree.json || true
+          target/lsp-bench/servers/wake/venv/bin/pip freeze --all \
+            > target/lsp-bench/provenance/wake-python-packages.txt
+
+      - name: Audit publication environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/debug/solar-lsp-bench doctor \
+            | tee target/lsp-bench/doctor.txt
+          target/debug/solar-lsp-bench doctor --publish 2>&1 \
+            | tee -a target/lsp-bench/doctor.txt
+
+      - name: Run full comparison
+        run: >-
+          target/debug/solar-lsp-bench run
+          --profile publish
+          --output target/lsp-bench/publish
+
+      - name: Generate comparison
+        if: always() && hashFiles('target/lsp-bench/publish/summary.json') != ''
+        run: >-
+          target/debug/solar-lsp-bench report
+          --input target/lsp-bench/publish/summary.json
+          --output target/lsp-bench/publish/COMPARISON.md
+
+      - name: Upload comparison artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: solidity-lsp-benchmark-${{ github.run_id }}
+          path: |
+            target/lsp-bench/publish/
+            target/lsp-bench/doctor.txt
+            target/lsp-bench/provenance.txt
+            target/lsp-bench/provenance/
+            tools/lsp-bench/benchmark.yaml
+            tools/lsp-bench/servers.lock.yaml
+            tools/lsp-bench/fixtures.lock.yaml
+          retention-days: 90
+          if-no-files-found: error
