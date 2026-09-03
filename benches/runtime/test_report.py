@@ -24,6 +24,22 @@ def result(test_id="test", suite="repository", **compiler):
 
 
 class ReportFormattingTests(unittest.TestCase):
+    def test_perf_link_targets_artifact(self):
+        with patch.dict(
+            os.environ,
+            {
+                "BENCHMARK_BASE_SHA": "0123456789abcdef",
+                "BENCHMARK_PR_HEAD_SHA": "fedcba9876543210",
+                "BENCHMARK_SITE_URL": "https://example.test/",
+            },
+        ):
+            link = benchmark.perf_link("factorial", "factorial")
+
+        self.assertEqual(
+            link,
+            "[factorial](https://example.test/?base=01234567&head=fedcba98&benchmark=factorial#artifacts)",
+        )
+
     def test_unchanged_report_has_note(self):
         report = benchmark.format_report("## Results", False, False)
         self.assertEqual(
