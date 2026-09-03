@@ -325,8 +325,7 @@ impl SymbolTables {
             let Some(location) = proto::span_to_location(gcx.sess.source_map(), item.span()) else {
                 continue;
             };
-            let Some(name_location) = proto::span_to_location(gcx.sess.source_map(), name_span)
-            else {
+            let Some(name_range) = proto::span_to_range(gcx.sess.source_map(), name_span) else {
                 continue;
             };
 
@@ -338,7 +337,7 @@ impl SymbolTables {
                     name,
                     kind: item_symbol_kind(gcx, item_id),
                     location,
-                    name_range: name_location.range,
+                    name_range,
                     parent: None,
                     has_definition: item_has_definition(gcx, item_id),
                     has_getter_completion: matches!(

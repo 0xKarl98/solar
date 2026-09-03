@@ -13,7 +13,7 @@ use solar_interface::{
     diagnostics::{Diag, Level},
     source_map::SourceFile,
 };
-use std::borrow::Borrow;
+use std::{borrow::Borrow, sync::Arc};
 
 #[derive(Debug)]
 pub(crate) enum Initialize {}
@@ -335,6 +335,22 @@ fn diagnostic_data(
 }
 
 pub(crate) fn span_to_location(source_map: &SourceMap, span: Span) -> Option<lsp_types::Location> {
+    let (file, range) = source_file_and_range(source_map, span)?;
+    Some(lsp_types::Location {
+        uri: lsp_types::Url::from_file_path(file.name.as_real().unwrap()).ok()?,
+        range,
+    })
+}
+
+/// Converts a compiler span into an LSP range without constructing its file URI.
+pub(crate) fn span_to_range(source_map: &SourceMap, span: Span) -> Option<lsp_types::Range> {
+    source_file_and_range(source_map, span).map(|(_, range)| range)
+}
+
+fn source_file_and_range(
+    source_map: &SourceMap,
+    span: Span,
+) -> Option<(Arc<SourceFile>, lsp_types::Range)> {
     if source_map.is_empty() || span.is_dummy() {
         return None;
     }
@@ -346,14 +362,11 @@ pub(crate) fn span_to_location(source_map: &SourceMap, span: Span) -> Option<lsp
     }
     let lo = file.lookup_file_pos(file.relative_position(span.lo()));
     let hi = file.lookup_file_pos(file.relative_position(span.hi()));
-
-    Some(lsp_types::Location {
-        uri: lsp_types::Url::from_file_path(file.name.as_real().unwrap()).ok()?,
-        range: lsp_types::Range {
-            start: lsp_position(&file, lo.0, lo.1)?,
-            end: lsp_position(&file, hi.0, hi.1)?,
-        },
-    })
+    let range = lsp_types::Range {
+        start: lsp_position(&file, lo.0, lo.1)?,
+        end: lsp_position(&file, hi.0, hi.1)?,
+    };
+    Some((file, range))
 }
 
 fn lsp_position(file: &SourceFile, line: usize, column: CharPos) -> Option<lsp_types::Position> {
@@ -569,6 +582,7 @@ mod tests {
         let location = super::span_to_location(&source_map, span).unwrap();
 
         assert_eq!(location.range, Range::new(Position::new(0, 4), Position::new(0, 9)));
+        assert_eq!(super::span_to_range(&source_map, span), Some(location.range));
     }
 
     #[test]
@@ -595,6 +609,7 @@ mod tests {
     fn span_to_location_rejects_empty_dummy_and_cross_file_spans() {
         let empty = SourceMap::empty();
         assert!(super::span_to_location(&empty, Span::DUMMY).is_none());
+        assert!(super::span_to_range(&empty, Span::DUMMY).is_none());
 
         let source_map = SourceMap::empty();
         let first = source_map
@@ -606,6 +621,7 @@ mod tests {
         let cross_file = Span::new(first.start_pos, second.start_pos);
 
         assert!(super::span_to_location(&source_map, cross_file).is_none());
+        assert!(super::span_to_range(&source_map, cross_file).is_none());
     }
 
     #[test]
