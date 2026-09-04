@@ -9,10 +9,12 @@ use lsp_types::{
 };
 use solar_config::version::SHORT_VERSION;
 use solar_interface::{
-    CharPos, SourceMap, Span,
+    BytePos, CharPos, SourceMap, Span,
+    data_structures::map::FxHashMap,
     diagnostics::{Diag, Level},
     source_map::SourceFile,
 };
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) enum Initialize {}
@@ -316,7 +318,56 @@ fn diagnostic_data(
     Some(DiagnosticData::new(uri.clone(), &file.src, suggestions).to_value())
 }
 
+/// Converts compiler spans to LSP locations while caching each source file's URI.
+///
+/// The cache keys are local to one source map, so a converter must not outlive or be reused across
+/// analysis builds. Construct it only after source loading is complete; files appended later are
+/// not added to the eager URI snapshot.
+pub(crate) struct LocationConverter {
+    source_map: Arc<SourceMap>,
+    uris: FxHashMap<BytePos, lsp_types::Url>,
+}
+
+impl LocationConverter {
+    pub(crate) fn new(source_map: Arc<SourceMap>) -> Self {
+        let uris = {
+            let files = source_map.files();
+            let mut uris = FxHashMap::with_capacity_and_hasher(files.len(), Default::default());
+            for file in files.iter() {
+                if let Some(path) = file.name.as_real()
+                    && let Ok(uri) = lsp_types::Url::from_file_path(path)
+                {
+                    uris.insert(file.start_pos, uri);
+                }
+            }
+            uris
+        };
+        Self { source_map, uris }
+    }
+
+    pub(crate) fn file_uri(&self, file: &SourceFile) -> Option<&lsp_types::Url> {
+        self.uris.get(&file.start_pos)
+    }
+
+    pub(crate) fn location(&self, span: Span) -> Option<lsp_types::Location> {
+        span_to_location_with(&self.source_map, span, |file| {
+            let _ = file.name.as_real().unwrap();
+            self.file_uri(file).cloned()
+        })
+    }
+}
+
 pub(crate) fn span_to_location(source_map: &SourceMap, span: Span) -> Option<lsp_types::Location> {
+    span_to_location_with(source_map, span, |file| {
+        lsp_types::Url::from_file_path(file.name.as_real().unwrap()).ok()
+    })
+}
+
+fn span_to_location_with(
+    source_map: &SourceMap,
+    span: Span,
+    uri: impl FnOnce(&SourceFile) -> Option<lsp_types::Url>,
+) -> Option<lsp_types::Location> {
     if source_map.is_empty() || span.is_dummy() {
         return None;
     }
@@ -330,7 +381,7 @@ pub(crate) fn span_to_location(source_map: &SourceMap, span: Span) -> Option<lsp
     let hi = file.lookup_file_pos(file.relative_position(span.hi()));
 
     Some(lsp_types::Location {
-        uri: lsp_types::Url::from_file_path(file.name.as_real().unwrap()).ok()?,
+        uri: uri(&file)?,
         range: lsp_types::Range {
             start: lsp_position(&file, lo.0, lo.1)?,
             end: lsp_position(&file, hi.0, hi.1)?,
@@ -387,13 +438,14 @@ fn severity(level: Level) -> lsp_types::DiagnosticSeverity {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_text_range, position_at_byte, text_range};
+    use super::{LocationConverter, checked_text_range, position_at_byte, text_range};
     use crop::Rope;
     use lsp_types::{Position, Range, request::Request};
     use solar_interface::{
         BytePos, SourceMap, Span,
         diagnostics::{Applicability, Diag, DiagMsg, Level},
     };
+    use std::sync::Arc;
 
     fn diagnostic_refresh_support(workspace: serde_json::Value) -> Option<bool> {
         let params: <super::Initialize as Request>::Params =
@@ -551,6 +603,28 @@ mod tests {
         let location = super::span_to_location(&source_map, span).unwrap();
 
         assert_eq!(location.range, Range::new(Position::new(0, 4), Position::new(0, 9)));
+    }
+
+    #[test]
+    fn location_converter_caches_each_source_file_uri() {
+        let source_map = Arc::new(SourceMap::empty());
+        let first = source_map
+            .new_source_file(std::env::temp_dir().join("FirstCachedLocation.sol"), "first")
+            .unwrap();
+        let second = source_map
+            .new_source_file(std::env::temp_dir().join("SecondCachedLocation.sol"), "second")
+            .unwrap();
+        let first_span = Span::new(first.start_pos, first.end_position());
+        let second_span = Span::new(second.start_pos, second.end_position());
+        let first_location = super::span_to_location(&source_map, first_span).unwrap();
+        let second_location = super::span_to_location(&source_map, second_span).unwrap();
+
+        let converter = LocationConverter::new(source_map);
+        assert_eq!(converter.uris.len(), 2);
+        assert_eq!(converter.file_uri(&first), Some(&first_location.uri));
+        assert_eq!(converter.location(first_span), Some(first_location));
+        assert_eq!(converter.location(second_span), Some(second_location));
+        assert_eq!(converter.uris.len(), 2);
     }
 
     #[test]
