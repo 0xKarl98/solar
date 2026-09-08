@@ -309,9 +309,13 @@ enum CandidateResult {
     Candidate(CommentCandidate),
 }
 
-pub(crate) fn target(contents: &Rope, position: Position) -> NatSpecCompletionResult {
-    let Some(cursor) = proto::checked_text_range(contents, Range::new(position, position))
-        .map(|range| range.start)
+pub(crate) fn target(
+    positions: &proto::LspPositionIndex<&Rope>,
+    position: Position,
+) -> NatSpecCompletionResult {
+    let contents = positions.rope();
+    let Some(cursor) =
+        positions.checked_text_range(Range::new(position, position)).map(|range| range.start)
     else {
         return NatSpecCompletionResult::Claimed(None);
     };
@@ -338,7 +342,7 @@ pub(crate) fn target(contents: &Rope, position: Position) -> NatSpecCompletionRe
         candidate.style,
     ) {
         Some(mut target) => {
-            let Some(edit_range) = proto::byte_range_to_lsp(contents, candidate.edit_range) else {
+            let Some(edit_range) = positions.byte_range_to_lsp(candidate.edit_range) else {
                 return NatSpecCompletionResult::Claimed(None);
             };
             target.edit_range = edit_range;
@@ -346,7 +350,7 @@ pub(crate) fn target(contents: &Rope, position: Position) -> NatSpecCompletionRe
             target.source_fingerprint = source_fingerprint;
             target.additional_text_edits = candidate
                 .additional_edit_range
-                .and_then(|range| proto::byte_range_to_lsp(contents, range))
+                .and_then(|range| positions.byte_range_to_lsp(range))
                 .map(|range| vec![TextEdit { range, new_text: String::new() }]);
             NatSpecCompletionResult::Claimed(Some(Box::new(target)))
         }
@@ -666,7 +670,7 @@ mod tests {
     fn rejects_a_line_doc_comment_separated_by_a_blank_line() {
         let contents = Rope::from("///\n\ncontract C {}");
         assert!(matches!(
-            target(&contents, Position::new(0, 3)),
+            target(&proto::LspPositionIndex::new(&contents), Position::new(0, 3)),
             NatSpecCompletionResult::Claimed(None)
         ));
     }
@@ -679,7 +683,7 @@ mod tests {
             ("contract C {}\r\n", Position::new(1, 0)),
         ] {
             assert!(matches!(
-                target(&Rope::from(source), position),
+                target(&proto::LspPositionIndex::new(&Rope::from(source)), position),
                 NatSpecCompletionResult::NotApplicable
             ));
         }
@@ -688,7 +692,8 @@ mod tests {
     #[test]
     fn preserves_crlf_in_generated_comments() {
         let contents = Rope::from("///\r\ncontract C {}");
-        let NatSpecCompletionResult::Claimed(Some(target)) = target(&contents, Position::new(0, 3))
+        let NatSpecCompletionResult::Claimed(Some(target)) =
+            target(&proto::LspPositionIndex::new(&contents), Position::new(0, 3))
         else {
             panic!("expected a NatSpec completion target");
         };
@@ -715,7 +720,9 @@ mod tests {
             ("/** \t*/ contract C {}", Position::new(0, 5), "/** \t"),
         ] {
             let contents = Rope::from(source);
-            let NatSpecCompletionResult::Claimed(Some(target)) = target(&contents, position) else {
+            let NatSpecCompletionResult::Claimed(Some(target)) =
+                target(&proto::LspPositionIndex::new(&contents), position)
+            else {
                 panic!("expected a NatSpec completion target");
             };
             let item = target
@@ -734,7 +741,8 @@ mod tests {
     #[test]
     fn replaces_multiline_crlf_blocks_with_non_overlapping_edits() {
         let contents = Rope::from("/**\r\n *\r\n */\r\ncontract C {}");
-        let NatSpecCompletionResult::Claimed(Some(target)) = target(&contents, Position::new(0, 3))
+        let NatSpecCompletionResult::Claimed(Some(target)) =
+            target(&proto::LspPositionIndex::new(&contents), Position::new(0, 3))
         else {
             panic!("expected a NatSpec completion target");
         };
@@ -765,7 +773,7 @@ mod tests {
     fn does_not_recognize_a_block_marker_inside_a_string() {
         let contents = Rope::from("string constant VALUE = \"/**\";");
         assert!(matches!(
-            target(&contents, Position::new(0, 29)),
+            target(&proto::LspPositionIndex::new(&contents), Position::new(0, 29)),
             NatSpecCompletionResult::NotApplicable
         ));
     }
@@ -775,7 +783,8 @@ mod tests {
         let contents = Rope::from(
             "contract C {\n    ///\n    function value(uint256 $amount) external returns (uint256 $result);\n}",
         );
-        let NatSpecCompletionResult::Claimed(Some(target)) = target(&contents, Position::new(1, 7))
+        let NatSpecCompletionResult::Claimed(Some(target)) =
+            target(&proto::LspPositionIndex::new(&contents), Position::new(1, 7))
         else {
             panic!("expected a NatSpec completion target");
         };

@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "completionProvider":true,
                         "documentSymbolProvider":true
                     })
-                } else if behavior == "numeric-text-sync" {
+                } else if matches!(behavior.as_str(), "numeric-text-sync" | "completion-context") {
                     json!({
                         "positionEncoding":"utf-8",
                         "textDocumentSync":1,
@@ -395,14 +395,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Some("textDocument/completion") => {
-                let context_matches =
-                    if behavior == "negotiated-capabilities" || behavior == "no-text-sync" {
-                        message["params"]["context"]["triggerKind"] == 1
-                            && message["params"]["context"].get("triggerCharacter").is_none()
-                    } else {
-                        message["params"]["context"]["triggerKind"] == 2
-                            && message["params"]["context"]["triggerCharacter"] == "."
-                    };
+                let context_matches = if behavior == "completion-context" {
+                    message["params"]["context"]["triggerKind"] == 1
+                        || message["params"]["context"]["triggerKind"] == 2
+                } else if behavior == "negotiated-capabilities" || behavior == "no-text-sync" {
+                    message["params"]["context"]["triggerKind"] == 1
+                        && message["params"]["context"].get("triggerCharacter").is_none()
+                } else {
+                    message["params"]["context"]["triggerKind"] == 2
+                        && message["params"]["context"]["triggerCharacter"] == "."
+                };
                 let label = if lifecycle_valid && context_matches { "add" } else { "wrong" };
                 write_message(
                     &mut writer,

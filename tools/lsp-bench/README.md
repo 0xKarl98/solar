@@ -39,6 +39,10 @@ an exact `expected_label`, and a zero-based `expected_active_parameter`. They
 check the active signature, including a per-signature active parameter when
 provided, before accepting a request timing.
 
+Completion probes accept `trigger_character`, defaulting to `"."` for member completion.
+Set it to `null` to measure an ordinary invoked completion, or to a supported trigger such as
+`"\""` for import completion. Unadvertised triggers fall back to invoked completion.
+
 ## Requirements
 
 Run commands from the repository root. Preparation requires Git, curl, tar,

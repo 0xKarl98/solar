@@ -1400,16 +1400,17 @@ impl<'a> Session<'a> {
                 )?;
                 validate_definition(value, &expected_uri, &expected)
             }
-            ProbeSpec::Completion { path, anchor, expected_label } => {
+            ProbeSpec::Completion { path, anchor, expected_label, trigger_character } => {
                 let (_, source_anchor) = self.probe_anchor(path, anchor, allow_unopened_target)?;
                 let uri = file_uri(&source_anchor.path).map_err(harness_error)?;
                 self.require_document_probe("textDocument/completion", &uri, "completion")?;
-                let context =
-                    if self.process.completion_uses_trigger_for(".", &uri, SOLIDITY_LANGUAGE_ID) {
-                        json!({"triggerKind": 2, "triggerCharacter": "."})
-                    } else {
-                        json!({"triggerKind": 1})
-                    };
+                let context = if let Some(trigger) = trigger_character
+                    && self.process.completion_uses_trigger_for(trigger, &uri, SOLIDITY_LANGUAGE_ID)
+                {
+                    json!({"triggerKind": 2, "triggerCharacter": trigger})
+                } else {
+                    json!({"triggerKind": 1})
+                };
                 let value = self.request(
                     "textDocument/completion",
                     json!({

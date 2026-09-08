@@ -307,6 +307,8 @@ pub(crate) enum ProbeSpec {
         path: PathBuf,
         anchor: String,
         expected_label: String,
+        #[serde(default = "default_completion_trigger")]
+        trigger_character: Option<String>,
     },
     Hover {
         path: PathBuf,
@@ -340,6 +342,10 @@ pub(crate) enum ProbeSpec {
         #[serde(default = "default_enabled")]
         present: bool,
     },
+}
+
+fn default_completion_trigger() -> Option<String> {
+    Some(".".into())
 }
 
 #[derive(Deserialize)]

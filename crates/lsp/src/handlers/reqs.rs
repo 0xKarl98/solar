@@ -3,13 +3,14 @@ use crate::{
     diagnostics::PullReport,
     document_links::solidity_string_contents,
     formatter::{self, FormatterError},
-    global_state::GlobalState,
+    global_state::{AnalysisRevision, GlobalState},
     import_resolution::{
         ImportCandidateKind, ImportResolver, decode_import_path, import_path_at,
         import_path_at_for_completion,
     },
     natspec_completion::{self, NatSpecCompletionResult},
     progress::send_progress,
+    proto::LspPositionIndex,
     symbols::{CompletionContext, CompletionItemData, SymbolTables},
     vfs::{Vfs, VfsPath},
 };
@@ -554,8 +555,12 @@ pub(crate) fn goto_definition(
     let params = params.text_document_position_params;
     let latest_analysis = latest_analysis_for_uri(state, &params.text_document.uri);
     let analysis_revision = state.analysis_revision();
-    let import_request =
-        import_definition_request(state, &params.text_document.uri, params.position);
+    let import_request = import_definition_request(
+        state,
+        &params.text_document.uri,
+        params.position,
+        &analysis_revision,
+    );
     let config = state.config.clone();
     async move {
         let Some(latest_analysis) = latest_analysis else { return Ok(None) };
@@ -598,15 +603,23 @@ fn import_definition_request(
     state: &GlobalState,
     uri: &Url,
     position: Position,
+    analysis_revision: &AnalysisRevision,
 ) -> Option<ImportDefinitionRequest> {
     let importer = uri.to_file_path().ok()?;
     let vfs_path = VfsPath::from(importer.clone());
-    let (vfs_content_revision, open_contents, overlay_paths) = {
+    let (vfs_content_revision, open_contents) = {
         let vfs = state.vfs.read();
-        let overlay_paths =
-            vfs.iter().filter_map(|(path, _)| path.as_path().map(Path::to_path_buf)).collect();
-        (vfs.content_revision(), vfs.get_file_contents(&vfs_path).cloned(), overlay_paths)
+        (vfs.content_revision(), vfs.get_file_contents(&vfs_path).cloned())
     };
+    // An indexed code symbol cannot overlap an import literal in the same source snapshot.
+    // Require an open, fully analyzed document; dirty buffers and closed files still need
+    // current-source parsing. The actual definition lookup still waits for latest analysis.
+    if open_contents.is_some()
+        && analysis_revision.is_current(vfs_content_revision)
+        && state.symbol_tables.load().has_code_symbol_at_position(uri, position)
+    {
+        return None;
+    }
     let contents = open_contents.or_else(|| {
         state
             .sess
@@ -622,6 +635,12 @@ fn import_definition_request(
     let source = contents.to_string();
     let import = import_path_at(&source, cursor_offset)?;
     let raw_path = import.raw_path;
+    let overlay_paths = state
+        .vfs
+        .read()
+        .iter()
+        .filter_map(|(path, _)| path.as_path().map(Path::to_path_buf))
+        .collect();
     Some(ImportDefinitionRequest { importer, raw_path, overlay_paths, vfs_content_revision })
 }
 
@@ -880,7 +899,8 @@ pub(crate) fn completion(
     let contents = crate::proto::vfs_path(&params.text_document.uri)
         .and_then(|path| state.vfs.read().get_file_contents(&path).cloned());
     if let Some(contents) = contents {
-        match natspec_completion::target(&contents, params.position) {
+        let positions = LspPositionIndex::new(&contents);
+        match natspec_completion::target(&positions, params.position) {
             NatSpecCompletionResult::Claimed(target) => {
                 let items = target.map_or_else(Vec::new, |target| {
                     let semantics = state
@@ -904,7 +924,7 @@ pub(crate) fn completion(
             NatSpecCompletionResult::NotApplicable => {}
         }
         if let Some(response) =
-            import_completion(state, &params.text_document.uri, params.position, &contents)
+            import_completion(state, &params.text_document.uri, params.position, &positions)
         {
             return ready(Ok(Some(response)));
         }
@@ -928,12 +948,12 @@ fn import_completion(
     state: &GlobalState,
     uri: &Url,
     position: Position,
-    contents: &Rope,
+    positions: &LspPositionIndex<&Rope>,
 ) -> Option<CompletionResponse> {
+    let contents = positions.rope();
     let importer = uri.to_file_path().ok()?;
     let cursor_offset =
-        crate::proto::checked_text_range(contents, lsp_types::Range::new(position, position))?
-            .start;
+        positions.checked_text_range(lsp_types::Range::new(position, position))?.start;
     let source = contents.to_string();
     let import = import_path_at_for_completion(&source, cursor_offset)?;
     let prefix_end = cursor_offset.max(import.content_range.start);
@@ -947,7 +967,7 @@ fn import_completion(
         return Some(CompletionResponse::Array(Vec::new()));
     }
     let (replacement_range, additional_text_edits) =
-        import_completion_edit_ranges(contents, replacement, cursor_offset)?;
+        import_completion_edit_ranges(positions, replacement, cursor_offset)?;
     let Some(context) = state.config.import_resolution_context(&importer) else {
         return Some(CompletionResponse::Array(Vec::new()));
     };
@@ -1002,10 +1022,11 @@ fn import_completion(
 }
 
 fn import_completion_edit_ranges(
-    contents: &Rope,
+    positions: &LspPositionIndex<&Rope>,
     replacement: std::ops::Range<usize>,
     cursor: usize,
 ) -> Option<(lsp_types::Range, Option<Vec<TextEdit>>)> {
+    let contents = positions.rope();
     let line = contents.line_of_byte(cursor);
     let line_start = contents.byte_of_line(line);
     let line_end = line_content_end(contents, line);
@@ -1019,16 +1040,10 @@ fn import_completion_edit_ranges(
     let mut additional = Vec::new();
     for range in [replacement.start..main.start, main.end..replacement.end] {
         if !range.is_empty() {
-            additional.push(TextEdit::new(
-                crate::proto::byte_range_to_lsp(contents, range)?,
-                String::new(),
-            ));
+            additional.push(TextEdit::new(positions.byte_range_to_lsp(range)?, String::new()));
         }
     }
-    Some((
-        crate::proto::byte_range_to_lsp(contents, main)?,
-        (!additional.is_empty()).then_some(additional),
-    ))
+    Some((positions.byte_range_to_lsp(main)?, (!additional.is_empty()).then_some(additional)))
 }
 
 fn line_content_end(contents: &Rope, line: usize) -> usize {

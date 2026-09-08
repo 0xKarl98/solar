@@ -38,6 +38,71 @@ fn assert_hex_digest(value: &Value, digits: usize) {
 }
 
 #[test]
+fn completion_probes_send_the_configured_trigger() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = directory.path().join("fixture");
+    fs::create_dir(&fixture).unwrap();
+    fs::write(fixture.join("Main.sol"), "contract Main { function call() external {} }\n").unwrap();
+    let scenarios = [None, Some(Value::Null), Some(Value::from("!"))]
+        .into_iter()
+        .enumerate()
+        .map(|(index, trigger)| {
+            let mut probe = serde_json::json!({
+                "kind": "completion", "path": "Main.sol", "anchor": "call", "expected_label": "add"
+            });
+            if let Some(trigger) = trigger {
+                probe["trigger_character"] = trigger;
+            }
+            serde_json::json!({
+                "id": format!("completion-{index}"), "fixture": "synthetic",
+                "steps": [
+                    {"kind": "open", "path": "Main.sol"},
+                    {"kind": "probe", "name": "cold-ready", "probe": {
+                        "kind": "hover", "path": "Main.sol", "anchor": "call", "expected_text": "add"
+                    }},
+                    {"kind": "warm", "probe": probe}
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let config = directory.path().join("benchmark.json");
+    fs::write(&config, serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "profiles": {"smoke": {"warmup": 1, "samples": 2, "cold_samples": 1, "timeout_ms": 2000}},
+        "servers": [{"id": "fake", "command": env!("CARGO_BIN_EXE_solar-lsp-bench-fake"),
+            "env": {"LSP_BENCH_FAKE_BEHAVIOR": "completion-context"}}],
+        "fixtures": [{"id": "synthetic", "root": fixture, "source_roots": ["."],
+            "anchors": {"call": {"path": "Main.sol", "needle": "call"}}}],
+        "scenarios": scenarios
+    })).unwrap()).unwrap();
+    let output = directory.path().join("results");
+    assert!(run_benchmark(&config, &output, &["--profile", "smoke"]).success());
+    let samples = read_json(&output.join("samples.json"));
+    let samples = samples["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 3);
+    for sample in samples {
+        assert_eq!(sample["status"], "pass");
+        let expected = if sample["workload"] == "completion-0" {
+            serde_json::json!({"triggerKind": 2, "triggerCharacter": "."})
+        } else {
+            serde_json::json!({"triggerKind": 1})
+        };
+        let requests = sample["observations"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event["direction"] == "send" && event["method"] == "textDocument/completion"
+            })
+            .collect::<Vec<_>>();
+        assert!(requests.len() >= 3);
+        for request in requests {
+            assert_eq!(request.pointer("/message/params/context"), Some(&expected));
+        }
+    }
+}
+
+#[test]
 fn signature_help_records_real_requests_and_validates_the_selected_parameter() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = directory.path().join("fixture");

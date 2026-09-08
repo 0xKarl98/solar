@@ -274,6 +274,11 @@ struct CachedAnalysisOutput {
     config: Arc<Config>,
     output: AnalysisOutput<Arc<SymbolTables>>,
     inputs: Vec<AnalysisBatchInputs>,
+    /// Independently reusable batches with no dependencies outside their exact inputs.
+    ///
+    /// Keep these only for multiple nonempty workspaces: a single workspace can reuse the
+    /// aggregate directly, without retaining another copy of its symbol tables.
+    batches: Vec<Option<Arc<AnalysisOutput>>>,
 }
 
 /// Exact analysis roots and overlays, excluding client document versions.
@@ -1683,6 +1688,21 @@ fn run_analysis(
         }
     }
 
+    let cache_batches = !has_disk_paths
+        && source_files_complete
+        && batches.iter().filter(|batch| !batch.files.is_empty()).take(2).count() > 1;
+    let cached_batches = if cache_batches {
+        let commit = snapshot.analysis_commit.lock();
+        commit.cached_output.as_ref().and_then(|cached| {
+            (!commit.cache_invalidated
+                && Arc::ptr_eq(&cached.config, &config)
+                && cached.inputs.len() == batches.len()
+                && cached.batches.len() == batches.len())
+            .then(|| (cached.inputs.clone(), cached.batches.clone()))
+        })
+    } else {
+        None
+    };
     let inputs = if has_disk_paths {
         Vec::new()
     } else {
@@ -1695,8 +1715,10 @@ fn run_analysis(
             .collect::<Vec<_>>()
     };
     let mut results = AnalysisOutputAccumulator::default();
+    let mut next_cached_batches =
+        if cache_batches { vec![None; batches.len()] } else { Vec::new() };
 
-    for batch in batches {
+    for (idx, batch) in batches.into_iter().enumerate() {
         if batch.files.is_empty() {
             continue;
         }
@@ -1705,8 +1727,30 @@ fn run_analysis(
             return AnalysisTaskOutcome::Superseded;
         }
 
-        let Some(result) = analyze_cancellable(batch, cancellation) else {
-            return AnalysisTaskOutcome::Superseded;
+        let cached = cached_batches.as_ref().and_then(|(inputs, outputs)| {
+            let inputs = &inputs[idx];
+            (inputs.files == batch.files && inputs.preloaded_files == batch.preloaded_files)
+                .then(|| outputs[idx].clone())
+                .flatten()
+        });
+        let result = if let Some(cached) = cached {
+            let mut result = (*cached).clone();
+            // Exact source contents permit reuse, but document versions belong to this epoch.
+            for (uri, version) in &mut result.result.analyzed_documents {
+                *version = batch.open_file_versions.get(uri).copied();
+            }
+            next_cached_batches[idx] = Some(cached);
+            result
+        } else {
+            let Some(result) = analyze_cancellable(batch, cancellation) else {
+                return AnalysisTaskOutcome::Superseded;
+            };
+            // NOTE: Resolver probes and disk-only imports are not represented in `inputs`.
+            // Such batches must be analyzed again even when all root sources are identical.
+            if cache_batches && result.analysis_paths.is_empty() {
+                next_cached_batches[idx] = Some(Arc::new(result.clone()));
+            }
+            result
         };
         results.push(result);
 
@@ -1723,7 +1767,12 @@ fn run_analysis(
                 vfs_content_revision,
                 config,
                 output: output.clone(),
-                inputs: if output.analysis_paths.is_empty() { inputs } else { Vec::new() },
+                inputs: if output.analysis_paths.is_empty() || cache_batches {
+                    inputs
+                } else {
+                    Vec::new()
+                },
+                batches: next_cached_batches,
             });
         }
     }

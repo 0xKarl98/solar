@@ -222,6 +222,16 @@ impl<R: Borrow<Rope>> LspPositionIndex<R> {
         Some(lsp_types::Position::new(u32::try_from(line).ok()?, u32::try_from(character).ok()?))
     }
 
+    pub(crate) fn byte_range_to_lsp(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Option<lsp_types::Range> {
+        Some(lsp_types::Range::new(
+            self.position_at_byte(range.start)?,
+            self.position_at_byte(range.end)?,
+        ))
+    }
+
     pub(crate) fn line_at_byte(&self, byte: usize) -> Option<usize> {
         let rope = self.rope();
         if byte > rope.byte_len() || !rope.is_char_boundary(byte) {
