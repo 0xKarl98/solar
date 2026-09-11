@@ -1,0 +1,24 @@
+Benchmarking lsp/completion/all
+Benchmarking lsp/completion/all: Warming up for 1.0000 s
+Benchmarking lsp/completion/all: Collecting 40 samples in estimated 2.0400 s (33k iterations)
+Benchmarking lsp/completion/all: Analyzing
+lsp/completion/all      time:   [62.454 µs 63.804 µs 65.090 µs]
+Found 1 outliers among 40 measurements (2.50%)
+  1 (2.50%) high mild
+Benchmarking lsp/completion/selective
+Benchmarking lsp/completion/selective: Warming up for 1.0000 s
+Benchmarking lsp/completion/selective: Collecting 40 samples in estimated 2.0031 s (522k iterations)
+Benchmarking lsp/completion/selective: Analyzing
+lsp/completion/selective
+                        time:   [3.5940 µs 3.7490 µs 3.9291 µs]
+Found 6 outliers among 40 measurements (15.00%)
+  3 (7.50%) high mild
+  3 (7.50%) high severe
+Benchmarking lsp/completion/no-match
+Benchmarking lsp/completion/no-match: Warming up for 1.0000 s
+Benchmarking lsp/completion/no-match: Collecting 40 samples in estimated 2.0011 s (755k iterations)
+Benchmarking lsp/completion/no-match: Analyzing
+lsp/completion/no-match time:   [2.9672 µs 3.1944 µs 3.4613 µs]
+Found 2 outliers among 40 measurements (5.00%)
+  2 (5.00%) high mild
+

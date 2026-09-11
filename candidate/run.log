@@ -1,0 +1,117 @@
+Benchmarking lsp/completion/all
+Benchmarking lsp/completion/all: Warming up for 1.0000 s
+Benchmarking lsp/completion/all: Collecting 40 samples in estimated 2.0314 s (34k iterations)
+Benchmarking lsp/completion/all: Analyzing
+lsp/completion/all      time:   [59.573 µs 60.226 µs 60.918 µs]
+Found 2 outliers among 40 measurements (5.00%)
+  2 (5.00%) high severe
+Benchmarking lsp/completion/selective
+Benchmarking lsp/completion/selective: Warming up for 1.0000 s
+Benchmarking lsp/completion/selective: Collecting 40 samples in estimated 2.0024 s (526k iterations)
+Benchmarking lsp/completion/selective: Analyzing
+lsp/completion/selective
+                        time:   [3.7475 µs 3.7703 µs 3.7953 µs]
+Found 3 outliers among 40 measurements (7.50%)
+  1 (2.50%) low mild
+  1 (2.50%) high mild
+  1 (2.50%) high severe
+Benchmarking lsp/completion/no-match
+Benchmarking lsp/completion/no-match: Warming up for 1.0000 s
+Benchmarking lsp/completion/no-match: Collecting 40 samples in estimated 2.0015 s (631k iterations)
+Benchmarking lsp/completion/no-match: Analyzing
+lsp/completion/no-match time:   [3.0994 µs 3.1676 µs 3.2807 µs]
+Found 3 outliers among 40 measurements (7.50%)
+  1 (2.50%) high mild
+  2 (5.00%) high severe
+
+Benchmarking lsp/member-completion/64
+Benchmarking lsp/member-completion/64: Warming up for 1.0000 s
+Benchmarking lsp/member-completion/64: Collecting 40 samples in estimated 2.0000 s (15M iterations)
+Benchmarking lsp/member-completion/64: Analyzing
+lsp/member-completion/64
+                        time:   [137.80 ns 138.61 ns 139.39 ns]
+Benchmarking lsp/member-completion/256
+Benchmarking lsp/member-completion/256: Warming up for 1.0000 s
+Benchmarking lsp/member-completion/256: Collecting 40 samples in estimated 2.0000 s (13M iterations)
+Benchmarking lsp/member-completion/256: Analyzing
+lsp/member-completion/256
+                        time:   [145.45 ns 146.29 ns 147.09 ns]
+Benchmarking lsp/member-completion/1024
+Benchmarking lsp/member-completion/1024: Warming up for 1.0000 s
+Benchmarking lsp/member-completion/1024: Collecting 40 samples in estimated 2.0001 s (13M iterations)
+Benchmarking lsp/member-completion/1024: Analyzing
+lsp/member-completion/1024
+                        time:   [155.74 ns 156.92 ns 158.51 ns]
+Found 1 outliers among 40 measurements (2.50%)
+  1 (2.50%) high severe
+
+Benchmarking lsp/open-document-selection-range/uniswap-v3
+Benchmarking lsp/open-document-selection-range/uniswap-v3: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range/uniswap-v3: Collecting 40 samples in estimated 2.0004 s (2.2M iterations)
+Benchmarking lsp/open-document-selection-range/uniswap-v3: Analyzing
+lsp/open-document-selection-range/uniswap-v3
+                        time:   [902.46 ns 908.47 ns 914.75 ns]
+                        thrpt:  [149.24 GiB/s 150.27 GiB/s 151.27 GiB/s]
+Found 3 outliers among 40 measurements (7.50%)
+  3 (7.50%) high severe
+Benchmarking lsp/open-document-selection-range/unifap-v2-router
+Benchmarking lsp/open-document-selection-range/unifap-v2-router: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range/unifap-v2-router: Collecting 40 samples in estimated 2.0001 s (2.7M iterations)
+Benchmarking lsp/open-document-selection-range/unifap-v2-router: Analyzing
+lsp/open-document-selection-range/unifap-v2-router
+                        time:   [728.15 ns 731.51 ns 734.79 ns]
+                        thrpt:  [6.8469 GiB/s 6.8776 GiB/s 6.9093 GiB/s]
+Found 1 outliers among 40 measurements (2.50%)
+  1 (2.50%) high severe
+
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii: Collecting 40 samples in estimated 2.0003 s (1.7M iterations)
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii: Analyzing
+lsp/open-document-selection-range-line-layout/minified-ascii
+                        time:   [1.1292 µs 1.1617 µs 1.2130 µs]
+                        thrpt:  [47.122 GiB/s 49.206 GiB/s 50.622 GiB/s]
+Found 4 outliers among 40 measurements (10.00%)
+  2 (5.00%) high mild
+  2 (5.00%) high severe
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode: Collecting 40 samples in estimated 2.0673 s (18k iterations)
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode: Analyzing
+lsp/open-document-selection-range-line-layout/minified-unicode
+                        time:   [111.96 µs 112.38 µs 112.97 µs]
+                        thrpt:  [604.59 MiB/s 607.77 MiB/s 610.02 MiB/s]
+Found 5 outliers among 40 measurements (12.50%)
+  1 (2.50%) low mild
+  4 (10.00%) high severe
+Benchmarking lsp/open-document-selection-range-line-layout/multiline
+Benchmarking lsp/open-document-selection-range-line-layout/multiline: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range-line-layout/multiline: Collecting 40 samples in estimated 2.0004 s (1.9M iterations)
+Benchmarking lsp/open-document-selection-range-line-layout/multiline: Analyzing
+lsp/open-document-selection-range-line-layout/multiline
+                        time:   [1.0430 µs 1.0475 µs 1.0545 µs]
+                        thrpt:  [54.206 GiB/s 54.568 GiB/s 54.804 GiB/s]
+Found 6 outliers among 40 measurements (15.00%)
+  3 (7.50%) low mild
+  2 (5.00%) high mild
+  1 (2.50%) high severe
+
+Benchmarking lsp/project-analysis/unifap-v2
+Benchmarking lsp/project-analysis/unifap-v2: Warming up for 1.0000 s
+Benchmarking lsp/project-analysis/unifap-v2: Collecting 40 samples in estimated 2.7236 s (120 iterations)
+Benchmarking lsp/project-analysis/unifap-v2: Analyzing
+lsp/project-analysis/unifap-v2
+                        time:   [20.187 ms 20.275 ms 20.365 ms]
+Found 1 outliers among 40 measurements (2.50%)
+  1 (2.50%) high mild
+
+Benchmarking lsp/project-analysis-after-edit/unifap-v2
+Benchmarking lsp/project-analysis-after-edit/unifap-v2: Warming up for 1.0000 s
+Benchmarking lsp/project-analysis-after-edit/unifap-v2: Collecting 40 samples in estimated 2.6114 s (120 iterations)
+Benchmarking lsp/project-analysis-after-edit/unifap-v2: Analyzing
+lsp/project-analysis-after-edit/unifap-v2
+                        time:   [20.590 ms 21.143 ms 21.874 ms]
+Found 6 outliers among 40 measurements (15.00%)
+  2 (5.00%) high mild
+  4 (10.00%) high severe
+

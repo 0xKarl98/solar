@@ -1,0 +1,17 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/yuhang/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/getopts-0.2.24/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+   Compiling solar-config v0.2.0 (/Users/yuhang/solar/crates/config)
+   Compiling solar-interface v0.2.0 (/Users/yuhang/solar/crates/interface)
+   Compiling solar-ast v0.2.0 (/Users/yuhang/solar/crates/ast)
+   Compiling solar-parse v0.2.0 (/Users/yuhang/solar/crates/parse)
+   Compiling solar-sema v0.2.0 (/Users/yuhang/solar/crates/sema)
+   Compiling solar-lsp v0.2.0 (/Users/yuhang/solar/crates/lsp)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 34.67s
+  Executable benches/lsp.rs (target/release/build/solar-lsp/67d9116b3a3b0120/out/lsp-67d9116b3a3b0120)

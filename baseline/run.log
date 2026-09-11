@@ -1,0 +1,106 @@
+Benchmarking lsp/completion/all
+Benchmarking lsp/completion/all: Warming up for 1.0000 s
+Benchmarking lsp/completion/all: Collecting 40 samples in estimated 2.0477 s (31k iterations)
+Benchmarking lsp/completion/all: Analyzing
+lsp/completion/all      time:   [60.453 µs 60.864 µs 61.236 µs]
+Benchmarking lsp/completion/selective
+Benchmarking lsp/completion/selective: Warming up for 1.0000 s
+Benchmarking lsp/completion/selective: Collecting 40 samples in estimated 2.0024 s (553k iterations)
+Benchmarking lsp/completion/selective: Analyzing
+lsp/completion/selective
+                        time:   [3.5434 µs 3.5707 µs 3.5994 µs]
+Benchmarking lsp/completion/no-match
+Benchmarking lsp/completion/no-match: Warming up for 1.0000 s
+Benchmarking lsp/completion/no-match: Collecting 40 samples in estimated 2.0007 s (760k iterations)
+Benchmarking lsp/completion/no-match: Analyzing
+lsp/completion/no-match time:   [2.6013 µs 2.6146 µs 2.6275 µs]
+Found 3 outliers among 40 measurements (7.50%)
+  3 (7.50%) high mild
+
+Benchmarking lsp/member-completion/64
+Benchmarking lsp/member-completion/64: Warming up for 1.0000 s
+Benchmarking lsp/member-completion/64: Collecting 40 samples in estimated 2.0001 s (10M iterations)
+Benchmarking lsp/member-completion/64: Analyzing
+lsp/member-completion/64
+                        time:   [193.44 ns 193.84 ns 194.22 ns]
+Found 2 outliers among 40 measurements (5.00%)
+  2 (5.00%) high mild
+Benchmarking lsp/member-completion/256
+Benchmarking lsp/member-completion/256: Warming up for 1.0000 s
+Benchmarking lsp/member-completion/256: Collecting 40 samples in estimated 2.0003 s (4.7M iterations)
+Benchmarking lsp/member-completion/256: Analyzing
+lsp/member-completion/256
+                        time:   [425.38 ns 426.34 ns 427.32 ns]
+Found 2 outliers among 40 measurements (5.00%)
+  1 (2.50%) high mild
+  1 (2.50%) high severe
+Benchmarking lsp/member-completion/1024
+Benchmarking lsp/member-completion/1024: Warming up for 1.0000 s
+Benchmarking lsp/member-completion/1024: Collecting 40 samples in estimated 2.0005 s (1.5M iterations)
+Benchmarking lsp/member-completion/1024: Analyzing
+lsp/member-completion/1024
+                        time:   [1.3023 µs 1.3049 µs 1.3077 µs]
+Found 3 outliers among 40 measurements (7.50%)
+  3 (7.50%) high mild
+
+Benchmarking lsp/open-document-selection-range/uniswap-v3
+Benchmarking lsp/open-document-selection-range/uniswap-v3: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range/uniswap-v3: Collecting 40 samples in estimated 2.0010 s (1.4M iterations)
+Benchmarking lsp/open-document-selection-range/uniswap-v3: Analyzing
+lsp/open-document-selection-range/uniswap-v3
+                        time:   [1.3989 µs 1.4015 µs 1.4042 µs]
+                        thrpt:  [97.217 GiB/s 97.406 GiB/s 97.585 GiB/s]
+Benchmarking lsp/open-document-selection-range/unifap-v2-router
+Benchmarking lsp/open-document-selection-range/unifap-v2-router: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range/unifap-v2-router: Collecting 40 samples in estimated 2.0001 s (1.7M iterations)
+Benchmarking lsp/open-document-selection-range/unifap-v2-router: Analyzing
+lsp/open-document-selection-range/unifap-v2-router
+                        time:   [1.2141 µs 1.2167 µs 1.2196 µs]
+                        thrpt:  [4.1250 GiB/s 4.1350 GiB/s 4.1437 GiB/s]
+
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii: Collecting 40 samples in estimated 2.1755 s (2460 iterations)
+Benchmarking lsp/open-document-selection-range-line-layout/minified-ascii: Analyzing
+lsp/open-document-selection-range-line-layout/minified-ascii
+                        time:   [881.48 µs 883.51 µs 885.69 µs]
+                        thrpt:  [66.087 MiB/s 66.251 MiB/s 66.403 MiB/s]
+Found 1 outliers among 40 measurements (2.50%)
+  1 (2.50%) high mild
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode: Collecting 40 samples in estimated 2.6298 s (2460 iterations)
+Benchmarking lsp/open-document-selection-range-line-layout/minified-unicode: Analyzing
+lsp/open-document-selection-range-line-layout/minified-unicode
+                        time:   [1.0510 ms 1.0604 ms 1.0779 ms]
+                        thrpt:  [63.362 MiB/s 64.407 MiB/s 64.983 MiB/s]
+Found 1 outliers among 40 measurements (2.50%)
+  1 (2.50%) high severe
+Benchmarking lsp/open-document-selection-range-line-layout/multiline
+Benchmarking lsp/open-document-selection-range-line-layout/multiline: Warming up for 1.0000 s
+Benchmarking lsp/open-document-selection-range-line-layout/multiline: Collecting 40 samples in estimated 2.0001 s (912k iterations)
+Benchmarking lsp/open-document-selection-range-line-layout/multiline: Analyzing
+lsp/open-document-selection-range-line-layout/multiline
+                        time:   [2.1870 µs 2.1916 µs 2.1969 µs]
+                        thrpt:  [26.019 GiB/s 26.082 GiB/s 26.137 GiB/s]
+Found 2 outliers among 40 measurements (5.00%)
+  1 (2.50%) low mild
+  1 (2.50%) high mild
+
+Benchmarking lsp/project-analysis/unifap-v2
+Benchmarking lsp/project-analysis/unifap-v2: Warming up for 1.0000 s
+Benchmarking lsp/project-analysis/unifap-v2: Collecting 40 samples in estimated 2.6145 s (120 iterations)
+Benchmarking lsp/project-analysis/unifap-v2: Analyzing
+lsp/project-analysis/unifap-v2
+                        time:   [20.266 ms 20.374 ms 20.498 ms]
+Found 4 outliers among 40 measurements (10.00%)
+  1 (2.50%) high mild
+  3 (7.50%) high severe
+
+Benchmarking lsp/project-analysis-after-edit/unifap-v2
+Benchmarking lsp/project-analysis-after-edit/unifap-v2: Warming up for 1.0000 s
+Benchmarking lsp/project-analysis-after-edit/unifap-v2: Collecting 40 samples in estimated 2.6127 s (120 iterations)
+Benchmarking lsp/project-analysis-after-edit/unifap-v2: Analyzing
+lsp/project-analysis-after-edit/unifap-v2
+                        time:   [20.284 ms 20.344 ms 20.404 ms]
+

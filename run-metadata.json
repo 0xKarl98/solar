@@ -1,0 +1,93 @@
+{
+  "baseline_commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+  "candidate_commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+  "platform": "macOS-15.5-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.99.0-nightly (8ab9fdff5 2026-07-30)\nbinary: rustc\ncommit-hash: 8ab9fdff5a91b9f2b5ed57fb0275452d9a0d0280\ncommit-date: 2026-07-30\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8\n",
+  "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+  "runs": [
+    {
+      "name": "baseline",
+      "source_commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+      "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+      "binary_sha256": "e23a0ee551e7039b01b26801b51fc40b6599c40c6a8690682e0f5f4bedb364a0",
+      "command": [
+        "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline-lsp",
+        "--bench",
+        "--noplot",
+        "--sample-size",
+        "40",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "2",
+        "^lsp/(completion/|member-completion/|open-document-selection-range-line-layout/|open-document-selection-range/(uniswap-v3|unifap-v2-router)$|project-analysis(-after-edit)?/unifap-v2$)"
+      ],
+      "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline/criterion",
+      "exit_code": 0,
+      "elapsed_seconds": 50.26661705970764
+    },
+    {
+      "name": "candidate",
+      "source_commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+      "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+      "binary_sha256": "df0bdcb628dc0a5eb321b32d9f439512064d5a468741c7ff52ddc47f4bd915c2",
+      "command": [
+        "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate-lsp",
+        "--bench",
+        "--noplot",
+        "--sample-size",
+        "40",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "2",
+        "^lsp/(completion/|member-completion/|open-document-selection-range-line-layout/|open-document-selection-range/(uniswap-v3|unifap-v2-router)$|project-analysis(-after-edit)?/unifap-v2$)"
+      ],
+      "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate/criterion",
+      "exit_code": 0,
+      "elapsed_seconds": 51.201337814331055
+    },
+    {
+      "name": "candidate-repeat",
+      "source_commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+      "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+      "binary_sha256": "df0bdcb628dc0a5eb321b32d9f439512064d5a468741c7ff52ddc47f4bd915c2",
+      "command": [
+        "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate-lsp",
+        "--bench",
+        "--noplot",
+        "--sample-size",
+        "40",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "2",
+        "^lsp/completion/"
+      ],
+      "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate-repeat/criterion",
+      "exit_code": 0,
+      "elapsed_seconds": 11.923043966293335
+    },
+    {
+      "name": "baseline-repeat",
+      "source_commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+      "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+      "binary_sha256": "e23a0ee551e7039b01b26801b51fc40b6599c40c6a8690682e0f5f4bedb364a0",
+      "command": [
+        "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline-lsp",
+        "--bench",
+        "--noplot",
+        "--sample-size",
+        "40",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "2",
+        "^lsp/completion/"
+      ],
+      "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline-repeat/criterion",
+      "exit_code": 0,
+      "elapsed_seconds": 12.311612129211426
+    }
+  ]
+}

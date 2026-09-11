@@ -1,0 +1,1133 @@
+{
+  "schema_version": 1,
+  "scope": "Local in-process member-completion and selection-range queries; editor transport and scheduling are excluded.",
+  "statistics": "Criterion slope estimates when available, otherwise mean estimates; nanoseconds per iteration. Original confidence intervals are retained unchanged.",
+  "change_formula": "100 * (candidate point estimate / baseline point estimate - 1)",
+  "chart_note": "Each main estimate is normalized to 100. Colours indicate the direction of the point-estimate change, not statistical significance. All primary cases are included below; seven selected cases appear in the chart.",
+  "run_metadata_source": {
+    "path": "run-metadata.json",
+    "sha256": "0ff09b4f658c39adbcad9efbd81dd29cd28b15b424f26e1855b830b9f3c04b83"
+  },
+  "run_metadata": {
+    "baseline_commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+    "candidate_commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+    "platform": "macOS-15.5-arm64-arm-64bit-Mach-O",
+    "rustc": "rustc 1.99.0-nightly (8ab9fdff5 2026-07-30)\nbinary: rustc\ncommit-hash: 8ab9fdff5a91b9f2b5ed57fb0275452d9a0d0280\ncommit-date: 2026-07-30\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8\n",
+    "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+    "runs": [
+      {
+        "name": "baseline",
+        "source_commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+        "binary_sha256": "e23a0ee551e7039b01b26801b51fc40b6599c40c6a8690682e0f5f4bedb364a0",
+        "command": [
+          "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline-lsp",
+          "--bench",
+          "--noplot",
+          "--sample-size",
+          "40",
+          "--warm-up-time",
+          "1",
+          "--measurement-time",
+          "2",
+          "^lsp/(completion/|member-completion/|open-document-selection-range-line-layout/|open-document-selection-range/(uniswap-v3|unifap-v2-router)$|project-analysis(-after-edit)?/unifap-v2$)"
+        ],
+        "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline/criterion",
+        "exit_code": 0,
+        "elapsed_seconds": 50.26661705970764
+      },
+      {
+        "name": "candidate",
+        "source_commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+        "binary_sha256": "df0bdcb628dc0a5eb321b32d9f439512064d5a468741c7ff52ddc47f4bd915c2",
+        "command": [
+          "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate-lsp",
+          "--bench",
+          "--noplot",
+          "--sample-size",
+          "40",
+          "--warm-up-time",
+          "1",
+          "--measurement-time",
+          "2",
+          "^lsp/(completion/|member-completion/|open-document-selection-range-line-layout/|open-document-selection-range/(uniswap-v3|unifap-v2-router)$|project-analysis(-after-edit)?/unifap-v2$)"
+        ],
+        "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate/criterion",
+        "exit_code": 0,
+        "elapsed_seconds": 51.201337814331055
+      },
+      {
+        "name": "candidate-repeat",
+        "source_commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+        "binary_sha256": "df0bdcb628dc0a5eb321b32d9f439512064d5a468741c7ff52ddc47f4bd915c2",
+        "command": [
+          "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate-lsp",
+          "--bench",
+          "--noplot",
+          "--sample-size",
+          "40",
+          "--warm-up-time",
+          "1",
+          "--measurement-time",
+          "2",
+          "^lsp/completion/"
+        ],
+        "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/candidate-repeat/criterion",
+        "exit_code": 0,
+        "elapsed_seconds": 11.923043966293335
+      },
+      {
+        "name": "baseline-repeat",
+        "source_commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "fixture_sha256": "52d831e2e3544d219715812c4f12062992b63a3ef6993e20784f4bceb2bc56e7",
+        "binary_sha256": "e23a0ee551e7039b01b26801b51fc40b6599c40c6a8690682e0f5f4bedb364a0",
+        "command": [
+          "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline-lsp",
+          "--bench",
+          "--noplot",
+          "--sample-size",
+          "40",
+          "--warm-up-time",
+          "1",
+          "--measurement-time",
+          "2",
+          "^lsp/completion/"
+        ],
+        "criterion_home": "/Users/yuhang/solar/target/lsp-member-position-pr-20260911/baseline-repeat/criterion",
+        "exit_code": 0,
+        "elapsed_seconds": 12.311612129211426
+      }
+    ]
+  },
+  "comparisons": [
+    {
+      "benchmark": "lsp/completion/all",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 60452.74794835533,
+            "upper_bound": 61236.40521700453
+          },
+          "point_estimate": 60864.44115794228,
+          "standard_error": 200.94041608565996
+        },
+        "time_us": 60.86444115794228,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_completion/all/new/benchmark.json",
+            "sha256": "c1e1c02d54437a91bd863820fa0914c1d24848230202f848340872b5528e96b6"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_completion/all/new/estimates.json",
+            "sha256": "fb9949f41229826c2cdb3214e0a5cce6977532990147fcaa6d54658bac20465e"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_completion/all/new/sample.json",
+            "sha256": "c3050bdb98c966281e19dc866454c50dde2504085bf12c1ff372e57edcd22d6f"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 59572.8038341692,
+            "upper_bound": 60918.066359947414
+          },
+          "point_estimate": 60225.73201136889,
+          "standard_error": 343.09952028446344
+        },
+        "time_us": 60.22573201136889,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_completion/all/new/benchmark.json",
+            "sha256": "c1e1c02d54437a91bd863820fa0914c1d24848230202f848340872b5528e96b6"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_completion/all/new/estimates.json",
+            "sha256": "81730cfa7aba092384319b9bc43fe3a2ad70fb07a153776e6cf534a66957870d"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_completion/all/new/sample.json",
+            "sha256": "fb43799875311c32c1529e4b4af908a785b0a94b3f067c168346413972060405"
+          }
+        }
+      },
+      "candidate_percent_of_main": 98.95060377714478,
+      "change_percent": -1.0493962228552256
+    },
+    {
+      "benchmark": "lsp/completion/no-match",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2601.349512026449,
+            "upper_bound": 2627.520744030093
+          },
+          "point_estimate": 2614.574646629422,
+          "standard_error": 6.687512422890633
+        },
+        "time_us": 2.614574646629422,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_completion/no-match/new/benchmark.json",
+            "sha256": "ccead331871afd6eac91cfab1053673ebc501c732e6922a0fef877483bdf7b24"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_completion/no-match/new/estimates.json",
+            "sha256": "f2fdcac4936b8897224c8d9afdf95f75e656088348ccc3bc2fd95f37683c0383"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_completion/no-match/new/sample.json",
+            "sha256": "f70473c5d823963e917b8aa2a1a6bcd1f33e0d01cf865b345ded4161737eeef8"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3099.381755134893,
+            "upper_bound": 3280.719032493311
+          },
+          "point_estimate": 3167.5673235842746,
+          "standard_error": 47.73782582998789
+        },
+        "time_us": 3.1675673235842745,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_completion/no-match/new/benchmark.json",
+            "sha256": "ccead331871afd6eac91cfab1053673ebc501c732e6922a0fef877483bdf7b24"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_completion/no-match/new/estimates.json",
+            "sha256": "d4a9682788c8b5206c2859f55d5fb5c70308025ba5c2b23db0186bec68719e59"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_completion/no-match/new/sample.json",
+            "sha256": "4fe2239ff8c3a4426a20582bd404d18c41bb411a66aa2e980625f5aed8ef3794"
+          }
+        }
+      },
+      "candidate_percent_of_main": 121.15038779511393,
+      "change_percent": 21.150387795113936
+    },
+    {
+      "benchmark": "lsp/completion/selective",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3543.4319060450694,
+            "upper_bound": 3599.4249683611292
+          },
+          "point_estimate": 3570.6537683047454,
+          "standard_error": 14.28810701785247
+        },
+        "time_us": 3.5706537683047452,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_completion/selective/new/benchmark.json",
+            "sha256": "07f0d59e33f4f34562c6f239186fe6a9b2a355301ee31e979cab07a1cb86adf7"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_completion/selective/new/estimates.json",
+            "sha256": "567558bc828375818009683c8cc9ebdbbdbfeb0e34ea8956b30c68fcf8e46d80"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_completion/selective/new/sample.json",
+            "sha256": "bb20b4cf1c1d2171b406149737a599e5ea3e64d1e1f4f2b7d4aa59fea3435a34"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3747.4843498536143,
+            "upper_bound": 3795.2925686455887
+          },
+          "point_estimate": 3770.2992394054263,
+          "standard_error": 12.158357735459061
+        },
+        "time_us": 3.770299239405426,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_completion/selective/new/benchmark.json",
+            "sha256": "07f0d59e33f4f34562c6f239186fe6a9b2a355301ee31e979cab07a1cb86adf7"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_completion/selective/new/estimates.json",
+            "sha256": "f422dad12559570bc4adf0aa25126e926b6b67bff049879c025223b678deba02"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_completion/selective/new/sample.json",
+            "sha256": "d08e905ac9945a7f13468409ad16199ffedecce908c732a2d8aacdd29d83b792"
+          }
+        }
+      },
+      "candidate_percent_of_main": 105.59128619170117,
+      "change_percent": 5.5912861917011725
+    },
+    {
+      "benchmark": "lsp/member-completion/1024",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1302.324482487355,
+            "upper_bound": 1307.7061295068318
+          },
+          "point_estimate": 1304.8541607852799,
+          "standard_error": 1.377113464036571
+        },
+        "time_us": 1.30485416078528,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_member-completion/1024/new/benchmark.json",
+            "sha256": "746080f215709ab34a55b1ac1e838dca8da6ea5daa0a2c0c716ccd081bd58575"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_member-completion/1024/new/estimates.json",
+            "sha256": "b54eab7df874f7898e08a58dad0c4c28be21006670aa0a860cb95df6d4efcfae"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_member-completion/1024/new/sample.json",
+            "sha256": "d3004dae9ef0d66a2ebf2b3082f02e9c737c44ddcf07af62253862046f183c01"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 155.7429909102046,
+            "upper_bound": 158.50909150935493
+          },
+          "point_estimate": 156.92479354063076,
+          "standard_error": 0.7081669974038152
+        },
+        "time_us": 0.15692479354063077,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_member-completion/1024/new/benchmark.json",
+            "sha256": "746080f215709ab34a55b1ac1e838dca8da6ea5daa0a2c0c716ccd081bd58575"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_member-completion/1024/new/estimates.json",
+            "sha256": "5fc6614bc0628d692826fa0a6f998e38a53121052a70fde5a015ccd76bfce742"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_member-completion/1024/new/sample.json",
+            "sha256": "bfefb4fea5880daa77b0908d900d745e45bacdf273c33046d2f77d6f3b45dc9e"
+          }
+        }
+      },
+      "candidate_percent_of_main": 12.026232375746204,
+      "change_percent": -87.9737676242538
+    },
+    {
+      "benchmark": "lsp/member-completion/256",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 425.3837787258933,
+            "upper_bound": 427.3197643069874
+          },
+          "point_estimate": 426.33716809172506,
+          "standard_error": 0.49300978250438426
+        },
+        "time_us": 0.42633716809172506,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_member-completion/256/new/benchmark.json",
+            "sha256": "609cb1774fc68c5708ed019afc165d81b4fa255549c4ff6660b7eea189812320"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_member-completion/256/new/estimates.json",
+            "sha256": "2483841fcd7f3c5e348c3806c2cdb7286ef45f1b24bf97b45560afc86abe3245"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_member-completion/256/new/sample.json",
+            "sha256": "1de6a393f0fe3009e4d6548bd6ad4a7dffd3895e2b5226a090e4557593f209ff"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 145.4491191472783,
+            "upper_bound": 147.09422080983484
+          },
+          "point_estimate": 146.2899728475476,
+          "standard_error": 0.4202493791933393
+        },
+        "time_us": 0.1462899728475476,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_member-completion/256/new/benchmark.json",
+            "sha256": "609cb1774fc68c5708ed019afc165d81b4fa255549c4ff6660b7eea189812320"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_member-completion/256/new/estimates.json",
+            "sha256": "b0f811ae6126d611e34ce0445e6342bd86a82c22d86cc0d053c2fe11fda4d618"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_member-completion/256/new/sample.json",
+            "sha256": "22c5005fc43cb0f4c9f38f95639f0b16794b0e3d1452a1eae458e4ba615447d9"
+          }
+        }
+      },
+      "candidate_percent_of_main": 34.313211185020066,
+      "change_percent": -65.68678881497993
+    },
+    {
+      "benchmark": "lsp/member-completion/64",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 193.43979447182866,
+            "upper_bound": 194.21923323155184
+          },
+          "point_estimate": 193.8390421678651,
+          "standard_error": 0.19917025705233124
+        },
+        "time_us": 0.1938390421678651,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_member-completion/64/new/benchmark.json",
+            "sha256": "b48fb779463160eed723acb3282bf793a8058ef245afdc26aea32de3e67b64ff"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_member-completion/64/new/estimates.json",
+            "sha256": "e0643e7f02777847ca2865827baa8070e01dece77256cd81af92bcb37cfc11cc"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_member-completion/64/new/sample.json",
+            "sha256": "85532cd2bfb7c963fcfdac23bc13d662c3ee1c091345c80fb46a11d380eb5969"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 137.80248261661893,
+            "upper_bound": 139.39150370921024
+          },
+          "point_estimate": 138.61451637252165,
+          "standard_error": 0.40608773052177455
+        },
+        "time_us": 0.13861451637252165,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_member-completion/64/new/benchmark.json",
+            "sha256": "b48fb779463160eed723acb3282bf793a8058ef245afdc26aea32de3e67b64ff"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_member-completion/64/new/estimates.json",
+            "sha256": "85a61313c3d02ba0c808288e0c2f6d9bbc5379791442fe46e4b7c3fce4b1d21f"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_member-completion/64/new/sample.json",
+            "sha256": "f464a8f33ea7a89f3a0c9464cf5a6082540966fee9781cbdde925e6823be4154"
+          }
+        }
+      },
+      "candidate_percent_of_main": 71.51011211275029,
+      "change_percent": -28.489887887249708
+    },
+    {
+      "benchmark": "lsp/open-document-selection-range-line-layout/minified-ascii",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 881477.8293447378,
+            "upper_bound": 885689.6900538726
+          },
+          "point_estimate": 883505.3625112918,
+          "standard_error": 1077.5496508883573
+        },
+        "time_us": 883.5053625112918,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/minified-ascii/new/benchmark.json",
+            "sha256": "9d2ade5d5ea2ecc518710235f515cff0c99e1ad2b7d83034766fefe0d667ee5e"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/minified-ascii/new/estimates.json",
+            "sha256": "4c2661214f6bc424fe0632769fde9cf74e3dfb4c5ed9a542c327e46c70a6359e"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/minified-ascii/new/sample.json",
+            "sha256": "d431f3de6d2954ad8b364de9eb06748a9b217463153ba1148f1ed1092dbf01fb"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1129.1671095071301,
+            "upper_bound": 1213.049184986244
+          },
+          "point_estimate": 1161.6642406741719,
+          "standard_error": 22.986369793466086
+        },
+        "time_us": 1.161664240674172,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/minified-ascii/new/benchmark.json",
+            "sha256": "9d2ade5d5ea2ecc518710235f515cff0c99e1ad2b7d83034766fefe0d667ee5e"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/minified-ascii/new/estimates.json",
+            "sha256": "16e0398c3c0af5b2167e355555f04fc36e101b9fe69e9eec13811d08b19be13c"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/minified-ascii/new/sample.json",
+            "sha256": "d2e196739ef06e11f296d9ea414baf55162baa088ef0a26a84e53748a3b06058"
+          }
+        }
+      },
+      "candidate_percent_of_main": 0.1314835528979967,
+      "change_percent": -99.86851644710201
+    },
+    {
+      "benchmark": "lsp/open-document-selection-range-line-layout/minified-unicode",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1051012.987740265,
+            "upper_bound": 1077898.9079501417
+          },
+          "point_estimate": 1060409.7592743149,
+          "standard_error": 7597.655570790219
+        },
+        "time_us": 1060.4097592743149,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/minified-unicode/new/benchmark.json",
+            "sha256": "1e6584897f1eb53c29c9a108f0f8924a6fadee067f9c94640f2cb80af5c50a05"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/minified-unicode/new/estimates.json",
+            "sha256": "191a837bd78a791f09176a0946743dcd70b1aef2b04159feeddb65bf60b6a16c"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/minified-unicode/new/sample.json",
+            "sha256": "6ac04a0ae6ff643315eb134c3fc65d342eb84aecec3e444b33d29860fa058b91"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 111960.75364498822,
+            "upper_bound": 112965.73483581636
+          },
+          "point_estimate": 112375.11704032191,
+          "standard_error": 259.0405299886105
+        },
+        "time_us": 112.37511704032191,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/minified-unicode/new/benchmark.json",
+            "sha256": "1e6584897f1eb53c29c9a108f0f8924a6fadee067f9c94640f2cb80af5c50a05"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/minified-unicode/new/estimates.json",
+            "sha256": "ea428b0d5652324eb3f1bccb323a44db6d4375beaa7b315e13dcd5f7de33fe5d"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/minified-unicode/new/sample.json",
+            "sha256": "9cdb503b3fc43b9dcd8afb96cedb51e4bd82bb2659bfa492b71aa17f79b0cd01"
+          }
+        }
+      },
+      "candidate_percent_of_main": 10.597329575429894,
+      "change_percent": -89.4026704245701
+    },
+    {
+      "benchmark": "lsp/open-document-selection-range-line-layout/multiline",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2186.9758062926976,
+            "upper_bound": 2196.928015327756
+          },
+          "point_estimate": 2191.57976618705,
+          "standard_error": 2.5407388438788123
+        },
+        "time_us": 2.19157976618705,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/multiline/new/benchmark.json",
+            "sha256": "719e16319f9c942d68742db4ad8d0775f7c42dd8bc7b4dc66fc5a23e7d612c1e"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/multiline/new/estimates.json",
+            "sha256": "fc61aa739cee902ea9beb3175483393d99db6ff309d2b8eab11a81d6c9fb90cb"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_open-document-selection-range-line-layout/multiline/new/sample.json",
+            "sha256": "07763659c287560d765c0d751368119a726597e6ea41c653d1cf03bd604edc02"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1043.007895965931,
+            "upper_bound": 1054.5051335538458
+          },
+          "point_estimate": 1047.5222380046669,
+          "standard_error": 2.995860512915399
+        },
+        "time_us": 1.047522238004667,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/multiline/new/benchmark.json",
+            "sha256": "719e16319f9c942d68742db4ad8d0775f7c42dd8bc7b4dc66fc5a23e7d612c1e"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/multiline/new/estimates.json",
+            "sha256": "164a57323140dd3ae6910af6eb55fec64502651cf928a32411d7827d6a488918"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_open-document-selection-range-line-layout/multiline/new/sample.json",
+            "sha256": "0353c4100afac8aab56a79b8c0720587fa3ff1a348d39e6e128583bb127379a5"
+          }
+        }
+      },
+      "candidate_percent_of_main": 47.79758666175153,
+      "change_percent": -52.20241333824846
+    },
+    {
+      "benchmark": "lsp/open-document-selection-range/unifap-v2-router",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1214.1267867626898,
+            "upper_bound": 1219.6242548985274
+          },
+          "point_estimate": 1216.6831222919343,
+          "standard_error": 1.4014491134751703
+        },
+        "time_us": 1.2166831222919343,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_open-document-selection-range/unifap-v2-router/new/benchmark.json",
+            "sha256": "1d70d2a66b2207d105fed7e27574b7efe46ed628c821bd21625fa2f22e9ee793"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_open-document-selection-range/unifap-v2-router/new/estimates.json",
+            "sha256": "2793d274f32074bce0c097fc68a60e23886c56f5643aa3f7f5d4d8824900dbef"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_open-document-selection-range/unifap-v2-router/new/sample.json",
+            "sha256": "d392f7256d8232608cdde54374366dfa5b7492b48ae754d505bc7709856dbb2f"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 728.1517015259149,
+            "upper_bound": 734.7879142373857
+          },
+          "point_estimate": 731.5097576484222,
+          "standard_error": 1.684581296114075
+        },
+        "time_us": 0.7315097576484222,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_open-document-selection-range/unifap-v2-router/new/benchmark.json",
+            "sha256": "1d70d2a66b2207d105fed7e27574b7efe46ed628c821bd21625fa2f22e9ee793"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_open-document-selection-range/unifap-v2-router/new/estimates.json",
+            "sha256": "dc25ca7fbc5d5a997b4477481dcdff4d5c525d922d21ec3f97030f787902efaf"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_open-document-selection-range/unifap-v2-router/new/sample.json",
+            "sha256": "da8abf763fa112f4871b30b162d8ba365a7b41f4dfb8e5ac515276849a3069d2"
+          }
+        }
+      },
+      "candidate_percent_of_main": 60.12327649211046,
+      "change_percent": -39.87672350788954
+    },
+    {
+      "benchmark": "lsp/open-document-selection-range/uniswap-v3",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 1398.945117242888,
+            "upper_bound": 1404.2410787354338
+          },
+          "point_estimate": 1401.515039529699,
+          "standard_error": 1.3609975097838114
+        },
+        "time_us": 1.401515039529699,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_open-document-selection-range/uniswap-v3/new/benchmark.json",
+            "sha256": "1bc3a50569169f6eeead28825be7e16824d01c80fb0c8e6dfbe2a771a1ff4401"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_open-document-selection-range/uniswap-v3/new/estimates.json",
+            "sha256": "c20dd7c30cac95e535f2f82dd795d72313ae1d3d06e53159e47e4bec3f9847db"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_open-document-selection-range/uniswap-v3/new/sample.json",
+            "sha256": "e2adb5e24ee3133e15946f6855354f5fe7e3d4cc8461af59b106613651c14b27"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 902.4600048341856,
+            "upper_bound": 914.7460841835378
+          },
+          "point_estimate": 908.4652606623016,
+          "standard_error": 3.1231685054242546
+        },
+        "time_us": 0.9084652606623016,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_open-document-selection-range/uniswap-v3/new/benchmark.json",
+            "sha256": "1bc3a50569169f6eeead28825be7e16824d01c80fb0c8e6dfbe2a771a1ff4401"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_open-document-selection-range/uniswap-v3/new/estimates.json",
+            "sha256": "28096c3c0d21394a638bf8ac89ed9eb035635e32992c3cb45566fe82a5930f9d"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_open-document-selection-range/uniswap-v3/new/sample.json",
+            "sha256": "ec58540a765d8a22038684e574085d2ded8eaf6783ab98210e5a1940f5f287e3"
+          }
+        }
+      },
+      "candidate_percent_of_main": 64.82022918335232,
+      "change_percent": -35.17977081664768
+    },
+    {
+      "benchmark": "lsp/project-analysis-after-edit/unifap-v2",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "mean",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 20283904.970833335,
+            "upper_bound": 20403714.47458333
+          },
+          "point_estimate": 20343746.208333332,
+          "standard_error": 30608.42124158091
+        },
+        "time_us": 20343.74620833333,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_project-analysis-after-edit/unifap-v2/new/benchmark.json",
+            "sha256": "4133893aaf4ccd771d2ef0d8f58513c0405d6548ec26990b69b8e1d3e2a3a2e1"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_project-analysis-after-edit/unifap-v2/new/estimates.json",
+            "sha256": "b5c60153678cd38b3472b41bf09b924c22562e4cfae0d6c21b1febe2289145e8"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_project-analysis-after-edit/unifap-v2/new/sample.json",
+            "sha256": "693ba23bf850db8e8cc36d0d7dbe7922872e489bdc34f6dd2d8458693a309a55"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "mean",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 20590347.663125005,
+            "upper_bound": 21874071.479375
+          },
+          "point_estimate": 21142944.424999997,
+          "standard_error": 331569.1795508019
+        },
+        "time_us": 21142.944424999998,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_project-analysis-after-edit/unifap-v2/new/benchmark.json",
+            "sha256": "4133893aaf4ccd771d2ef0d8f58513c0405d6548ec26990b69b8e1d3e2a3a2e1"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_project-analysis-after-edit/unifap-v2/new/estimates.json",
+            "sha256": "0330cdc4f298ea3d26ed415ebbb1b2016f7dc9c7311e2755423494a53f78c126"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_project-analysis-after-edit/unifap-v2/new/sample.json",
+            "sha256": "cdeb7956bde6d9ebee08af6f63923ff7c223aa46293bc417f5c0f531b71aa3df"
+          }
+        }
+      },
+      "candidate_percent_of_main": 103.92847122885998,
+      "change_percent": 3.9284712288599755
+    },
+    {
+      "benchmark": "lsp/project-analysis/unifap-v2",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "mean",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 20265504.985208336,
+            "upper_bound": 20497791.252708334
+          },
+          "point_estimate": 20373878.76666666,
+          "standard_error": 59363.237736569565
+        },
+        "time_us": 20373.878766666658,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline/criterion/lsp_project-analysis/unifap-v2/new/benchmark.json",
+            "sha256": "322f99a84eedecd7648a717d8c31a04f13579f2cecade574b85afdeda141ac6d"
+          },
+          "estimates": {
+            "path": "baseline/criterion/lsp_project-analysis/unifap-v2/new/estimates.json",
+            "sha256": "323917189b37d71dff8490dc875f37798e698507f2c855a44d568e1bcbc4bf37"
+          },
+          "samples": {
+            "path": "baseline/criterion/lsp_project-analysis/unifap-v2/new/sample.json",
+            "sha256": "81236a42bd3bf376be07d3e9952b556108be08257109cc207183d919c639d0da"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "mean",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 20187340.879374996,
+            "upper_bound": 20365245.459374994
+          },
+          "point_estimate": 20274582.258333333,
+          "standard_error": 45205.40910004449
+        },
+        "time_us": 20274.582258333332,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate/criterion/lsp_project-analysis/unifap-v2/new/benchmark.json",
+            "sha256": "322f99a84eedecd7648a717d8c31a04f13579f2cecade574b85afdeda141ac6d"
+          },
+          "estimates": {
+            "path": "candidate/criterion/lsp_project-analysis/unifap-v2/new/estimates.json",
+            "sha256": "6599401ebdfe46cbc500974321566352ac93be448c98a6b83ce03013ef52f677"
+          },
+          "samples": {
+            "path": "candidate/criterion/lsp_project-analysis/unifap-v2/new/sample.json",
+            "sha256": "2c1fc0b8644c7a5f16bd84d0a8e99695f2a3721c40490310f6709d96788eb737"
+          }
+        }
+      },
+      "candidate_percent_of_main": 99.51262835383224,
+      "change_percent": -0.48737164616775575
+    }
+  ],
+  "repeat_comparisons": [
+    {
+      "benchmark": "lsp/completion/all",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 62453.63950876649,
+            "upper_bound": 65089.5765309974
+          },
+          "point_estimate": 63804.10905487805,
+          "standard_error": 673.8223429727386
+        },
+        "time_us": 63.80410905487805,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline-repeat/criterion/lsp_completion/all/new/benchmark.json",
+            "sha256": "c1e1c02d54437a91bd863820fa0914c1d24848230202f848340872b5528e96b6"
+          },
+          "estimates": {
+            "path": "baseline-repeat/criterion/lsp_completion/all/new/estimates.json",
+            "sha256": "d96ee330eef0e3ee6c8b8bf4a3dc34abf448aee56d28c1b245b504897366e3bb"
+          },
+          "samples": {
+            "path": "baseline-repeat/criterion/lsp_completion/all/new/sample.json",
+            "sha256": "3ed704e2f2ae28a31c899a1ce0bad9f1e1a3836c7f47dad9fa3f480e20b542e2"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 61693.476383452136,
+            "upper_bound": 64991.01549347926
+          },
+          "point_estimate": 63135.306390018064,
+          "standard_error": 855.0259663071296
+        },
+        "time_us": 63.135306390018066,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate-repeat/criterion/lsp_completion/all/new/benchmark.json",
+            "sha256": "c1e1c02d54437a91bd863820fa0914c1d24848230202f848340872b5528e96b6"
+          },
+          "estimates": {
+            "path": "candidate-repeat/criterion/lsp_completion/all/new/estimates.json",
+            "sha256": "7b0fa7b484002ad4980b8fa6fa393020fdceff24cee200c5712587da8134d998"
+          },
+          "samples": {
+            "path": "candidate-repeat/criterion/lsp_completion/all/new/sample.json",
+            "sha256": "ca2a6101c754589a63742c0cf6567eaa03a59f9cb78939d87c8f224b06862124"
+          }
+        }
+      },
+      "candidate_percent_of_main": 98.95178747142327,
+      "change_percent": -1.0482125285767196
+    },
+    {
+      "benchmark": "lsp/completion/no-match",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 2967.2297821474885,
+            "upper_bound": 3461.282432478524
+          },
+          "point_estimate": 3194.4473356794733,
+          "standard_error": 126.91313048498081
+        },
+        "time_us": 3.1944473356794734,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline-repeat/criterion/lsp_completion/no-match/new/benchmark.json",
+            "sha256": "ccead331871afd6eac91cfab1053673ebc501c732e6922a0fef877483bdf7b24"
+          },
+          "estimates": {
+            "path": "baseline-repeat/criterion/lsp_completion/no-match/new/estimates.json",
+            "sha256": "b222918df7874e52ba9f1df19c304e96561149ff85d0a80af4b7d6df7381545b"
+          },
+          "samples": {
+            "path": "baseline-repeat/criterion/lsp_completion/no-match/new/sample.json",
+            "sha256": "af4e3920d194c4a3007ca7b1c5d8befccd84d9bc28da4242abacd934d49512f2"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3030.2016724954633,
+            "upper_bound": 3159.3950512607266
+          },
+          "point_estimate": 3075.326774146205,
+          "standard_error": 37.136640388501036
+        },
+        "time_us": 3.075326774146205,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate-repeat/criterion/lsp_completion/no-match/new/benchmark.json",
+            "sha256": "ccead331871afd6eac91cfab1053673ebc501c732e6922a0fef877483bdf7b24"
+          },
+          "estimates": {
+            "path": "candidate-repeat/criterion/lsp_completion/no-match/new/estimates.json",
+            "sha256": "034e228217653c806d2bb850e05b1d201c539f1cb42a79b8ca2ff94863ad7112"
+          },
+          "samples": {
+            "path": "candidate-repeat/criterion/lsp_completion/no-match/new/sample.json",
+            "sha256": "43691cc7948d10a8bdcc16dfe14581f0561f4f465bc6996b6c6bcef682c97171"
+          }
+        }
+      },
+      "candidate_percent_of_main": 96.27101188356481,
+      "change_percent": -3.7289881164351946
+    },
+    {
+      "benchmark": "lsp/completion/selective",
+      "baseline": {
+        "commit": "1cddb0736eddae7fc28c9c05372d2881d17d378f",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3593.992501403955,
+            "upper_bound": 3929.101047106812
+          },
+          "point_estimate": 3748.985238861023,
+          "standard_error": 85.6545083296
+        },
+        "time_us": 3.7489852388610228,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "baseline-repeat/criterion/lsp_completion/selective/new/benchmark.json",
+            "sha256": "07f0d59e33f4f34562c6f239186fe6a9b2a355301ee31e979cab07a1cb86adf7"
+          },
+          "estimates": {
+            "path": "baseline-repeat/criterion/lsp_completion/selective/new/estimates.json",
+            "sha256": "6d6f8e02ea3bbb0ce763e7922aa605c390a067513b68b9acb15ab3411fb18d6a"
+          },
+          "samples": {
+            "path": "baseline-repeat/criterion/lsp_completion/selective/new/sample.json",
+            "sha256": "60442bf933aa4bb870d4bbaa84ba464a6a2b9aade5d627cc2b40870c4579b886"
+          }
+        }
+      },
+      "candidate": {
+        "commit": "d24278df929ce0d660b3e14bd75b4893763f491e",
+        "statistic": "slope",
+        "estimate_ns": {
+          "confidence_interval": {
+            "confidence_level": 0.95,
+            "lower_bound": 3640.3946932741155,
+            "upper_bound": 3715.514309244708
+          },
+          "point_estimate": 3677.532093873515,
+          "standard_error": 18.994457679166093
+        },
+        "time_us": 3.677532093873515,
+        "sample_count": 40,
+        "sources": {
+          "benchmark": {
+            "path": "candidate-repeat/criterion/lsp_completion/selective/new/benchmark.json",
+            "sha256": "07f0d59e33f4f34562c6f239186fe6a9b2a355301ee31e979cab07a1cb86adf7"
+          },
+          "estimates": {
+            "path": "candidate-repeat/criterion/lsp_completion/selective/new/estimates.json",
+            "sha256": "51f6643aca04470f37bd0e5df8d4af37e0836d9532ff1cbab757336e7717c151"
+          },
+          "samples": {
+            "path": "candidate-repeat/criterion/lsp_completion/selective/new/sample.json",
+            "sha256": "f34047a3caef558812a26a8eebb84baaa4ced4363ad5d31b398dc85bd0673d53"
+          }
+        }
+      },
+      "candidate_percent_of_main": 98.09406704921525,
+      "change_percent": -1.905932950784739
+    }
+  ],
+  "chart_cases": [
+    "lsp/member-completion/1024",
+    "lsp/open-document-selection-range-line-layout/minified-ascii",
+    "lsp/open-document-selection-range-line-layout/minified-unicode",
+    "lsp/open-document-selection-range-line-layout/multiline",
+    "lsp/completion/all",
+    "lsp/completion/selective",
+    "lsp/completion/no-match"
+  ],
+  "chart_source": {
+    "path": "lsp-performance.png",
+    "sha256": "216f486ce597a4431ea756cd17bd9d9180ec8cd93d7b9e3d7c31250892635dce"
+  },
+  "plot_script_source": {
+    "path": "plot.py",
+    "sha256": "4b40d03abbc77daa6f6a7a0f82bfdc70519a8713865c8217657c7c6de024f827"
+  }
+}
