@@ -1,0 +1,64 @@
+{
+  "base_commit": "2c47185cc78101db0caf776bbc27f6fe8bae4a70",
+  "head_commit": "c016afaf5d92f18664c14baf4a506e145b86372e",
+  "platform": "macOS-15.5-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.99.0-nightly (8ab9fdff5 2026-07-30)\nbinary: rustc\ncommit-hash: 8ab9fdff5a91b9f2b5ed57fb0275452d9a0d0280\ncommit-date: 2026-07-30\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8\n",
+  "runs": [
+    {
+      "name": "pr-main-20260911",
+      "commit": "2c47185cc78101db0caf776bbc27f6fe8bae4a70",
+      "command": [
+        "cargo",
+        "bench",
+        "--locked",
+        "-p",
+        "solar-lsp",
+        "--features",
+        "bench",
+        "--bench",
+        "lsp",
+        "--",
+        "--noplot",
+        "--sample-size",
+        "30",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "1",
+        "--save-baseline",
+        "pr-main-20260911",
+        "lsp/(completion|unchanged-document-update)"
+      ],
+      "exit_code": 0,
+      "elapsed_including_build_seconds": 49.67181897163391
+    },
+    {
+      "name": "pr-head-20260911",
+      "commit": "c016afaf5d92f18664c14baf4a506e145b86372e",
+      "command": [
+        "cargo",
+        "bench",
+        "--locked",
+        "-p",
+        "solar-lsp",
+        "--features",
+        "bench",
+        "--bench",
+        "lsp",
+        "--",
+        "--noplot",
+        "--sample-size",
+        "30",
+        "--warm-up-time",
+        "1",
+        "--measurement-time",
+        "1",
+        "--save-baseline",
+        "pr-head-20260911",
+        "lsp/(completion|unchanged-document-update)"
+      ],
+      "exit_code": 0,
+      "elapsed_including_build_seconds": 48.290716886520386
+    }
+  ]
+}

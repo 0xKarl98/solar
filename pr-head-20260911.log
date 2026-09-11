@@ -1,0 +1,46 @@
+Commit: c016afaf5d92f18664c14baf4a506e145b86372e
+Command: ['cargo', 'bench', '--locked', '-p', 'solar-lsp', '--features', 'bench', '--bench', 'lsp', '--', '--noplot', '--sample-size', '30', '--warm-up-time', '1', '--measurement-time', '1', '--save-baseline', 'pr-head-20260911', 'lsp/(completion|unchanged-document-update)']
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/yuhang/.cargo/registry/src/mirrors.tuna.tsinghua.edu.cn-e791a3f93f26854f/getopts-0.2.24/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+   Compiling solar-config v0.2.0 (/Users/yuhang/solar/crates/config)
+   Compiling solar-interface v0.2.0 (/Users/yuhang/solar/crates/interface)
+   Compiling solar-ast v0.2.0 (/Users/yuhang/solar/crates/ast)
+   Compiling solar-parse v0.2.0 (/Users/yuhang/solar/crates/parse)
+   Compiling solar-sema v0.2.0 (/Users/yuhang/solar/crates/sema)
+   Compiling solar-lsp v0.2.0 (/Users/yuhang/solar/crates/lsp)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 34.22s
+     Running benches/lsp.rs (target/release/build/solar-lsp/67d9116b3a3b0120/out/lsp-67d9116b3a3b0120)
+Benchmarking lsp/completion/all
+Benchmarking lsp/completion/all: Warming up for 1.0000 s
+Benchmarking lsp/completion/all: Collecting 30 samples in estimated 1.0032 s (17k iterations)
+Benchmarking lsp/completion/all: Analyzing
+lsp/completion/all      time:   [60.032 µs 60.360 µs 60.629 µs]
+Benchmarking lsp/completion/selective
+Benchmarking lsp/completion/selective: Warming up for 1.0000 s
+Benchmarking lsp/completion/selective: Collecting 30 samples in estimated 1.0002 s (287k iterations)
+Benchmarking lsp/completion/selective: Analyzing
+lsp/completion/selective
+                        time:   [3.4957 µs 3.5076 µs 3.5193 µs]
+Benchmarking lsp/completion/no-match
+Benchmarking lsp/completion/no-match: Warming up for 1.0000 s
+Benchmarking lsp/completion/no-match: Collecting 30 samples in estimated 1.0004 s (380k iterations)
+Benchmarking lsp/completion/no-match: Analyzing
+lsp/completion/no-match time:   [2.6017 µs 2.6291 µs 2.6603 µs]
+Found 2 outliers among 30 measurements (6.67%)
+  2 (6.67%) high severe
+
+Benchmarking lsp/unchanged-document-update/optimism
+Benchmarking lsp/unchanged-document-update/optimism: Warming up for 1.0000 s
+Benchmarking lsp/unchanged-document-update/optimism: Collecting 30 samples in estimated 1.3984 s (1395 iterations)
+Benchmarking lsp/unchanged-document-update/optimism: Analyzing
+lsp/unchanged-document-update/optimism
+                        time:   [258.02 µs 266.44 µs 275.01 µs]
+                        thrpt:  [18.233 GiB/s 18.819 GiB/s 19.433 GiB/s]
+

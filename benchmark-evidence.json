@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "statistic": "Criterion slope point estimate, nanoseconds per iteration",
+  "confidence_level": 0.95,
+  "comparison": "candidate / baseline - 1; slope point estimates only",
+  "baseline_commit": "2c47185cc78101db0caf776bbc27f6fe8bae4a70",
+  "candidate_commit": "c016afaf5d92f18664c14baf4a506e145b86372e",
+  "provenance_note": "Sequential same-checkout comparison against official main; exact commands and Git revisions retained in run-metadata.json and the run logs.",
+  "reported_method": {
+    "host": "macOS arm64",
+    "warmup_seconds": 1,
+    "measurement_seconds": 1
+  },
+  "scope": "In-process production notification handler and symbol-query benchmarks, not stdio or editor latency.",
+  "cases": [
+    {
+      "benchmark": "lsp/unchanged-document-update/optimism",
+      "title": "Unchanged full-document update",
+      "unit": "ms",
+      "series": {
+        "baseline": {
+          "commit": "2c47185cc78101db0caf776bbc27f6fe8bae4a70",
+          "source": "target/criterion/lsp_unchanged-document-update/optimism/pr-main-20260911/estimates.json",
+          "source_sha256": "f9b312a513c0be3139c0e7955b017a06e9dae3423b19ee6beb03ce9b9b7d2f9e",
+          "sample_source": "target/criterion/lsp_unchanged-document-update/optimism/pr-main-20260911/sample.json",
+          "sample_sha256": "dab0be70331945ece027dea8366262ce997b71ca3abc2ed901db1a1af9b11e71",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 1239126.0850898607,
+              "upper_bound": 1277857.8869383293
+            },
+            "point_estimate": 1256941.436964569,
+            "standard_error": 9912.019552798543
+          }
+        },
+        "candidate": {
+          "commit": "c016afaf5d92f18664c14baf4a506e145b86372e",
+          "source": "target/criterion/lsp_unchanged-document-update/optimism/pr-head-20260911/estimates.json",
+          "source_sha256": "2f8954e7e3d3b6a5bdf1e5d00faf58410dbde33b1c1cca27a141b903342e0204",
+          "sample_source": "target/criterion/lsp_unchanged-document-update/optimism/pr-head-20260911/sample.json",
+          "sample_sha256": "21fcc9c4a017cc87d60661dcecf009b1dade31de7af480682fe16b13ada7ddfd",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 258023.6509492758,
+              "upper_bound": 275007.790142825
+            },
+            "point_estimate": 266442.74440331396,
+            "standard_error": 4339.015877553483
+          }
+        }
+      },
+      "change_percent": -78.80229447707956
+    },
+    {
+      "benchmark": "lsp/completion/selective",
+      "title": "Completion \u00b7 selective prefix",
+      "unit": "\u00b5s",
+      "series": {
+        "baseline": {
+          "commit": "2c47185cc78101db0caf776bbc27f6fe8bae4a70",
+          "source": "target/criterion/lsp_completion/selective/pr-main-20260911/estimates.json",
+          "source_sha256": "75aa980ddf6c1e03f98ea707615a7fecbf31b7ecfe3c59f6f0de364a48c9c093",
+          "sample_source": "target/criterion/lsp_completion/selective/pr-main-20260911/sample.json",
+          "sample_sha256": "0e704141706948598aaeafcbfbb3ad97ffda5ceed30ca655fe8aa8af0a6b0b54",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 5741.958849738169,
+              "upper_bound": 5891.4228614236235
+            },
+            "point_estimate": 5803.264925603881,
+            "standard_error": 40.210067898373175
+          }
+        },
+        "candidate": {
+          "commit": "c016afaf5d92f18664c14baf4a506e145b86372e",
+          "source": "target/criterion/lsp_completion/selective/pr-head-20260911/estimates.json",
+          "source_sha256": "1f4308b5bc94156090c814f9555b1019cdf76269bc604f84fe33879ecd947a55",
+          "sample_source": "target/criterion/lsp_completion/selective/pr-head-20260911/sample.json",
+          "sample_sha256": "8ace8922b0f683b65e656817c5fe16e8fc4183679adf35071024573132299bbf",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 3495.6635488966235,
+              "upper_bound": 3519.3241952346907
+            },
+            "point_estimate": 3507.6253091715685,
+            "standard_error": 6.038370998466141
+          }
+        }
+      },
+      "change_percent": -39.557725622761076
+    },
+    {
+      "benchmark": "lsp/completion/no-match",
+      "title": "Completion \u00b7 no matching symbols",
+      "unit": "\u00b5s",
+      "series": {
+        "baseline": {
+          "commit": "2c47185cc78101db0caf776bbc27f6fe8bae4a70",
+          "source": "target/criterion/lsp_completion/no-match/pr-main-20260911/estimates.json",
+          "source_sha256": "5333dad0094652eaa792d92a220973eb30f15d7ac4253fdffd6a945d3aff5fa5",
+          "sample_source": "target/criterion/lsp_completion/no-match/pr-main-20260911/sample.json",
+          "sample_sha256": "603968b8fb0f78cd72267e1ef5f59bf15735a3f80c69103a2499c20b09a43e2c",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 4070.1595757497485,
+              "upper_bound": 4094.9726711456465
+            },
+            "point_estimate": 4082.4510033943616,
+            "standard_error": 6.310382752276694
+          }
+        },
+        "candidate": {
+          "commit": "c016afaf5d92f18664c14baf4a506e145b86372e",
+          "source": "target/criterion/lsp_completion/no-match/pr-head-20260911/estimates.json",
+          "source_sha256": "3cfee6ae9f2e8905d338dafb92358b32f1073be0807195e411783245262e9aba",
+          "sample_source": "target/criterion/lsp_completion/no-match/pr-head-20260911/sample.json",
+          "sample_sha256": "d23c52940a29afdb1496ed73347a95223698e2d06b2994fef7fdac268301525f",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 2601.7368848248825,
+              "upper_bound": 2660.2766264953502
+            },
+            "point_estimate": 2629.134266094565,
+            "standard_error": 15.410043421667963
+          }
+        }
+      },
+      "change_percent": -35.5991225881568
+    },
+    {
+      "benchmark": "lsp/completion/all",
+      "title": "Completion \u00b7 empty prefix (control)",
+      "unit": "\u00b5s",
+      "series": {
+        "baseline": {
+          "commit": "2c47185cc78101db0caf776bbc27f6fe8bae4a70",
+          "source": "target/criterion/lsp_completion/all/pr-main-20260911/estimates.json",
+          "source_sha256": "f0b2b0fd6d6bf01967141d3d9fd2f507532ecc804efbfa55a2823ee43647c2f5",
+          "sample_source": "target/criterion/lsp_completion/all/pr-main-20260911/sample.json",
+          "sample_sha256": "d70bf77269f58f0f3b8045e88417e979c5d64543bb6369d9434295055bd22a9a",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 62227.489204829624,
+              "upper_bound": 65304.153135763736
+            },
+            "point_estimate": 63742.38386163561,
+            "standard_error": 783.5336659512166
+          }
+        },
+        "candidate": {
+          "commit": "c016afaf5d92f18664c14baf4a506e145b86372e",
+          "source": "target/criterion/lsp_completion/all/pr-head-20260911/estimates.json",
+          "source_sha256": "f9e90db92a74fb193861f1b70109d3564b22ef71c232cb96ca86488099c97aef",
+          "sample_source": "target/criterion/lsp_completion/all/pr-head-20260911/sample.json",
+          "sample_sha256": "984657384275f259e0efe6f9879372a6bcede6955cd9fdc55af01d37ebcbd8e5",
+          "sample_count": 30,
+          "slope_ns": {
+            "confidence_interval": {
+              "confidence_level": 0.95,
+              "lower_bound": 60032.070149819716,
+              "upper_bound": 60628.648791428895
+            },
+            "point_estimate": 60360.191762148184,
+            "standard_error": 153.31861863695315
+          }
+        }
+      },
+      "change_percent": -5.306033277370181
+    }
+  ]
+}
