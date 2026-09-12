@@ -1,0 +1,62 @@
+Benchmarking lsp/folding-range/clean
+Benchmarking lsp/folding-range/clean: Warming up for 1.0000 s
+Benchmarking lsp/folding-range/clean: Collecting 30 samples in estimated 4.0878 s (90 iterations)
+Benchmarking lsp/folding-range/clean: Analyzing
+lsp/folding-range/clean time:   [44.952 ms 45.106 ms 45.314 ms]
+                        thrpt:  [113.31 MiB/s 113.83 MiB/s 114.22 MiB/s]
+Found 3 outliers among 30 measurements (10.00%)
+  1 (3.33%) high mild
+  2 (6.67%) high severe
+Benchmarking lsp/folding-range/incomplete
+Benchmarking lsp/folding-range/incomplete: Warming up for 1.0000 s
+Benchmarking lsp/folding-range/incomplete: Collecting 30 samples in estimated 3.0308 s (3720 iterations)
+Benchmarking lsp/folding-range/incomplete: Analyzing
+lsp/folding-range/incomplete
+                        time:   [801.09 µs 818.09 µs 832.29 µs]
+                        thrpt:  [52.271 MiB/s 53.178 MiB/s 54.307 MiB/s]
+Benchmarking lsp/folding-range/minified
+Benchmarking lsp/folding-range/minified: Warming up for 1.0000 s
+Benchmarking lsp/folding-range/minified: Collecting 30 samples in estimated 3.0037 s (139k iterations)
+Benchmarking lsp/folding-range/minified: Analyzing
+lsp/folding-range/minified
+                        time:   [21.075 µs 21.110 µs 21.144 µs]
+                        thrpt:  [1.6208 GiB/s 1.6234 GiB/s 1.6261 GiB/s]
+Benchmarking lsp/folding-range/open-clean-legacy
+Benchmarking lsp/folding-range/open-clean-legacy: Warming up for 1.0000 s
+Benchmarking lsp/folding-range/open-clean-legacy: Collecting 30 samples in estimated 4.1058 s (90 iterations)
+Benchmarking lsp/folding-range/open-clean-legacy: Analyzing
+lsp/folding-range/open-clean-legacy
+                        time:   [45.486 ms 45.830 ms 46.354 ms]
+                        thrpt:  [110.77 MiB/s 112.03 MiB/s 112.88 MiB/s]
+Found 3 outliers among 30 measurements (10.00%)
+  1 (3.33%) high mild
+  2 (6.67%) high severe
+Benchmarking lsp/folding-range/open-clean-snapshot
+Benchmarking lsp/folding-range/open-clean-snapshot: Warming up for 1.0000 s
+Benchmarking lsp/folding-range/open-clean-snapshot: Collecting 30 samples in estimated 4.0698 s (90 iterations)
+Benchmarking lsp/folding-range/open-clean-snapshot: Analyzing
+lsp/folding-range/open-clean-snapshot
+                        time:   [44.770 ms 44.838 ms 44.907 ms]
+                        thrpt:  [114.34 MiB/s 114.51 MiB/s 114.69 MiB/s]
+
+Benchmarking lsp/open-document-folding-range/optimism-unchanged
+Benchmarking lsp/open-document-folding-range/optimism-unchanged: Warming up for 1.0000 s
+Benchmarking lsp/open-document-folding-range/optimism-unchanged: Collecting 30 samples in estimated 3.0041 s (115k iterations)
+Benchmarking lsp/open-document-folding-range/optimism-unchanged: Analyzing
+lsp/open-document-folding-range/optimism-unchanged
+                        time:   [26.144 µs 26.156 µs 26.166 µs]
+                        thrpt:  [191.63 GiB/s 191.71 GiB/s 191.79 GiB/s]
+Found 4 outliers among 30 measurements (13.33%)
+  2 (6.67%) low mild
+  1 (3.33%) high mild
+  1 (3.33%) high severe
+Benchmarking lsp/open-document-folding-range/optimism-first-request
+Benchmarking lsp/open-document-folding-range/optimism-first-request: Warming up for 1.0000 s
+Benchmarking lsp/open-document-folding-range/optimism-first-request: Collecting 30 samples in estimated 4.1492 s (90 iterations)
+Benchmarking lsp/open-document-folding-range/optimism-first-request: Analyzing
+lsp/open-document-folding-range/optimism-first-request
+                        time:   [44.725 ms 44.932 ms 45.212 ms]
+                        thrpt:  [113.57 MiB/s 114.27 MiB/s 114.80 MiB/s]
+Found 2 outliers among 30 measurements (6.67%)
+  2 (6.67%) high severe
+
