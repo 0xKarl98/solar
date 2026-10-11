@@ -70,7 +70,13 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             self.parse_simple_stmt_kind()
         };
         if semi && kind.is_ok() {
-            self.expect_semi()?;
+            if self.can_recover_statement_boundary(true) {
+                if self.last_unexpected_token_span != Some(self.token.span) {
+                    self.expect(TokenKind::Semi).unwrap_err().emit();
+                }
+            } else {
+                self.expect_semi()?;
+            }
         }
         kind
     }
@@ -421,7 +427,14 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         } else if self.check_nr_ident() {
             path.push(IapKind::Member(self.parse_ident()?));
             while self.eat(TokenKind::Dot) {
-                let id = match self.ident_or_err(true) {
+                // NOTE: `a.\nB value` can be a valid qualified type declaration. Until
+                // this path is known to be an expression, prefer that interpretation.
+                let member = if self.can_recover_statement_boundary(false) {
+                    Err(self.expected_ident_found_err())
+                } else {
+                    self.ident_or_err(true)
+                };
+                let id = match member {
                     Ok(id) => id,
                     Err(err) => {
                         err.emit();
@@ -452,6 +465,85 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         }
 
         Ok(IndexAccessedPath { path, n_idents })
+    }
+
+    /// Whether incomplete input can end before an unambiguous statement starter.
+    /// Custom type declarations are only boundaries once the caller has ruled out a type path.
+    pub(super) fn can_recover_statement_boundary(&self, allow_declaration: bool) -> bool {
+        if !self.recover_incomplete_input || self.in_yul {
+            return false;
+        }
+
+        if self.token.kind == TokenKind::OpenDelim(Delimiter::Brace)
+            || self.token.is_keyword_any(&[
+                kw::Assembly,
+                kw::Break,
+                kw::Continue,
+                kw::Delete,
+                kw::Do,
+                kw::Emit,
+                kw::For,
+                kw::Function,
+                kw::If,
+                kw::Mapping,
+                kw::Return,
+                kw::Throw,
+                kw::Try,
+                kw::Unchecked,
+                kw::While,
+            ])
+        {
+            return true;
+        }
+
+        // Unlike other elementary type keywords, `address` is also a valid member of an
+        // external function. Only split it when the following token indicates a declaration.
+        if self.token.is_elementary_type() {
+            return !self.token.is_keyword(kw::Address) || self.is_type_declaration_boundary();
+        }
+
+        allow_declaration && self.is_type_declaration_boundary()
+    }
+
+    fn is_type_declaration_boundary(&self) -> bool {
+        let is_address = self.token.is_keyword(kw::Address);
+        if !self.token.is_non_reserved_ident(false) && !is_address {
+            return false;
+        }
+
+        let mut tokens = self.tokens.as_slice().iter().copied().filter(|t| !t.is_comment_or_doc());
+        let mut next = tokens.next().unwrap_or(Token::EOF);
+        if is_address {
+            if next.is_keyword(kw::Payable) {
+                next = tokens.next().unwrap_or(Token::EOF);
+            }
+        } else {
+            while next.kind == TokenKind::Dot {
+                if !tokens.next().is_some_and(|t| t.is_non_reserved_ident(false)) {
+                    return false;
+                }
+                next = tokens.next().unwrap_or(Token::EOF);
+            }
+        }
+        while next.kind == TokenKind::OpenDelim(Delimiter::Bracket) {
+            let mut depth = 1;
+            while depth > 0 {
+                match tokens.next().unwrap_or(Token::EOF).kind {
+                    TokenKind::OpenDelim(Delimiter::Bracket) => depth += 1,
+                    TokenKind::CloseDelim(Delimiter::Bracket) => depth -= 1,
+                    TokenKind::Semi
+                    | TokenKind::Eof
+                    | TokenKind::OpenDelim(Delimiter::Brace)
+                    | TokenKind::CloseDelim(Delimiter::Brace) => return false,
+                    _ => {}
+                }
+            }
+            next = tokens.next().unwrap_or(Token::EOF);
+        }
+        if next.is_location_specifier() {
+            next = tokens.next().unwrap_or(Token::EOF);
+        }
+        next.is_non_reserved_ident(false)
     }
 }
 

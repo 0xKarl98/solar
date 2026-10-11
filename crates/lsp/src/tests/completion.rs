@@ -1175,3 +1175,74 @@ fn check_member_access_edits(
     let mut state = fixture.completion_state_after_changes(&[("/Completion.sol", &changed)]);
     fixture.check_completions_in(&mut state, markers, expected);
 }
+
+#[test]
+fn completes_members_and_later_locals_after_statement_recovery() {
+    for (expression, following) in [
+        ("tokens[i].", "uint256 next;"),
+        ("tokens[i].", "address payable next;"),
+        ("tokens[i].", "address[] memory next;"),
+        ("tokens[i].", "address[2] memory next;"),
+        ("tokens[i].", "address payable[] memory next;"),
+        ("tokens[i].", "Token next;"),
+        ("tokens[i].", "Token[] memory next;"),
+        ("tokens[i].", "Token[2] memory next;"),
+        ("tokens[i].", "Lib.Record memory next;"),
+        ("tokens[i].", "Record memory next;"),
+        ("tokens[i].", "emit Seen(i);"),
+        ("tokens[i].", "delete tokens[i];"),
+        ("tokens[i].", "assembly { let next := 1 }"),
+        ("tokens[i].", "if (i > 0) {}"),
+        ("tokens[i].", "for (uint256 j; j < i; ++j) {}"),
+        ("tokens[i].", "while (i > 0) { --i; }"),
+        ("tokens[i].", "unchecked { ++i; }"),
+        ("tokens[i].", "return;"),
+        ("tokens[i].", "revert Failed();"),
+        ("tokens[i].bal", "uint256 next;"),
+        ("getToken().", "Token next;"),
+        ("this.getToken().", "Lib.Record memory next;"),
+        ("getTokens()[i].", "Token next;"),
+    ] {
+        let source = format!(
+            r#"
+            //- /Completion.sol open
+            contract Token {{ uint256 public balance; }}
+            library Lib {{ struct Record {{ uint256 amount; }} }}
+            contract C {{
+                struct Record {{ uint256 amount; }}
+                Token[] tokens;
+                event Seen(uint256 value);
+                error Failed();
+                function getToken() public view returns (Token) {{ return tokens[0]; }}
+                function getTokens() internal view returns (Token[] memory) {{ return tokens; }}
+                function f(uint256 i) public {{
+                    tokens.push();
+                    if (i > 0) {{
+                        {expression}$1
+                        {following}
+                    }}
+                    uint256 laterLocal;
+                    later$2Local;
+                }}
+            }}
+            "#,
+        );
+        let fixture = RequestFixture::new_allowing_diagnostics(&source, "/Completion.sol");
+        let expected = str![[r#"
+$1:
+balance Method
+$2:
+laterLocal Variable detail="f"
+
+"#]];
+        fixture.check_completions(&["$1", "$2"], expected.clone());
+
+        // Start with a complete member access, then remove its suffix before analysis catches up.
+        let suffix = if expression.ends_with(".bal") { "ance;" } else { "balance;" };
+        let clean = source.replace("$1", &format!("$1{suffix}"));
+        let analyzed = RequestFixture::new(&clean, "/Completion.sol");
+        let changed = fixture.project_contents("/Completion.sol");
+        let mut state = analyzed.completion_state_after_changes(&[("/Completion.sol", &changed)]);
+        analyzed.check_completions_in(&mut state, &["$1", "$2"], expected);
+    }
+}

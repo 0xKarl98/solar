@@ -149,11 +149,21 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         } else {
             self.parse_primary_expr()
         }?;
+        // A failed declaration lookahead rules out every suffix of the same identifier path.
+        // Calls, indexing, and recovery start a new path that needs its own lookahead.
+        let mut check_declaration = true;
         loop {
             let kind = if self.eat(TokenKind::Dot) {
                 let dot_span = self.prev_token.span;
                 // expr.member
-                match self.parse_ident_any() {
+                let is_type_path_member = self.token.is_non_reserved_ident(false);
+                let member = if self.can_recover_statement_boundary(check_declaration) {
+                    Err(self.expected_ident_found_err())
+                } else {
+                    self.parse_ident_any()
+                };
+                check_declaration = !is_type_path_member || member.is_err();
+                match member {
                     Ok(member) => ExprKind::Member(expr, member),
                     Err(err) => {
                         err.emit();
@@ -180,6 +190,9 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             } else {
                 break;
             };
+            if !matches!(kind, ExprKind::Member(..)) {
+                check_declaration = true;
+            }
             let span = lo.to(self.prev_token.span);
             expr = self.alloc(Expr { span, kind });
         }
